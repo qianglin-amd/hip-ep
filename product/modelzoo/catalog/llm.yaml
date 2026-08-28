@@ -1,0 +1,257 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Certified large language models for HIP EP.
+#
+# Seeded from the internal ROCm HIP EP dashboard, release_0.4, run date 2026-08-27.
+# Measured numbers live in ../benchmarks/, not here, so the catalog stays stable while
+# results are re-measured every release.
+#
+# Fields left null are genuinely unknown and must be filled from the model card before
+# the entry can be promoted past `preview`. Do not guess them.
+
+tier: llm
+schema_version: 1
+
+models:
+  - id: llama3.1:8b
+    name: Llama 3.1 8B Instruct
+    family: llama3.1
+    type: text-to-text
+    base_model: meta-llama/Llama-3.1-8B-Instruct
+    license: llama3.1
+    parameters: 8.03B
+    description: >-
+      Meta's general-purpose 8B instruct model. The default recommendation for a first
+      run on 16 GB and larger AMD GPUs: fast, well understood, and broadly compatible
+      with existing OpenAI-style prompts.
+    quantization:
+      scheme: awq
+      weight_dtype: int4
+      symmetry: asymmetric
+      group_size: 128
+      activation_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 131072, default: 32768 }
+    capabilities: { vision: false, tools: true, thinking: false }
+    footprint: { weights_gb: 5.4, min_vram_gb: 8 }
+    artifact:
+      dashboard_name: Llama-3.1-8B-awq-g128-int4-asym-fp16-onnx-dml-pruned_lm_head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Llama-3.1-8B-awq-g128-int4-asym-onnx }
+    recipe: llama-awq-int4-asym.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: mistral:7b
+    name: Mistral 7B Instruct v0.3
+    family: mistral
+    type: text-to-text
+    base_model: mistralai/Mistral-7B-Instruct-v0.3
+    license: apache-2.0
+    parameters: 7.25B
+    description: >-
+      The fastest certified decoder in the catalog. A good default when latency matters
+      more than reasoning depth, and the smallest model that still handles tool calls
+      reliably.
+    quantization:
+      scheme: awq
+      weight_dtype: int4
+      symmetry: symmetric
+      group_size: 128
+      activation_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 32768, default: 32768 }
+    capabilities: { vision: false, tools: true, thinking: false }
+    footprint: { weights_gb: 4.1, min_vram_gb: 8 }
+    artifact:
+      dashboard_name: Mistral-7B-Instruct-v0.3-dml-int4-awq-block-128-pruned_lm_head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Mistral-7B-Instruct-v0.3-awq-int4-onnx }
+    recipe: mistral-awq-int4.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: qwen2.5:14b
+    name: Qwen2.5 14B Instruct
+    family: qwen2.5
+    type: text-to-text
+    base_model: Qwen/Qwen2.5-14B-Instruct
+    license: apache-2.0
+    parameters: 14.7B
+    description: >-
+      The strongest general model that fits comfortably in 24 GB. Round-to-nearest INT4
+      keeps the recipe simple and fast to reproduce — no calibration data required.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      symmetry: symmetric
+      group_size: 128
+      activation_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 32768, default: 32768 }
+    capabilities: { vision: false, tools: true, thinking: false }
+    footprint: { weights_gb: 8.9, min_vram_gb: 12 }
+    artifact:
+      dashboard_name: Qwen2.5-14B-instruct-rtn-128gs-fp16-onnx-gpu-pruned_lm_head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Qwen2.5-14B-Instruct-rtn-int4-onnx }
+    recipe: qwen-rtn-int4.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: qwen2.5-coder:14b
+    name: Qwen2.5 Coder 14B Instruct
+    family: qwen2.5
+    type: text-to-text
+    base_model: Qwen/Qwen2.5-Coder-14B-Instruct
+    license: apache-2.0
+    parameters: 14.7B
+    description: >-
+      Code-specialised sibling of Qwen2.5-14B with the same shape, the same recipe and
+      effectively the same performance. Use it for completion, refactoring and repo
+      question answering.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      symmetry: symmetric
+      group_size: 128
+      activation_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 32768, default: 32768 }
+    capabilities: { vision: false, tools: true, thinking: false }
+    footprint: { weights_gb: 8.9, min_vram_gb: 12 }
+    artifact:
+      dashboard_name: Qwen2.5-Coder-14B-instruct-rtn-128gs-fp16-onnx-gpu-pruned_lm_head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Qwen2.5-Coder-14B-Instruct-rtn-int4-onnx }
+    recipe: qwen-rtn-int4.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: phi4:14b
+    name: Phi-4 14B
+    family: phi
+    type: text-to-text
+    base_model: microsoft/phi-4
+    license: mit
+    parameters: 14.7B
+    description: >-
+      Microsoft's dense 14B model, strong on reasoning and maths for its size. Block-32
+      RTN keeps quantization error low at the cost of a slightly larger footprint than
+      group-128.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      symmetry: symmetric
+      group_size: 32
+      activation_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 16384, default: 16384 }
+    capabilities: { vision: false, tools: true, thinking: false }
+    footprint: { weights_gb: 9.6, min_vram_gb: 12 }
+    artifact:
+      dashboard_name: phi4-14B-int4-rtn-block-32_directml-pruned_lm_head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: microsoft/phi-4-onnx }
+    recipe: phi-rtn-int4-block32.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: gpt-oss:20b
+    name: gpt-oss 20B
+    family: gpt-oss
+    type: text-to-text
+    base_model: openai/gpt-oss-20b
+    license: apache-2.0
+    parameters: 20.9B
+    active_parameters: 3.6B
+    description: >-
+      Sparse mixture-of-experts model. Only a fraction of the weights are active per
+      token, so it decodes far faster than its parameter count suggests — the fastest
+      TPS in the catalog.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      symmetry: symmetric
+      group_size: 32
+      activation_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 131072, default: 32768 }
+    capabilities: { vision: false, tools: true, thinking: true }
+    footprint: { weights_gb: 12.1, min_vram_gb: 16 }
+    artifact:
+      dashboard_name: gpt-oss-20b-webgpu-int4-rtn-block-32-pruned_lm_head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/gpt-oss-20b-int4-rtn-onnx }
+    recipe: moe-rtn-int4-block32.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: gpt-oss:120b
+    name: gpt-oss 120B
+    family: gpt-oss
+    type: text-to-text
+    base_model: openai/gpt-oss-120b
+    license: apache-2.0
+    parameters: 116.8B
+    active_parameters: 5.1B
+    description: >-
+      The largest certified model. It only fits on a large unified-memory part such as
+      Strix Halo, but because it is sparse it still decodes at interactive speed once
+      resident.
+    quantization:
+      scheme: awq
+      weight_dtype: uint4
+      symmetry: asymmetric
+      group_size: per-group
+      activation_dtype: fp16
+      layernorm_dtype: fp32
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 131072, default: 32768 }
+    capabilities: { vision: false, tools: true, thinking: true }
+    footprint: { weights_gb: 61.0, min_vram_gb: 72 }
+    artifact:
+      dashboard_name: gpt-oss-120b-w-uint4-pergroup-asym-awq-fp16-ssln-fp32-onnx-prune-lm-head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/gpt-oss-120b-uint4-awq-onnx }
+    recipe: moe-awq-uint4-pergroup.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: deepseek-r1-distill:70b
+    name: DeepSeek-R1 Distill Llama 70B
+    family: deepseek-r1
+    type: text-to-text
+    base_model: deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+    license: mit
+    parameters: 70.6B
+    description: >-
+      Reasoning-distilled Llama 70B. Dense, so decode is memory-bandwidth bound and
+      slow; use it when answer quality matters more than latency, and expect a
+      multi-second time to first token at long context.
+    quantization:
+      scheme: awq
+      weight_dtype: int4
+      symmetry: symmetric
+      group_size: 128
+      activation_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 131072, default: 16384 }
+    capabilities: { vision: false, tools: false, thinking: true }
+    footprint: { weights_gb: 37.5, min_vram_gb: 44 }
+    artifact:
+      dashboard_name: DeepSeek-R1-Distill-Llama-70B-dml-int4-awq-block-128-pruned_lm_head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/DeepSeek-R1-Distill-Llama-70B-awq-int4-onnx }
+    recipe: llama-awq-int4-sym.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified

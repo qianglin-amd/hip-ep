@@ -1,0 +1,262 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Certified vision-language models for HIP EP.
+#
+# Seeded from the internal ROCm HIP EP dashboard, release_0.4, run date 2026-08-27.
+# All eight VLM entries passed that run.
+#
+# The VLM artifacts keep the vision encoder in fp16 and quantize only the text tower.
+# That is deliberate: the encoder is a small fraction of the weights but dominates
+# image quality, and quantizing it costs far more accuracy than it saves memory.
+#
+# Fields left null are genuinely unknown and must be filled from the upstream model
+# card before the entry can be promoted past `preview`. Do not guess them.
+
+tier: vlm
+schema_version: 1
+
+models:
+  - id: gemma3-vl:4b
+    name: Gemma 3 4B Instruct
+    family: gemma3
+    type: image-text-to-text
+    base_model: google/gemma-3-4b-it
+    license: gemma
+    parameters: 4.3B
+    description: >-
+      The entry-point VLM: small enough for an 8 GB laptop GPU and still the fastest
+      image-to-text model in the catalog. Start here when adding vision to an app.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      group_size: 128
+      activation_dtype: fp16
+      vision_encoder_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 131072, default: 32768 }
+    capabilities: { vision: true, tools: false, thinking: false }
+    vision: { max_image_pixels: 896x896, default_resize_height: 720 }
+    footprint: { weights_gb: 3.2, min_vram_gb: 6 }
+    artifact:
+      dashboard_name: gemma3-4b-it-rtn-int4-128gs-fp16-onnx-gpu-pruned_lm_head
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/gemma-3-4b-it-rtn-int4-onnx }
+    recipe: gemma-vlm-rtn-int4.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: qwen3.5-vl:9b
+    name: Qwen3.5 9B
+    family: qwen3.5
+    type: image-text-to-text
+    base_model: Qwen/Qwen3.5-9B
+    license: apache-2.0
+    parameters: null
+    description: >-
+      Dense mid-size VLM with strong document and chart understanding. The best
+      accuracy-per-gigabyte option in the VLM tier.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      group_size: 32
+      activation_dtype: fp16
+      vision_encoder_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 262144, default: 32768 }
+    capabilities: { vision: true, tools: true, thinking: true }
+    vision: { max_image_pixels: null, default_resize_height: 720 }
+    footprint: { weights_gb: null, min_vram_gb: 12 }
+    artifact:
+      dashboard_name: Qwen3.5-9B-fp16-ve-fp16-int4-text-gs32-dml
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Qwen3.5-9B-int4-onnx }
+    recipe: qwen-vlm-int4-gs32.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: qwen3.5-vl:35b-a3b
+    name: Qwen3.5 35B A3B
+    family: qwen3.5
+    type: image-text-to-text
+    base_model: Qwen/Qwen3.5-35B-A3B
+    license: apache-2.0
+    parameters: null
+    active_parameters: ~3B
+    description: >-
+      Sparse mixture-of-experts VLM. Roughly four times the parameters of the 9B dense
+      model but decodes faster, because only about 3B parameters are active per token.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      group_size: 32
+      activation_dtype: fp16
+      vision_encoder_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 262144, default: 32768 }
+    capabilities: { vision: true, tools: true, thinking: true }
+    vision: { max_image_pixels: null, default_resize_height: 720 }
+    footprint: { weights_gb: null, min_vram_gb: 24 }
+    artifact:
+      dashboard_name: Qwen3.5-35B-A3B-fp16-ve-fp16-int4-text-gs32-dml
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Qwen3.5-35B-A3B-int4-onnx }
+    recipe: qwen-vlm-moe-int4-gs32.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: qwen3.6-vl:27b
+    name: Qwen3.6 27B
+    family: qwen3.6
+    type: image-text-to-text
+    base_model: Qwen/Qwen3.6-27B
+    license: apache-2.0
+    parameters: null
+    description: >-
+      Dense 27B VLM. The heaviest dense vision model we certify; prefer the A3B sparse
+      variants unless you specifically need dense-model behaviour.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      group_size: 32
+      activation_dtype: fp16
+      vision_encoder_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 262144, default: 32768 }
+    capabilities: { vision: true, tools: true, thinking: true }
+    vision: { max_image_pixels: null, default_resize_height: 720 }
+    footprint: { weights_gb: null, min_vram_gb: 24 }
+    artifact:
+      dashboard_name: Qwen3.6-27B-fp16-ve-fp16-int4-rtn-text-gs32-dml
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Qwen3.6-27B-int4-onnx }
+    recipe: qwen-vlm-int4-gs32.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: qwen3.6-vl:35b-a3b
+    name: Qwen3.6 35B A3B
+    family: qwen3.6
+    type: image-text-to-text
+    base_model: Qwen/Qwen3.6-35B-A3B
+    license: apache-2.0
+    parameters: null
+    active_parameters: ~3B
+    description: >-
+      The fastest large VLM in the catalog and the default recommendation for vision
+      work on a 32 GB or larger AMD GPU.
+    quantization:
+      scheme: rtn
+      weight_dtype: int4
+      group_size: 32
+      activation_dtype: fp16
+      vision_encoder_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 262144, default: 32768 }
+    capabilities: { vision: true, tools: true, thinking: true }
+    vision: { max_image_pixels: null, default_resize_height: 720 }
+    footprint: { weights_gb: null, min_vram_gb: 24 }
+    artifact:
+      dashboard_name: Qwen3.6-35B-A3B-fp16-ve-fp16-int4-text-gs32-dml
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Qwen3.6-35B-A3B-int4-onnx }
+    recipe: qwen-vlm-moe-int4-gs32.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: qwen3.8-vl:27b
+    name: Qwen3.8 27B
+    family: qwen3.8
+    type: image-text-to-text
+    base_model: Qwen/Qwen3.8-27B
+    license: apache-2.0
+    parameters: null
+    description: >-
+      Newest Qwen vision generation in the catalog, quantized with k-quant at group 128
+      rather than the group-32 RTN used by the 3.5 and 3.6 entries.
+    quantization:
+      scheme: k_quant
+      weight_dtype: int4
+      group_size: 128
+      activation_dtype: fp16
+      vision_encoder_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 262144, default: 32768 }
+    capabilities: { vision: true, tools: true, thinking: true }
+    vision: { max_image_pixels: null, default_resize_height: 720 }
+    footprint: { weights_gb: null, min_vram_gb: 24 }
+    artifact:
+      dashboard_name: Qwen3.8-27B-fp16-ve-fp16-int4-k_quant-gs128-text-dml-onnx
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/Qwen3.8-27B-kquant-int4-onnx }
+    recipe: qwen-vlm-kquant-int4.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: gemma4-vl:12b
+    name: Gemma 4 12B Instruct
+    family: gemma4
+    type: image-text-to-text
+    base_model: google/gemma-4-12b-it
+    license: gemma
+    parameters: null
+    description: >-
+      Dense Gemma 4 vision model. Very fast at short context, but throughput falls off
+      sharply past 8k tokens — check the published 16384 numbers before committing to
+      it for long-document work.
+    quantization:
+      scheme: k_quant
+      weight_dtype: int4
+      block_size: 32
+      activation_dtype: fp16
+      vision_encoder_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 131072, default: 32768 }
+    capabilities: { vision: true, tools: true, thinking: false }
+    vision: { max_image_pixels: null, default_resize_height: 720 }
+    footprint: { weights_gb: null, min_vram_gb: 12 }
+    artifact:
+      dashboard_name: gemma-4-12b-it-fp16-int4-bs32-kquant
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/gemma-4-12b-it-kquant-int4-onnx }
+    recipe: gemma-vlm-kquant-int4.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified
+
+  - id: gemma4-vl:26b-a4b
+    name: Gemma 4 26B A4B Instruct
+    family: gemma4
+    type: image-text-to-text
+    base_model: google/gemma-4-26B-A4B-it
+    license: gemma
+    parameters: null
+    active_parameters: ~4B
+    description: >-
+      Sparse mixture-of-experts Gemma 4. Quantized with the MoE-aware qmoe path, which
+      quantizes expert weights to 4 bits while keeping the router and shared layers in
+      fp16.
+    quantization:
+      scheme: qmoe
+      weight_dtype: int4
+      activation_dtype: fp16
+      vision_encoder_dtype: fp16
+      prune_logit: true
+      chunk_size: 512
+    context: { max: 131072, default: 32768 }
+    capabilities: { vision: true, tools: true, thinking: false }
+    vision: { max_image_pixels: null, default_resize_height: 720 }
+    footprint: { weights_gb: null, min_vram_gb: 24 }
+    artifact:
+      dashboard_name: google-gemma-4-26B-A4B-it-FP16W4-qmoe
+      format: oga-pipeline
+      source: { kind: huggingface, repo: amd/gemma-4-26B-A4B-it-qmoe-int4-onnx }
+    recipe: gemma-vlm-qmoe-int4.yaml
+    certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+    status: certified

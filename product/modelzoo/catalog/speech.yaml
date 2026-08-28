@@ -1,0 +1,87 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Certified speech-to-text models for HIP EP.
+#
+# Secondary tier: fully certified and benchmarked, but the console and the docs
+# foreground LLM and VLM. Whisper is exposed through /v1/audio/transcriptions.
+#
+# RTF (real-time factor) is the headline metric: 0.008 means one second of audio
+# transcribes in 8 ms, or 125x faster than real time.
+
+tier: speech
+schema_version: 1
+
+defaults:
+  family: whisper
+  type: speech-to-text
+  license: mit
+  capabilities: { vision: false, tools: false, thinking: false }
+  quantization: { scheme: none, weight_dtype: fp16 }
+  artifact: { format: oga-pipeline }
+  recipe: whisper-fp16.yaml
+  certification: { release: release_0.4, run_date: 2026-08-27, status: pass }
+  status: certified
+
+models:
+  - id: whisper:tiny
+    name: Whisper Tiny
+    base_model: openai/whisper-tiny
+    parameters: 39M
+    description: Fastest transcription path; use for live captioning and wake-word style flows.
+    footprint: { weights_gb: 0.08, min_vram_gb: 2 }
+    artifact: { dashboard_name: tiny-onnx-fp16 }
+
+  - id: whisper:base
+    name: Whisper Base
+    base_model: openai/whisper-base
+    parameters: 74M
+    description: Small accuracy gain over tiny at roughly half the throughput.
+    footprint: { weights_gb: 0.15, min_vram_gb: 2 }
+    artifact: { dashboard_name: base-onnx-fp16 }
+
+  - id: whisper:small
+    name: Whisper Small
+    base_model: openai/whisper-small
+    parameters: 244M
+    description: The usual accuracy/speed sweet spot for English batch transcription.
+    footprint: { weights_gb: 0.49, min_vram_gb: 4 }
+    artifact: { dashboard_name: small-onnx-fp16 }
+
+  - id: whisper:medium
+    name: Whisper Medium
+    base_model: openai/whisper-medium
+    parameters: 769M
+    description: Noticeably better on accented and noisy audio than small.
+    footprint: { weights_gb: 1.5, min_vram_gb: 6 }
+    artifact: { dashboard_name: medium-onnx-fp16 }
+
+  - id: whisper:large-v3
+    name: Whisper Large v3
+    base_model: openai/whisper-large-v3
+    parameters: 1.55B
+    description: Best accuracy, especially multilingual. Still transcribes ~14x faster than real time.
+    footprint: { weights_gb: 3.1, min_vram_gb: 8 }
+    artifact: { dashboard_name: large-v3-onnx-fp16 }
+
+  - id: whisper:large-v3-turbo
+    name: Whisper Large v3 Turbo
+    base_model: openai/whisper-large-v3-turbo
+    parameters: 809M
+    description: >-
+      Large-v3 with a pruned decoder. Close to large-v3 accuracy at roughly six times
+      the token throughput — the right default for most transcription workloads.
+    footprint: { weights_gb: 1.6, min_vram_gb: 6 }
+    artifact: { dashboard_name: large-v3-turbo-onnx-fp16 }
+
+  - id: whisper:large-v3-fp32
+    name: Whisper Large v3 (fp32)
+    base_model: openai/whisper-large-v3
+    parameters: 1.55B
+    description: >-
+      Full-precision reference build. Kept for numerical comparison against the fp16
+      artifact, not for production use — it is roughly 1.7x slower.
+    quantization: { scheme: none, weight_dtype: fp32 }
+    footprint: { weights_gb: 6.2, min_vram_gb: 12 }
+    artifact: { dashboard_name: large-v3-onnx-fp32 }
+    status: reference

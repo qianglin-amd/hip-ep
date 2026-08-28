@@ -1,0 +1,185 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Certified classical vision models for HIP EP.
+#
+# Secondary tier. These are single-shot ONNX graphs, not generative pipelines, so they
+# are served through the plain ORT path (/v1/vision/infer) rather than the OGA engine,
+# and their metrics are latency and QPS rather than TTFT and TPS.
+#
+# Two entries carry status `failing` from release_0.4. They stay in the catalog on
+# purpose: hiding a regression does not fix it, and the console shows the failure.
+
+tier: vision
+schema_version: 1
+
+defaults:
+  type: vision
+  quantization: { scheme: none, weight_dtype: fp16 }
+  artifact: { format: onnx }
+  capabilities: { vision: false, tools: false, thinking: false }
+  certification: { release: release_0.4, run_date: 2026-08-27 }
+  status: certified
+
+models:
+  - id: resnet50:v1.5
+    name: ResNet-50 v1.5
+    family: resnet
+    task: image-classification
+    base_model: nvidia/resnet50_v1.5
+    license: apache-2.0
+    description: The reference image classifier. Use it to sanity check a new install.
+    artifact: { dashboard_name: nvidia-resnet50v1.5 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: mobilenet:v2
+    name: MobileNet V2 1.0 224
+    family: mobilenet
+    task: image-classification
+    base_model: google/mobilenet_v2_1.0_224
+    license: apache-2.0
+    description: Highest-throughput classifier in the catalog at 387 QPS.
+    artifact: { dashboard_name: google-mobilenet_v2_1.0_224 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: yolov5:lu
+    name: YOLOv5 L-u
+    family: yolo
+    task: object-detection
+    base_model: ultralytics/yolov5lu
+    license: agpl-3.0
+    description: Real-time object detection at ~39 QPS.
+    artifact: { dashboard_name: ultralytics-yolov5lu }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: detr:resnet50
+    name: DETR ResNet-50
+    family: detr
+    task: object-detection
+    base_model: facebook/detr-resnet-50
+    license: apache-2.0
+    description: Transformer detector; heavier than YOLO but no NMS post-processing.
+    artifact: { dashboard_name: facebook-detr-resnet-50 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: ssd-resnet34:1200
+    name: SSD ResNet-34 1200x1200
+    family: ssd
+    task: object-detection
+    base_model: mlcommons/ssd-resnet34
+    license: apache-2.0
+    description: MLPerf detection workload at full 1200x1200 input.
+    artifact: { dashboard_name: mlcommons-ssd-resnet34-1200x1200 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: mb1-ssd:300
+    name: MobileNetV1 SSD
+    family: ssd
+    task: object-detection
+    base_model: qfgaohao/pytorch-ssd
+    license: mit
+    description: Lightweight detector, 109 QPS.
+    artifact: { dashboard_name: qfgaohao-mb1-ssd }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: swin-tiny:224
+    name: Swin Tiny 224x224
+    family: swin
+    task: image-classification
+    base_model: microsoft/swin-tiny-patch4-window7-224
+    license: apache-2.0
+    description: >-
+      Hierarchical vision transformer. Steady-state throughput is excellent at 301 QPS,
+      but first-inference latency regressed in release_0.4 and is being tracked.
+    artifact: { dashboard_name: microsoft-swin-tiny-224x224 }
+    recipe: vision-fp16.yaml
+    certification: { status: fail, note: "first-inference latency regression" }
+    status: failing
+
+  - id: swinv2-tiny:512x1024
+    name: SwinV2 Tiny 512x1024
+    family: swinv2
+    task: image-classification
+    base_model: microsoft/swinv2-tiny-patch4-window8-256
+    license: apache-2.0
+    description: High-resolution SwinV2 at 28 QPS.
+    artifact: { dashboard_name: microsoft-swinv2-tiny-512x1024 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: swinv2-tiny:8x521x1024
+    name: SwinV2 Tiny batch-8 521x1024
+    family: swinv2
+    task: image-classification
+    base_model: microsoft/swinv2-tiny-patch4-window8-256
+    license: apache-2.0
+    description: Batched SwinV2 tiny; exercises the batch dimension in the compiler.
+    artifact: { dashboard_name: microsoft-swinv2-tiny-8x521x1024 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: swinv2-base:2048x3072
+    name: SwinV2 Base 2048x3072
+    family: swinv2
+    task: image-classification
+    base_model: microsoft/swinv2-base-patch4-window12-192
+    license: apache-2.0
+    description: >-
+      Very large input resolution. Near 1 QPS — this entry exists to keep the compiler
+      honest about large activations, not as a deployable configuration.
+    artifact: { dashboard_name: microsoft-swinv2-base-2048x3072 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: swinv2-base:8x2048x3072
+    name: SwinV2 Base batch-8 2048x3072
+    family: swinv2
+    task: image-classification
+    base_model: microsoft/swinv2-base-patch4-window12-192
+    license: apache-2.0
+    description: The largest single graph we certify; 37 s first inference, 0.13 QPS.
+    artifact: { dashboard_name: microsoft-swinv2-base-8x2048x3072 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: bevformer:fp16
+    name: BEVFormer
+    family: bevformer
+    task: bev-perception
+    base_model: fundamentalvision/BEVFormer
+    license: apache-2.0
+    description: Bird's-eye-view perception for autonomous driving stacks, 72 QPS.
+    artifact: { dashboard_name: bevformer-fp16 }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
+
+  - id: bevformer:tiny-temporal
+    name: BEVFormer Tiny Temporal
+    family: bevformer
+    task: bev-perception
+    base_model: fundamentalvision/BEVFormer
+    license: apache-2.0
+    description: >-
+      Temporal BEVFormer variant. Not running in release_0.4 — tracked as a compile
+      failure, kept in the catalog so the regression stays visible.
+    artifact: { dashboard_name: bevformer-tiny-temporal-sim }
+    recipe: vision-fp16.yaml
+    certification: { status: fail, note: "does not compile in release_0.4" }
+    status: failing
+
+  - id: simplebev:fp16
+    name: SimpleBEV
+    family: simplebev
+    task: bev-perception
+    base_model: aharley/simple_bev
+    license: mit
+    description: Lightweight BEV baseline, ~1 QPS at full resolution.
+    artifact: { dashboard_name: simplebev }
+    recipe: vision-fp16.yaml
+    certification: { status: pass }
