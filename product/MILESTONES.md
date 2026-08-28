@@ -29,9 +29,9 @@ Goal: the product exists as a runnable thing, and the plan is reviewable.
 | M0.1 Plan and review deck | `hipep-product-m0.1-plan` | Done |
 | M0.2 Model registry seeded from release_0.4 | `hipep-product-m0.2-registry` | Done |
 | M0.3 `oga-server` with OpenAI + Ollama APIs on the replay engine | `hipep-product-m0.3-server` | Done |
-| M0.4 HIP EP Studio console | `hipep-product-m0.4-studio` | Done |
-| M0.5 Model pipeline jobs and the `hipep` toolkit | `hipep-product-m0.5-toolkit` | Done |
-| M0.6 Landing page, docs site and client samples | `hipep-product-m0.6-site` | Done |
+| M0.4 HIP EP Studio console and port recipes | `hipep-product-m0.4-studio` | Done |
+| M0.5 Client samples in C++, Python and C# | `hipep-product-m0.5-examples` | Done |
+| M0.6 `hipep` CLI, docs site and peer model sharing | `hipep-product-m0.6-cli-site` | Done |
 | M0.7 Test suite for Windows and Linux | `hipep-product-m0.7-tests` | Done |
 | M0 complete | `hipep-product-m0` | Done |
 
@@ -67,33 +67,37 @@ Review with: `hipep models` and `hipep show qwen2.5:14b`.
 
 Review with: `python -m hipep_server` then `curl http://127.0.0.1:11434/v1/models`.
 
-### M0.4 — HIP EP Studio
+### M0.4 — HIP EP Studio and recipes
 
 - Chat with live TTFT, TPS and token counts.
 - VLM image + text with drag-and-drop and paste.
 - Model manager with pull progress.
 - Benchmark runner and published results.
 - Multi-user server status: workers, queue, sessions, GPU memory.
-
-Review with: `python -m hipep_server` and open <http://127.0.0.1:11434>.
-
-### M0.5 — Toolkit and jobs
-
-- `hipep` CLI: `serve`, `models`, `show`, `ls`, `rm`, `recipes`, `run`, `pull`, `port`,
-  `bench`, `status`, `ps`, `jobs`, `cancel`.
 - Job pipeline: fetch → inspect → export → quantize → convert → validate → benchmark →
   publish, each stage resumable and cached, with a live status stream.
 - Quark quantization stages ported from the Quark AI Agent Skills, defaulting to
-  `chunk_size=512` and the `prune_logit` method.
+  `chunk_size=512` and the `prune_logit` method, with a recipe per architecture.
 
-Review with: `hipep status`, then `hipep port <hf-id>` and watch the stages.
+Review with: `python -m hipep_server` and open <http://127.0.0.1:11434>.
 
-### M0.6 — Site and samples
+### M0.5 — Client samples
 
+- C++, Python and C# clients under `product/examples/`, each streaming chat and
+  reporting TTFT and TPS against a running server.
+- The C# sample carries the WinML path for Windows applications.
+
+Review with: `python -m hipep_server`, then follow
+[`examples/README.md`](examples/README.md).
+
+### M0.6 — CLI, site and peer sharing
+
+- `hipep` CLI: `serve`, `models`, `show`, `ls`, `rm`, `recipes`, `run`, `pull`, `port`,
+  `bench`, `status`, `ps`, `jobs`, `cancel`. HTTP only, so it drives a remote server.
 - Landing page and documentation site under `product/site/`, served by the server at
-  `/docs` and publishable as static files.
-- Model cards generated from the registry.
-- Client samples in C++, Python and C# under `product/examples/`.
+  `/docs` and publishable as static files. Model cards generate from the registry.
+- Peer artifact sharing so a second machine copies a ported model instead of repeating
+  the quantization.
 
 Review with: `python site/build.py`, then `python -m hipep_server` and open
 <http://127.0.0.1:11434/docs>.
