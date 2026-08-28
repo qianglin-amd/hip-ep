@@ -1,0 +1,15 @@
+D:\06-hipep-product\hip-ep\product\examples\winml\bin\Debug\net8.0\hipep-chat.exe
+D:\06-hipep-product\hip-ep\product\examples\winml\bin\Debug\net8.0\hipep-chat.deps.json
+D:\06-hipep-product\hip-ep\product\examples\winml\bin\Debug\net8.0\hipep-chat.runtimeconfig.json
+D:\06-hipep-product\hip-ep\product\examples\winml\bin\Debug\net8.0\hipep-chat.dll
+D:\06-hipep-product\hip-ep\product\examples\winml\bin\Debug\net8.0\hipep-chat.pdb
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\HipEpChat.GeneratedMSBuildEditorConfig.editorconfig
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\HipEpChat.AssemblyInfoInputs.cache
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\HipEpChat.AssemblyInfo.cs
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\HipEpChat.csproj.CoreCompileInputs.cache
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\HipEpChat.sourcelink.json
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\hipep-chat.dll
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\refint\hipep-chat.dll
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\hipep-chat.pdb
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\HipEpChat.genruntimeconfig.cache
+D:\06-hipep-product\hip-ep\product\examples\winml\obj\Debug\net8.0\ref\hipep-chat.dll

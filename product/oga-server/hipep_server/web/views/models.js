@@ -5,7 +5,7 @@
 // each model fits on this machine.
 
 import { api } from "../api.js";
-import { refreshCatalog, state } from "../app.js";
+import { onState, refreshCatalog, state } from "../app.js";
 import {
   clear, el, empty, fmtBytes, fmtContext, fmtNumber, modal, toast,
 } from "../ui.js";
@@ -28,8 +28,9 @@ export async function renderModels(root) {
     oninput: (event) => { query = event.target.value.toLowerCase(); paint(); },
   });
 
-  const tabs = el("div", { class: "tabs" },
-    ["llm", "vlm", "speech", "vision"].map((name) =>
+  const tabButtons = new Map(
+    ["llm", "vlm", "speech", "vision"].map((name) => [
+      name,
       el("button", {
         class: name === tier ? "active" : "",
         onclick: (event) => {
@@ -38,9 +39,10 @@ export async function renderModels(root) {
           event.currentTarget.classList.add("active");
           paint();
         },
-      }, `${TIER_LABEL[name]} (${state.catalog.filter((m) => m.tier === name).length})`),
-    ),
+      }),
+    ]),
   );
+  const tabs = el("div", { class: "tabs" }, [...tabButtons.values()]);
 
   root.append(
     el("div", { class: "row wrap", style: "margin-bottom:16px" }, [
@@ -163,6 +165,11 @@ export async function renderModels(root) {
   }
 
   function paint() {
+    for (const [name, button] of tabButtons) {
+      const count = state.catalog.filter((m) => m.tier === name).length;
+      button.textContent = `${TIER_LABEL[name]} (${count})`;
+    }
+
     let models = state.catalog.filter((m) => m.tier === tier);
     if (query) {
       models = models.filter((m) =>
@@ -190,6 +197,15 @@ export async function renderModels(root) {
   }
 
   paint();
+
+  // A port or a pull finishing elsewhere changes what belongs in the zoo, so repaint on
+  // a catalog reload instead of waiting for the user to navigate away and back.
+  let seen = state.catalogVersion;
+  return onState(() => {
+    if (state.catalogVersion === seen) return;
+    seen = state.catalogVersion;
+    paint();
+  });
 }
 
 /* ---------- model card ---------- */

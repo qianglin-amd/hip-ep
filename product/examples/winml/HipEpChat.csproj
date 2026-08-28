@@ -1,0 +1,22 @@
+<!--
+Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+Licensed under the MIT License.
+-->
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- net8.0 is the oldest LTS with the C# 12 features used here; a newer SDK builds
+         it unchanged. Retarget freely to match the application you are porting into. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- Run on whatever runtime the machine has, rather than requiring the 8.0 one. -->
+    <RollForward>LatestMajor</RollForward>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>hipep-chat</AssemblyName>
+    <RootNamespace>HipEp.Examples</RootNamespace>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+</Project>

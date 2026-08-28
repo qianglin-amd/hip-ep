@@ -1,0 +1,6 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# The examples need only the OpenAI SDK; oga-server implements its wire protocol.
+# Everything else they use is in the standard library.
+openai>=1.40

@@ -25,6 +25,7 @@ from pathlib import Path
 
 try:
     from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
     from playwright.sync_api import sync_playwright
 except ImportError:  # pragma: no cover - the message is the whole point
     sys.exit("playwright is not installed. Run: pip install playwright")
@@ -250,11 +251,14 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         shot("port-done")
 
         goto("models")
-        page.wait_for_timeout(500)
-        checks.ok(
-            "ported model appears in the zoo",
-            page.locator("text=your import").count() >= 1,
-        )
+        # The zoo repaints when the catalog reload triggered by the finished job lands,
+        # which can be just after this navigation.
+        try:
+            page.wait_for_selector("text=your import", timeout=15_000)
+            tagged = True
+        except PlaywrightTimeout:
+            tagged = False
+        checks.ok("ported model appears in the zoo", tagged)
 
         # An imported model must be usable, not merely listed.
         goto("chat")
@@ -300,10 +304,8 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         checks.ok("sample points at this server", base.split("//")[1] in code, code[:80])
         page.click(".tabs button:nth-child(3)")
         page.wait_for_timeout(300)
-        checks.ok(
-            "c++ sample renders",
-            "curl_easy_setopt" in page.locator(".code-block pre").inner_text(),
-        )
+        cpp = page.locator(".code-block pre").inner_text()
+        checks.ok("c++ sample renders", "http_stream.hpp" in cpp and "post_lines" in cpp)
         shot("develop")
 
         # --- theme -------------------------------------------------------------

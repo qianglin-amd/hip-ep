@@ -8,10 +8,19 @@ the same path a user's application takes, including request parsing, scheduling 
 streaming overhead. A number produced by a private fast path is not a number a user can
 reproduce, and is therefore not worth publishing.
 
-Metrics match the internal dashboard so results are directly comparable:
+Each run is timed twice, because the two views answer different questions:
 
-  TTFT  wall seconds from request submission to the first content token
-  TPS   generated tokens divided by the decode window, excluding TTFT
+  TTFT / TPS          the engine's own measurement, reported in the response's usage
+                      block. Certified numbers are engine measurements, so this is the
+                      view compared against them.
+  e2e TTFT / e2e TPS  what the HTTP client saw, which includes request parsing,
+                      scheduling, SSE framing and the client's own read loop. This is
+                      what an application experiences, and the gap between the two is
+                      reported as `transport_s`.
+
+Comparing an end-to-end number against an engine-level certified number would report
+transport cost as a model regression, which is why the delta uses the engine view and
+the transport cost is shown separately instead of being hidden inside it.
 """
 
 from __future__ import annotations
@@ -98,16 +107,22 @@ class BenchRunner:
                     tokens += 1
 
         end = time.perf_counter()
-        ttft = (first - start) if first else (end - start)
+        e2e_ttft = (first - start) if first else (end - start)
         decode = (end - first) if first else 0.0
+        e2e_tps = tokens / decode if decode > 0 else 0.0
+
+        # Fall back to the client-side view for an engine that reports no usage, so the
+        # harness still produces comparable numbers rather than zeros.
+        engine_ttft = float(usage.get("ttft_s") or 0.0) or e2e_ttft
+        engine_tps = float(usage.get("tps") or 0.0) or e2e_tps
         return {
-            "ttft_s": ttft,
+            "ttft_s": engine_ttft,
+            "tps": engine_tps,
+            "e2e_ttft_s": e2e_ttft,
+            "e2e_tps": e2e_tps,
+            "transport_s": max(0.0, e2e_ttft - engine_ttft),
             "decode_s": decode,
             "tokens": float(tokens),
-            "tps": tokens / decode if decode > 0 else 0.0,
-            # Server-side view, for comparison against the client-side numbers above.
-            "server_ttft_s": float(usage.get("ttft_s") or 0.0),
-            "server_tps": float(usage.get("tps") or 0.0),
             "prompt_tokens": float(usage.get("prompt_tokens") or 0.0),
         }
 
@@ -172,6 +187,7 @@ class BenchRunner:
                 continue
             ttfts = [r["ttft_s"] for r in runs]
             tpss = [r["tps"] for r in runs if r["tps"] > 0]
+            e2e_tpss = [r["e2e_tps"] for r in runs if r["e2e_tps"] > 0]
             contexts[str(context)] = {
                 "ttft_s": round(statistics.median(ttfts), 4),
                 "ttft_min_s": round(min(ttfts), 4),
@@ -179,6 +195,9 @@ class BenchRunner:
                 "tps": round(statistics.median(tpss), 2) if tpss else 0.0,
                 "tps_min": round(min(tpss), 2) if tpss else 0.0,
                 "tps_max": round(max(tpss), 2) if tpss else 0.0,
+                "e2e_ttft_s": round(statistics.median(r["e2e_ttft_s"] for r in runs), 4),
+                "e2e_tps": round(statistics.median(e2e_tpss), 2) if e2e_tpss else 0.0,
+                "transport_s": round(statistics.median(r["transport_s"] for r in runs), 4),
                 "runs": len(runs),
                 "prompt_tokens": int(statistics.median(r["prompt_tokens"] for r in runs)),
             }
@@ -216,7 +235,10 @@ class BenchRunner:
             "harness": "oga-server /v1/chat/completions (streamed)",
         }
         for key, values in contexts.items():
-            line = f"context {key:>6}: TTFT {values['ttft_s']:.3f}s, {values['tps']:.1f} tok/s"
+            line = (
+                f"context {key:>6}: TTFT {values['ttft_s']:.3f}s "
+                f"(+{values['transport_s']:.3f}s over HTTP), {values['tps']:.1f} tok/s"
+            )
             if key in deltas:
                 line += (
                     f"  (vs published: TTFT {deltas[key]['ttft_pct']:+.1f}%, "

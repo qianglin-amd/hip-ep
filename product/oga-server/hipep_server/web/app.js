@@ -16,6 +16,9 @@ import { renderDevelop } from "./views/develop.js";
 export const state = {
   status: null,
   catalog: [],
+  // Bumped on every catalog reload so a view can tell a catalog change from the status
+  // ticks that also notify listeners, and repaint only when its data actually changed.
+  catalogVersion: 0,
   benchmarkMeta: {},
   tiers: [],
   jobs: new Map(),
@@ -126,6 +129,7 @@ async function refreshCatalog() {
   state.catalog = data.models;
   state.benchmarkMeta = data.benchmark;
   state.tiers = data.tiers;
+  state.catalogVersion += 1;
   emit();
 }
 

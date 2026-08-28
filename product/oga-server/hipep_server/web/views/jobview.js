@@ -190,6 +190,10 @@ export function jobPanel(jobId, { onFinish, showResult = true } = {}) {
 /**
  * Render the comparison table a benchmark job produces.
  *
+ * TTFT and tokens/s are the engine's own measurements, which is what the certified
+ * numbers are, so the two are comparable. The extra latency an HTTP client sees on top
+ * of that is shown as a separate line rather than folded into the comparison.
+ *
  * Sign convention: a faster TTFT is a negative percentage on the wire, so it is
  * flipped here to keep "green means better" true for both columns.
  */
@@ -227,6 +231,9 @@ export function benchSummary(summary) {
             el("span", { text: `${fmtNumber(row.ttft_s, 3)} s` }),
             ref.ttft_s
               ? el("div", { class: "faint small", text: `certified ${fmtNumber(ref.ttft_s, 2)} s` })
+              : null,
+            row.e2e_ttft_s
+              ? el("div", { class: "faint small", text: `${fmtNumber(row.e2e_ttft_s, 3)} s end to end` })
               : null,
           ]),
           deltaCell(delta.ttft_pct, true),

@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import math
 import random
 import textwrap
+import time
 from collections.abc import AsyncIterator
 
 from ..catalog import Model
@@ -34,6 +36,17 @@ from .base import (
 # converted artifact from warm page cache on the certification host.
 _LOAD_SECONDS_PER_GB = 0.35
 _MIN_LOAD_SECONDS = 0.4
+
+# Shortest sleep we will ask the event loop for while pacing decode. Windows timer
+# granularity is ~15.6 ms and asyncio runs any timer that falls due within one clock
+# resolution immediately, so a shorter request does not sleep at all. Tokens are
+# coalesced into batches until each sleep clears this bar.
+#
+# The same granularity also makes each sleep overshoot slightly, so a replayed decode
+# rate lands a few percent below the published rate rather than exactly on it. That is
+# the accuracy floor of a userspace clock and it errs on the slow side, which is the
+# safe direction for a number a user might compare against certified results.
+_MIN_PACING_SLEEP = 0.03
 
 
 class ReplayEngine(Engine):
@@ -82,12 +95,24 @@ class ReplayEngine(Engine):
         await self._sleep(ttft)
         watch.mark_first_token()
 
-        interval = 1.0 / tps if tps > 0 else 0.0
+        # Pace against an absolute schedule rather than sleeping once per token, so a
+        # sleep that returns early cannot compound into a response that streams faster
+        # than the rate we are replaying.
+        interval = self._scaled(1.0 / tps) if tps > 0 else 0.0
+        per_sleep = max(1, math.ceil(_MIN_PACING_SLEEP / interval)) if interval > 0 else 1
+        decode_start = time.perf_counter()
+
         emitted = 0
-        for piece in pieces:
+        for index, piece in enumerate(pieces, start=1):
             yield Delta(text=piece)
             emitted += 1
-            await self._sleep(interval)
+            if interval <= 0:
+                continue
+            if index % per_sleep and index != len(pieces):
+                continue
+            remaining = decode_start + index * interval - time.perf_counter()
+            if remaining > 0:
+                await asyncio.sleep(remaining)
 
         watch.finish()
         usage = watch.usage(prompt_tokens, emitted)
@@ -95,10 +120,17 @@ class ReplayEngine(Engine):
 
     # --- internals ------------------------------------------------------------
 
+    def _scaled(self, seconds: float) -> float:
+        """Replay-clock seconds converted to wall-clock seconds."""
+        if self._speed <= 0:
+            return 0.0
+        return seconds / self._speed
+
     async def _sleep(self, seconds: float) -> None:
-        if self._speed <= 0 or seconds <= 0:
+        wall = self._scaled(seconds)
+        if wall <= 0:
             return
-        await asyncio.sleep(seconds / self._speed)
+        await asyncio.sleep(wall)
 
     def _timing(self, model: Model, prompt_tokens: int) -> tuple[float, float]:
         """Published TTFT and TPS at this prompt length, with sane fallbacks."""

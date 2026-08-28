@@ -12,7 +12,7 @@ const SAMPLES = [
     id: "python-openai",
     label: "Python · OpenAI SDK",
     language: "python",
-    file: "examples/python/openai_chat.py",
+    file: "product/examples/python/openai_chat.py",
     note:
       "The server implements the OpenAI chat API, so the official SDK works unchanged. " +
       "Point base_url at oga-server and use any string as the key.",
@@ -41,7 +41,7 @@ for chunk in stream:
     id: "python-vision",
     label: "Python · Vision",
     language: "python",
-    file: "examples/python/vision_chat.py",
+    file: "product/examples/python/vision_chat.py",
     note:
       "Images travel as base64 data URIs. The server never fetches remote URLs, which " +
       "keeps an inference server from becoming an outbound HTTP client.",
@@ -71,50 +71,17 @@ print(response.choices[0].message.content)
     id: "cpp",
     label: "C++ · libcurl",
     language: "cpp",
-    file: "examples/cpp/chat_stream.cpp",
+    file: "product/examples/cpp/chat_stream.cpp",
     note:
-      "No SDK needed: one POST and a line-oriented read of the SSE body. Build with " +
-      "cmake --build examples/cpp/build after configuring with libcurl available.",
-    code: (ctx) => `// cmake -B build -S . && cmake --build build
-#include <curl/curl.h>
-
+      "No SDK and no package manager: one POST and a line-oriented read of the SSE " +
+      "body. http_stream.hpp next to this file carries a small sockets-based transport " +
+      "so it builds on Windows and Linux as-is; swap in libcurl or cpp-httplib and the " +
+      "code below is unchanged.",
+    code: (ctx) => `// cmake -B build -S . && cmake --build build --config Release
 #include <iostream>
 #include <string>
 
-namespace {
-
-// Each SSE frame arrives as "data: {json}\\n\\n". Extracting the delta with a find is
-// enough for a sample; production code should use a JSON parser.
-size_t on_data(char *ptr, size_t size, size_t nmemb, void *userdata) {
-  auto &buffer = *static_cast<std::string *>(userdata);
-  buffer.append(ptr, size * nmemb);
-
-  size_t frame_end;
-  while ((frame_end = buffer.find("\\n\\n")) != std::string::npos) {
-    const std::string frame = buffer.substr(0, frame_end);
-    buffer.erase(0, frame_end + 2);
-    if (frame.rfind("data: ", 0) != 0) continue;
-
-    const std::string payload = frame.substr(6);
-    if (payload == "[DONE]") return size * nmemb;
-
-    const size_t key = payload.find("\\"content\\":\\"");
-    if (key == std::string::npos) continue;
-    size_t i = key + 11;
-    for (; i < payload.size() && payload[i] != '"'; ++i) {
-      if (payload[i] == '\\\\' && i + 1 < payload.size()) {
-        const char escaped = payload[++i];
-        std::cout << (escaped == 'n' ? '\\n' : escaped);
-      } else {
-        std::cout << payload[i];
-      }
-    }
-    std::cout.flush();
-  }
-  return size * nmemb;
-}
-
-}  // namespace
+#include "http_stream.hpp"
 
 int main() {
   const std::string body = R"({
@@ -124,27 +91,30 @@ int main() {
     "stream": true
   })";
 
-  curl_global_init(CURL_GLOBAL_DEFAULT);
-  CURL *curl = curl_easy_init();
-  if (curl == nullptr) return 1;
+  const hipep::Session session;
+  const int status = session.post_lines(
+      "${ctx.base}", "/v1/chat/completions", body, [](const std::string &line) {
+        // Frames arrive as "data: {json}". Finding the delta with a substring search is
+        // enough for a sample; an application should use a real JSON parser.
+        if (line.rfind("data: ", 0) != 0) return;
+        const std::string payload = line.substr(6);
+        if (payload.find("[DONE]") != std::string::npos) return;
 
-  std::string buffer;
-  curl_slist *headers = curl_slist_append(nullptr, "Content-Type: application/json");
-  curl_easy_setopt(curl, CURLOPT_URL, "${ctx.base}/v1/chat/completions");
-  curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-  curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.c_str());
-  curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, on_data);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &buffer);
+        const size_t key = payload.find("\\"content\\":\\"");
+        if (key == std::string::npos) return;
+        for (size_t i = key + 11; i < payload.size() && payload[i] != '"'; ++i) {
+          if (payload[i] == '\\\\' && i + 1 < payload.size()) {
+            const char escaped = payload[++i];
+            std::cout << (escaped == 'n' ? '\\n' : escaped);
+          } else {
+            std::cout << payload[i];
+          }
+        }
+        std::cout.flush();
+      });
 
-  const CURLcode result = curl_easy_perform(curl);
-  if (result != CURLE_OK) {
-    std::cerr << "request failed: " << curl_easy_strerror(result) << "\\n";
-  }
-
-  curl_slist_free_all(headers);
-  curl_easy_cleanup(curl);
-  curl_global_cleanup();
-  return result == CURLE_OK ? 0 : 1;
+  std::cout << "\\n";
+  return status == 200 ? 0 : 1;
 }
 `,
   },
@@ -152,12 +122,12 @@ int main() {
     id: "winml",
     label: "C# · WinML / .NET",
     language: "csharp",
-    file: "examples/winml/ChatClient.cs",
+    file: "product/examples/winml/ChatClient.cs",
     note:
-      "A Windows app usually already has HttpClient. This is the same pattern the " +
-      "WinML sample app uses to talk to a locally running oga-server.",
-    code: (ctx) => `// dotnet add package System.Net.Http.Json
-using System.Net.Http.Json;
+      "A Windows app already has HttpClient and System.Text.Json, so this needs no " +
+      "package reference. ResponseHeadersRead is the detail that matters: the default " +
+      "buffers the whole response and every token arrives at once.",
+    code: (ctx) => `using System.Net.Http.Json;
 using System.Text.Json;
 
 using var http = new HttpClient { BaseAddress = new Uri("${ctx.base}/") };
@@ -170,7 +140,11 @@ var request = new
     stream = true,
 };
 
-using var response = await http.PostAsJsonAsync("v1/chat/completions", request);
+using var message = new HttpRequestMessage(HttpMethod.Post, "v1/chat/completions")
+{
+    Content = JsonContent.Create(request),
+};
+using var response = await http.SendAsync(message, HttpCompletionOption.ResponseHeadersRead);
 response.EnsureSuccessStatusCode();
 
 using var stream = await response.Content.ReadAsStreamAsync();
@@ -197,7 +171,7 @@ Console.WriteLine();
     id: "ollama",
     label: "Ollama clients",
     language: "bash",
-    file: "examples/ollama/README.md",
+    file: "product/examples/ollama/README.md",
     note:
       "The server also answers the Ollama API on the same port, so tools written for " +
       "Ollama work without a code change. Point OLLAMA_HOST at this server.",
@@ -220,7 +194,7 @@ curl ${ctx.base}/api/chat -d '{
     id: "curl",
     label: "curl",
     language: "bash",
-    file: "examples/curl/requests.sh",
+    file: "product/examples/curl/requests.sh",
     note: "Everything the console does is reachable from a shell.",
     code: (ctx) => `# Certified catalog, joined with what is installed here
 curl -s ${ctx.base}/v1/catalog | jq '.models[] | {id, tier, installed, fits}'

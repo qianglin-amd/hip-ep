@@ -32,6 +32,28 @@ def check(name: str, condition: bool, detail: str = "") -> bool:
     return condition
 
 
+def stream_usage(client: httpx.Client, model: str, *, max_tokens: int) -> dict:
+    """Stream a completion and return the usage block from its final frame."""
+    usage: dict = {}
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": "Describe an execution provider."}],
+            "max_tokens": max_tokens,
+            "stream": True,
+        },
+    ) as response:
+        for line in response.iter_lines():
+            if not line.startswith("data: ") or line[6:] == "[DONE]":
+                continue
+            frame = json.loads(line[6:])
+            if frame.get("usage"):
+                usage = frame["usage"]
+    return usage
+
+
 # A 1x1 transparent PNG, small enough to inline and valid enough to decode.
 TINY_PNG = base64.b64decode(
     "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
@@ -140,6 +162,24 @@ def main() -> int:
         first_at is not None,
         f"{first_at:.2f}s" if first_at else "",
     )
+
+    if not engine.get("real", True):
+        # Only meaningful against the replay engine, which is supposed to reproduce the
+        # published rate exactly. Check the fastest certified model: its per-token
+        # interval is the smallest, and an interval below the platform's timer
+        # resolution is what once let a whole response stream out instantly.
+        print("\n== replay pacing ==")
+        rated = [m for m in llms if (m.get("benchmark") or {}).get("tps", {}).get("128")]
+        fastest = max(rated, key=lambda m: m["benchmark"]["tps"]["128"])
+        published_tps = fastest["benchmark"]["tps"]["128"]
+        measured_tps = stream_usage(client, fastest["id"], max_tokens=40).get("tps", 0.0)
+        drift = abs(measured_tps - published_tps) / published_tps * 100
+        check(
+            "streamed decode rate reproduces the published rate",
+            drift <= 20,
+            f"{fastest['id']}: {measured_tps} tok/s vs published {published_tps} "
+            f"({drift:.0f}% off)",
+        )
 
     print("\n== ollama compatibility ==")
     version = client.get("/api/version").json()

@@ -136,15 +136,24 @@ def estimate_tokens(text: str) -> int:
 
     Real tokenization happens inside the engine. This estimate only has to be good
     enough to choose a point on the published TTFT curve and to report a plausible
-    prompt size, so a characters-per-token heuristic is sufficient and, unlike loading
-    a tokenizer, costs nothing and never fails.
+    prompt size, so a heuristic is sufficient and, unlike loading a tokenizer, costs
+    nothing and never fails.
+
+    It does have to be roughly unbiased, though: the replay engine picks its TTFT from
+    this number, and an estimate that runs 25% long makes a benchmark at a labelled
+    context look like a regression against the certified curve for that context.
     """
     if not text:
         return 0
-    words = text.split()
-    # ~1.3 tokens per whitespace word for English prose, with a floor from raw length
-    # so that dense non-Latin text is not badly under-counted.
-    return max(1, int(len(words) * 1.3), len(text) // 4)
+
+    chars = len(text)
+    words = len(text.split())
+    # A space-delimited script averages a little over one BPE token per word. A dense
+    # script (CJK, and text with no spaces at all) has few "words" and needs the
+    # character estimate instead, since BPE splits it far more finely.
+    if words and chars / words <= 12:
+        return max(1, round(words * 1.1))
+    return max(1, chars // 2)
 
 
 def image_prefill_tokens(count: int, resize_height: int = 720) -> int:
