@@ -1,0 +1,24 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Dependencies for the HIP EP product layer (server, toolkit, console, docs).
+# The inference engine itself comes from onnxruntime + onnxruntime-genai + the HIP EP
+# wheel; see product/docs/quickstart-windows.md and quickstart-linux.md for those.
+
+# --- server -------------------------------------------------------------------
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.30,<1.0
+pydantic>=2.7,<3.0
+python-multipart>=0.0.9
+httpx>=0.27
+psutil>=5.9
+
+# --- registry, recipes, artifacts ---------------------------------------------
+PyYAML>=6.0
+Pillow>=10.0
+
+# --- model acquisition --------------------------------------------------------
+huggingface-hub>=0.24
+
+# --- plan deck ----------------------------------------------------------------
+python-pptx>=0.6.23

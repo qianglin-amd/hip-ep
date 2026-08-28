@@ -1,0 +1,10 @@
+# Generated deck previews — regenerate with product/plan/preview_deck.py
+plan/preview/
+
+# Local model store and job workspace — never commit weights or artifacts
+.hipep/
+models/store/
+bench/results/local-*/
+
+# Generated model cards — regenerate with `hipep models cards`
+site/docs/models/generated/
