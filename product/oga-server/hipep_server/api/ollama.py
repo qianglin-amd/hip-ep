@@ -278,10 +278,13 @@ def _durations(usage: dict[str, Any]) -> dict[str, Any]:
     """Translate our usage block into Ollama's nanosecond duration fields."""
     ttft = usage.get("ttft_s", 0.0) or 0.0
     decode = usage.get("decode_s", 0.0) or 0.0
+    load = usage.get("load_s", 0.0) or 0.0
     total = usage.get("total_s", ttft + decode) or 0.0
     return {
-        "total_duration": int(total * NS),
-        "load_duration": 0,
+        # The engine's total excludes the load it did not perform, but an Ollama
+        # client expects total_duration to cover the whole request.
+        "total_duration": int((total + load) * NS),
+        "load_duration": int(load * NS),
         "prompt_eval_count": usage.get("prompt_tokens", 0),
         "prompt_eval_duration": int(ttft * NS),
         "eval_count": usage.get("completion_tokens", 0),

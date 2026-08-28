@@ -81,6 +81,7 @@ class ActiveRequest:
     started_at: float | None = None
     first_token_at: float | None = None
     tokens: int = 0
+    load_s: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         now = time.time()
@@ -99,6 +100,7 @@ class ActiveRequest:
             "state": self.state,
             "wait_s": round((self.started_at or now) - self.queued_at, 2),
             "elapsed_s": round(elapsed, 2),
+            "load_s": round(self.load_s, 3),
             "ttft_s": ttft,
             "tokens": self.tokens,
             "tps": tps,
@@ -221,6 +223,12 @@ class Scheduler:
         try:
             req.state = "loading"
             await self._ensure_capacity(model)
+            # Load here rather than leaving it to the engine's own lazy load, so the
+            # cost is measured and reported. It is the single largest surprise in a
+            # first request, and a client that cannot see it reads it as slow decode.
+            load_started = time.perf_counter()
+            await self.engine.load(model)
+            req.load_s = time.perf_counter() - load_started
             req.state = "prefill"
 
             usage: dict[str, Any] | None = None
@@ -231,6 +239,8 @@ class Scheduler:
                         req.state = "decoding"
                     req.tokens += 1
                 if delta.done:
+                    if delta.usage is not None:
+                        delta.usage["load_s"] = round(req.load_s, 4)
                     usage = delta.usage
                 yield delta
 
