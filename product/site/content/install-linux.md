@@ -40,9 +40,27 @@ python3 -m pip install hipep-server
 Or from this repository:
 
 ```bash
-cd product/oga-server
-python3 -m pip install -e .
+./product/install.sh          # add --dev for the test suite, --quant for porting
 ```
+
+Ubuntu 24.04 and Fedora 40 both refuse a pip install outside a virtualenv, so the script
+creates one at `product/.venv`, installs into it, builds this documentation and finishes
+by running the preflight below.
+
+## Check the machine first
+
+```bash
+hipep doctor
+```
+
+Each line is one precondition — driver, wheels, GPU, store, catalog, port — so a problem
+names the layer that owns it. On Linux the check that most often needs attention is group
+membership: without `render` and `video`, ROCm initialises and then reports no agents,
+which shows up here as `gpu: no AMD GPU detected` rather than as a slow model later.
+
+Warnings are not failures. A machine with no GPU serves the replay engine and runs the
+full test suite. Add `--json` to consume the result from a script, `--no-server` to skip
+the check for a running server.
 
 ## Start the server
 
@@ -89,25 +107,35 @@ authenticate.
 
 ## In a container
 
-The device files and the two groups are the whole trick:
+```bash
+docker compose -f product/docker/compose.yaml up --build
+```
+
+Without compose, the device passthrough has to be spelled out, and it is the whole trick:
 
 ```bash
 docker run --rm -it \
   --device /dev/kfd --device /dev/dri \
   --group-add video --group-add render \
   --security-opt seccomp=unconfined \
-  -p 11434:11434 \
-  -v "$HOME/.hipep:/root/.hipep" \
+  -p 127.0.0.1:11434:11434 \
+  -v hipep-home:/var/lib/hipep \
   hipep/oga-server:latest
 ```
 
-Mounting `~/.hipep` keeps downloaded models outside the container, which matters when a
-model is 12 GB and the container is disposable.
+All four of `/dev/kfd`, `/dev/dri`, `video` and `render` are needed. Miss any one and the
+container starts, ROCm finds no agents, and the server falls back to the replay engine.
+`docker exec -it <container> hipep doctor` says which.
 
-For building the compiler in a container, this repository has `./docker/run.sh build`,
-which creates the image, detects the host architecture, bind-mounts the workspace and runs
-`build.py` inside a compile-only container. It is the authoritative build path on the
-project's Linux host.
+The image does not carry `onnxruntime-genai`, because that wheel is built for one ROCm
+version and one GPU architecture and would fail at the first kernel launch on a different
+machine. Supply yours with `OGA_WHEEL=/path/to/wheel docker compose ... up --build`. See
+[product/docker/README.md](https://github.com/ROCm/hip-ep/tree/main/product/docker).
+
+For building the compiler in a container, this repository has `./docker/run.sh build` at
+the root, which creates the image, detects the host architecture, bind-mounts the
+workspace and runs `build.py` inside a compile-only container. It is the authoritative
+build path on the project's Linux host.
 
 ## Running the tests
 

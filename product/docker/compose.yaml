@@ -1,0 +1,46 @@
+##
+## Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+## Licensed under the MIT License.
+##
+
+# docker compose -f product/docker/compose.yaml up
+#
+# Run from the repository root so the build context resolves.
+
+services:
+  oga-server:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        # A wheel path or index URL for onnxruntime-genai built against this host's
+        # ROCm version and GPU architecture. Empty means the replay engine.
+        OGA_WHEEL: "${OGA_WHEEL:-}"
+    image: hipep/oga-server:latest
+    # Published on the loopback interface only. The server does not authenticate, so
+    # exposing it beyond the host is a decision a deployment makes deliberately.
+    ports:
+      - "127.0.0.1:11434:11434"
+    # The GPU is reachable through these two devices and the two groups that own them.
+    # Without all four, ROCm initialises and then finds no agents.
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    group_add:
+      - video
+      - render
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    # Models are tens of gigabytes and the container is disposable.
+    volumes:
+      - hipep-home:/var/lib/hipep
+    environment:
+      HIPEP_HOME: /var/lib/hipep
+      HIPEP_HOST: 0.0.0.0
+      # Raise on a machine with more memory than one model needs.
+      HIPEP_MAX_LOADED: "2"
+    restart: unless-stopped
+
+volumes:
+  hipep-home:

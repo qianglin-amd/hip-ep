@@ -35,9 +35,37 @@ weights; you choose those next.
 To install from this repository instead:
 
 ```powershell
-cd product\oga-server
-python -m pip install -e .
+.\product\install.ps1
 ```
+
+That creates a virtualenv under `product\.venv`, installs the server and the CLI, builds
+this documentation and finishes by running the preflight below. Add `-Dev` to install and
+run the test suite, `-Quant` to add the porting toolchain.
+
+## Check the machine first
+
+```powershell
+hipep doctor
+```
+
+```text
+hipep doctor on Windows 11 (AMD64)
+
+  ok    python
+        3.12.10 at C:\Python3\Python312\python.exe
+  ok    gpu 0
+        AMD Radeon(TM) 8060S Graphics (gfx1151), 33.9 GB, profile strix-halo
+  warn  engine
+        onnxruntime-genai is not installed; the server will replay published timings
+        try: install onnxruntime-genai to run real models
+  ok    model store
+        C:\Users\you\.hipep, 259 GB free
+```
+
+Each line is one precondition, so a problem names the layer that owns it rather than
+surfacing later as a slow model or a silent CPU fallback. Warnings are not failures: a
+machine with no GPU still serves the replay engine and still runs the test suite. Add
+`--json` to consume it from a script.
 
 ## Start the server
 

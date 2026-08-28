@@ -33,6 +33,7 @@ Goal: the product exists as a runnable thing, and the plan is reviewable.
 | M0.5 Client samples in C++, Python and C# | `hipep-product-m0.5-examples` | Done |
 | M0.6 `hipep` CLI, docs site and peer model sharing | `hipep-product-m0.6-cli-site` | Done |
 | M0.7 Test suite for Windows and Linux | `hipep-product-m0.7-tests` | Done |
+| M0.8 Install path: preflight, installers, container | `hipep-product-m0.8-platform` | Done |
 | M0 complete | `hipep-product-m0` | Done |
 
 ### M0.1 — Plan and review deck
@@ -116,6 +117,21 @@ empty manifest, `load_duration` was hardcoded to zero on the Ollama surface, and
 VLM entries were missing their parameter counts.
 
 Review with: `cd product && pytest`. See [`tests/README.md`](tests/README.md).
+
+### M0.8 — Install path
+
+- `hipep doctor`: preflight over Python, packages, GPU and device profile, engine
+  selection, porting toolchain, model store, catalog, docs and port. Runs without a
+  server, because the install it diagnoses is often the one that cannot start one.
+  Exits non-zero only on a hard failure, so a GPU-free CI runner stays green.
+- `install.sh` and `install.ps1`: virtualenv, install, build the docs, run the preflight.
+  Both refuse an interpreter older than 3.10 rather than failing later in pip.
+- `docker/`: image and compose file for serving on Linux, with the device passthrough
+  spelled out. The image deliberately ships without `onnxruntime-genai`, which is built
+  per ROCm version and GPU architecture; supply one with `OGA_WHEEL`.
+
+Review with: `hipep doctor`, then `docker compose -f product/docker/compose.yaml up`
+on a Linux host.
 
 ---
 

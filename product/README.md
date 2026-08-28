@@ -15,8 +15,17 @@ and benchmark.
 ## Quick start
 
 ```bash
-python -m pip install -r product/requirements.txt
-python -m hipep_server            # http://127.0.0.1:11434
+./product/install.sh        # Linux
+.\product\install.ps1       # Windows
+```
+
+Either one creates a virtualenv, installs the server and the `hipep` CLI, builds the
+documentation, and finishes by running `hipep doctor` so you can see what the machine
+can actually do before starting anything.
+
+```bash
+hipep doctor                # drivers, wheels, GPU, store, catalog, port
+hipep serve                 # http://127.0.0.1:11434
 ```
 
 Open <http://127.0.0.1:11434> for HIP EP Studio, or point any OpenAI or Ollama client
@@ -25,7 +34,7 @@ console, the APIs, the docs and the tests all work on any machine.
 
 See [`site/content/install-windows.md`](site/content/install-windows.md) and
 [`site/content/install-linux.md`](site/content/install-linux.md) for the GPU-backed
-setup.
+setup, and [`docker/`](docker/) to run the server in a container on Linux.
 
 ## Layout
 
@@ -37,6 +46,7 @@ setup.
 | [`toolkit/`](toolkit/) | `hipep` CLI — fetch, export, quantize, convert, validate, benchmark, publish |
 | [`examples/`](examples/) | C++, Python and C# client samples |
 | [`site/`](site/) | Landing page and documentation site: prose in `content/`, generator in `build.py` |
+| [`docker/`](docker/) | Container image and compose file for serving on Linux |
 | [`tests/`](tests/) | Test suite for all of the above |
 
 ## Building and testing
@@ -54,6 +64,10 @@ python site/build.py    # writes the documentation site to site/dist/
 The suite runs against the replay engine with its clock disabled, so it needs no AMD
 GPU, no `onnxruntime-genai` and no network. See [`tests/README.md`](tests/README.md)
 for what each module covers.
+
+When an install misbehaves, `hipep doctor` is the faster answer than the test suite: it
+runs without a server and reports each precondition separately, so the failure names a
+layer instead of a symptom. `hipep doctor --json` is the form to use in a CI step.
 
 ## Principles
 

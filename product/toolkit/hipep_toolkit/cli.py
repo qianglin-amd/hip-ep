@@ -18,6 +18,7 @@ from .client import DEFAULT_URL, ServerError, ServerUnreachable
 
 EPILOG = """\
 examples:
+  hipep doctor                        check drivers, wheels, GPU and store
   hipep serve --port 11434            start the server and the web console
   hipep models --tier vlm             certified vision models
   hipep pull llama3.1:8b              download a certified model
@@ -229,6 +230,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--repeats", type=int, default=3, help="measured runs per context")
     p.add_argument("--warmup", type=int, default=1, help="unmeasured runs per context")
     p.set_defaults(handler=commands.bench)
+
+    # --- diagnostics ---------------------------------------------------------
+    p = sub.add_parser(
+        "doctor",
+        help="check this machine: drivers, wheels, GPU, store, catalog, port",
+        description=(
+            "Preflight the install. Runs without a server and reports each "
+            "precondition separately, so a failure names the layer that owns it. "
+            "Exits non-zero only on a hard failure; a GPU-free machine warns and "
+            "still passes, because it can serve the replay engine and run the tests."
+        ),
+    )
+    _add_common(p)
+    _add_json(p)
+    p.add_argument(
+        "--no-server", action="store_true", help="skip the check for a running server"
+    )
+    p.set_defaults(handler=commands.doctor)
 
     # --- server introspection ------------------------------------------------
     p = sub.add_parser("status", help="engine, hardware, limits, load and sessions")

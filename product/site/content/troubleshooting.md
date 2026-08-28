@@ -8,12 +8,18 @@ order: 60
 Start here:
 
 ```bash
-hipep status
+hipep doctor          # nothing starts, or you are on a new machine
+hipep status          # it started, but something is slow or unexpected
 ```
 
-It names the engine, *why* that engine was selected, the GPU it found, the admission
-limits and what is currently loaded. Most surprises on a new machine are answered by the
-first two lines.
+`doctor` needs no server. It walks the preconditions in dependency order — Python,
+packages, GPU and device profile, engine, porting toolchain, model store, catalog, docs,
+port — and reports each separately, so the answer is a named layer rather than a guess.
+Warnings are not failures; only a hard failure exits non-zero.
+
+`status` asks a running server what it decided: the engine, *why* that engine was
+selected, the GPU it found, the admission limits and what is loaded. Most surprises on a
+new machine are answered by its first two lines.
 
 ## It says replay, and I have a GPU
 

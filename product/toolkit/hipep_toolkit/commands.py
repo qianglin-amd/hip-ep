@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from . import doctor as doctor_mod
 from . import term
 from .client import Client, ServerError
 
@@ -880,4 +881,60 @@ def _watch_ps(client: Client) -> int:
     except KeyboardInterrupt:
         pass
     line.done()
+    return 0
+
+
+# -------------------------------------------------------------------------- doctor
+
+
+STATE_MARK = {
+    doctor_mod.OK: ("green", "ok  "),
+    doctor_mod.WARN: ("yellow", "warn"),
+    doctor_mod.FAIL: ("red", "FAIL"),
+}
+
+
+def doctor(args: argparse.Namespace) -> int:
+    """Report every precondition, then exit non-zero only on a hard failure.
+
+    Warnings are deliberately not failures. A machine with no GPU and no Quark can still
+    serve the replay engine and run the whole test suite, and a preflight that exits
+    non-zero for that would make CI on a GPU-free runner permanently red.
+    """
+    report = doctor_mod.run_checks(
+        getattr(args, "url", None), include_server=not args.no_server
+    )
+    if args.json:
+        _out(json.dumps(report.to_dict(), indent=2))
+        return 0 if report.ok else 1
+
+    _out(term.paint(f"hipep doctor on {doctor_mod.platform_summary()}", "bold"))
+    _out()
+    for check in report.checks:
+        style, label = STATE_MARK.get(check.state, ("dim", check.state))
+        _out(f"  {term.paint(label, style)}  {check.name}")
+        _out(f"        {check.detail}")
+        if check.remedy:
+            _out(f"        {term.paint('try: ' + check.remedy, 'dim')}")
+    _out()
+
+    if report.failures:
+        _out(
+            term.paint(
+                f"{len(report.failures)} check(s) failed. "
+                "Fix the first one and re-run; later checks often depend on it.",
+                "red",
+            )
+        )
+        return 1
+    if report.warnings:
+        _out(
+            term.paint(
+                f"ready, with {len(report.warnings)} warning(s). "
+                "Nothing blocks serving or the test suite.",
+                "yellow",
+            )
+        )
+        return 0
+    _out(term.paint("ready.", "green"))
     return 0

@@ -10,6 +10,7 @@ use. There is no privileged path: if a number or a behaviour differs between the
 your code, that is a bug rather than a configuration difference.
 
 ```bash
+hipep doctor                    # check drivers, wheels, GPU, store, port
 hipep serve                     # start the server and the console
 hipep models                    # the certified zoo
 hipep pull llama3.1:8b          # download a model
@@ -19,6 +20,26 @@ hipep status                    # engine, hardware, load, sessions
 
 Every subcommand except `serve` takes `--url` and honours `$HIPEP_URL`, so the same
 commands manage a server on another machine.
+
+## Checking the machine
+
+```bash
+hipep doctor                    # every precondition, in dependency order
+hipep doctor --json             # the same, for a script or a CI step
+hipep doctor --no-server        # skip the check for a running server
+```
+
+`doctor` is the only subcommand that works without a server, which is the point: it runs
+on a broken install and reports each layer separately, so a failure names the thing that
+owns it instead of surfacing later as a slow model or a silent CPU fallback.
+
+It exits non-zero only on a hard failure. A machine with no GPU and no `onnxruntime-genai`
+warns and still passes, because it can serve the replay engine and run the whole test
+suite — a preflight that failed those would be useless in CI.
+
+The distinction worth knowing: `doctor` inspects **this machine** and needs nothing
+running, while `status` asks **a running server** what it decided. Use `doctor` when
+something will not start and `status` when something is slow.
 
 ## Generating
 

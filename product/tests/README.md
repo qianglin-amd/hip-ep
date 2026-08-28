@@ -39,6 +39,7 @@ pytest -k admission           # by name
 | `test_bench.py` | Prompt/estimator agreement, transport cost accounting, measurement against the published curve |
 | `test_status.py` | Health, status, hardware, multi-user session reporting, stream serialization |
 | `test_toolkit.py` | CLI table alignment and formatting, model-name resolution, argument parsing |
+| `test_doctor.py` | The preflight: every check reports an actionable verdict, a broken install never raises, a GPU-free machine does not fail |
 | `test_site.py` | Documentation build, internal link check, model-card content |
 
 ## Clock compression

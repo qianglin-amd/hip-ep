@@ -35,7 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 # The inference stack. Installed separately in practice because the wheels are
-# platform- and GPU-architecture-specific; see product/docs/quickstart-*.md.
+# platform- and GPU-architecture-specific; see product/site/content/install-*.md.
 gpu = ["onnxruntime-genai", "onnxruntime"]
 # Quantization via AMD Quark.
 quant = ["amd-quark", "torch", "transformers", "datasets", "onnx"]
@@ -50,7 +50,7 @@ oga-server = "hipep_server.__main__:main"
 hipep = "hipep_toolkit.__main__:main"
 
 [project.urls]
-Documentation = "https://github.com/ROCm/hip-ep/tree/main/product/docs"
+Documentation = "https://github.com/ROCm/hip-ep/tree/main/product/site/content"
 Source = "https://github.com/ROCm/hip-ep"
 
 [tool.setuptools]
