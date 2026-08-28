@@ -4,7 +4,11 @@ plan/preview/
 # Local model store and job workspace — never commit weights or artifacts
 .hipep/
 models/store/
-bench/results/local-*/
 
-# Generated model cards — regenerate with `hipep models cards`
-site/docs/models/generated/
+# Generated documentation site — regenerate with product/site/build.py
+site/dist/
+
+# Test and tooling caches
+.pytest_cache/
+.ruff_cache/
+__pycache__/

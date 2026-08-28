@@ -23,8 +23,9 @@ Open <http://127.0.0.1:11434> for HIP EP Studio, or point any OpenAI or Ollama c
 at the same port. Without an AMD GPU the server starts on the replay engine, so the
 console, the APIs, the docs and the tests all work on any machine.
 
-See [`docs/quickstart-windows.md`](docs/quickstart-windows.md) and
-[`docs/quickstart-linux.md`](docs/quickstart-linux.md) for the GPU-backed setup.
+See [`site/content/install-windows.md`](site/content/install-windows.md) and
+[`site/content/install-linux.md`](site/content/install-linux.md) for the GPU-backed
+setup.
 
 ## Layout
 
@@ -34,10 +35,25 @@ See [`docs/quickstart-windows.md`](docs/quickstart-windows.md) and
 | [`oga-server/`](oga-server/) | `hipep_server` — OpenAI- and Ollama-compatible server, plus HIP EP Studio |
 | [`modelzoo/`](modelzoo/) | Certified model registry, published benchmark results, model cards |
 | [`toolkit/`](toolkit/) | `hipep` CLI — fetch, export, quantize, convert, validate, benchmark, publish |
-| [`bench/`](bench/) | Benchmark suites and result archive, all driven through the server |
-| [`examples/`](examples/) | C++, Python and WinML client samples |
-| [`site/`](site/) | Public landing page and documentation site |
-| [`docs/`](docs/) | Product documentation source |
+| [`examples/`](examples/) | C++, Python and C# client samples |
+| [`site/`](site/) | Landing page and documentation site: prose in `content/`, generator in `build.py` |
+| [`tests/`](tests/) | Test suite for all of the above |
+
+## Building and testing
+
+Both work the same way on Windows and Linux, and neither needs a GPU.
+
+```bash
+cd product
+pip install -e ".[dev,site]"
+
+pytest                  # the full suite, about 30 seconds
+python site/build.py    # writes the documentation site to site/dist/
+```
+
+The suite runs against the replay engine with its clock disabled, so it needs no AMD
+GPU, no `onnxruntime-genai` and no network. See [`tests/README.md`](tests/README.md)
+for what each module covers.
 
 ## Principles
 

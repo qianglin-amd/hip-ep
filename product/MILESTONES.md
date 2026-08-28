@@ -9,7 +9,8 @@ re-test any checkpoint:
 
 ```bash
 git checkout <tag>
-python -m pip install -r product/requirements.txt
+cd product && pip install -e ".[dev,site]"
+pytest              # verify the checkpoint still passes
 python -m hipep_server
 ```
 
@@ -31,6 +32,7 @@ Goal: the product exists as a runnable thing, and the plan is reviewable.
 | M0.4 HIP EP Studio console | `hipep-product-m0.4-studio` | Done |
 | M0.5 Model pipeline jobs and the `hipep` toolkit | `hipep-product-m0.5-toolkit` | Done |
 | M0.6 Landing page, docs site and client samples | `hipep-product-m0.6-site` | Done |
+| M0.7 Test suite for Windows and Linux | `hipep-product-m0.7-tests` | Done |
 | M0 complete | `hipep-product-m0` | Done |
 
 ### M0.1 — Plan and review deck
@@ -52,8 +54,7 @@ Review with: open the `.pptx`, or `python product/plan/preview_deck.py` and look
 - Published TTFT and TPS at 128 / 2048 / 16384 context, accuracy where measured, and
   the recipe that reproduces each model.
 
-Review with: `python -m hipep_toolkit models list` and
-`python -m hipep_toolkit models card qwen2.5:14b`.
+Review with: `hipep models` and `hipep show qwen2.5:14b`.
 
 ### M0.3 — Server
 
@@ -78,23 +79,39 @@ Review with: `python -m hipep_server` and open <http://127.0.0.1:11434>.
 
 ### M0.5 — Toolkit and jobs
 
-- `hipep` CLI: `doctor`, `models`, `pull`, `port`, `quantize`, `bench`, `serve`.
-- Job pipeline: fetch → export → quantize → convert → validate → benchmark → publish,
-  each stage resumable and cached, with a live status stream.
+- `hipep` CLI: `serve`, `models`, `show`, `ls`, `rm`, `recipes`, `run`, `pull`, `port`,
+  `bench`, `status`, `ps`, `jobs`, `cancel`.
+- Job pipeline: fetch → inspect → export → quantize → convert → validate → benchmark →
+  publish, each stage resumable and cached, with a live status stream.
 - Quark quantization stages ported from the Quark AI Agent Skills, defaulting to
   `chunk_size=512` and the `prune_logit` method.
 
-Review with: `python -m hipep_toolkit doctor` and
-`python -m hipep_toolkit port <hf-id> --dry-run`.
+Review with: `hipep status`, then `hipep port <hf-id>` and watch the stages.
 
 ### M0.6 — Site and samples
 
 - Landing page and documentation site under `product/site/`, served by the server at
   `/docs` and publishable as static files.
 - Model cards generated from the registry.
-- Client samples in C++, Python and WinML under `product/examples/`.
+- Client samples in C++, Python and C# under `product/examples/`.
 
-Review with: `python -m hipep_server` and open <http://127.0.0.1:11434/docs>.
+Review with: `python site/build.py`, then `python -m hipep_server` and open
+<http://127.0.0.1:11434/docs>.
+
+### M0.7 — Test suite
+
+- 153 tests over the catalog, both API surfaces, admission control, the job pipeline,
+  peer artifact sharing, the benchmark harness, the CLI and the documentation build.
+- Runs on Windows and Linux with no GPU, no `onnxruntime-genai` and no network, in
+  about 30 seconds.
+- Clock compression (`HIPEP_REPLAY_SPEED`, `HIPEP_SIM_SPEED`) so replayed timings and
+  simulated pipeline stages do not have to be waited out.
+
+Found and fixed while writing it: a simulated port produced a share URL that served an
+empty manifest, `load_duration` was hardcoded to zero on the Ollama surface, and seven
+VLM entries were missing their parameter counts.
+
+Review with: `cd product && pytest`. See [`tests/README.md`](tests/README.md).
 
 ---
 
