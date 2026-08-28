@@ -42,6 +42,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
 @dataclass
 class Settings:
     """Resolved server settings.
@@ -63,13 +70,24 @@ class Settings:
     benchmarks_dir: Path = field(
         default_factory=lambda: PRODUCT_DIR / "modelzoo" / "benchmarks"
     )
-    recipes_dir: Path = field(default_factory=lambda: PRODUCT_DIR / "toolkit" / "recipes")
+    # Recipes live inside the hipep_toolkit package so that they ship in its wheel and
+    # a pip install of the toolkit alone can still port a model.
+    recipes_dir: Path = field(
+        default_factory=lambda: PRODUCT_DIR / "toolkit" / "hipep_toolkit" / "recipes"
+    )
     web_dir: Path = field(default_factory=lambda: PACKAGE_DIR / "web")
-    site_dir: Path = field(default_factory=lambda: PRODUCT_DIR / "site")
+    # The generated documentation site, not its sources. Absent until someone runs
+    # product/site/build.py, which the server treats as optional.
+    site_dir: Path = field(default_factory=lambda: PRODUCT_DIR / "site" / "dist")
 
     # Engine selection. "auto" picks OGA when onnxruntime_genai and an AMD GPU are both
     # present, and the replay engine otherwise.
     engine: str = field(default_factory=lambda: os.environ.get("HIPEP_ENGINE", "auto"))
+
+    # Replay-clock compression. 1.0 replays the certified timings in real time, which is
+    # what a demo wants; 0 removes the pacing entirely so a test suite is not forced to
+    # spend certified seconds waiting for placeholder text.
+    replay_speed: float = field(default_factory=lambda: _env_float("HIPEP_REPLAY_SPEED", 1.0))
 
     # Scheduler limits. max_loaded_models is an admission-control bound, not a queue
     # bound: exceeding it evicts the least recently used model rather than failing.
@@ -92,6 +110,11 @@ class Settings:
     # Job pipeline concurrency. Conversion and quantization are memory hungry; running
     # more than one at a time on a single box reliably ends in an OOM.
     max_concurrent_jobs: int = field(default_factory=lambda: _env_int("HIPEP_MAX_JOBS", 1))
+
+    # Clock compression for simulated pipeline stages, which exist only on a host with
+    # no export toolchain. 1.0 runs the script at demo pace; a test suite raises it so
+    # the stage sequencing can be verified without waiting out the pretend work.
+    simulation_speed: float = field(default_factory=lambda: _env_float("HIPEP_SIM_SPEED", 1.0))
 
     @property
     def models_dir(self) -> Path:

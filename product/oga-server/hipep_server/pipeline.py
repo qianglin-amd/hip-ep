@@ -63,6 +63,13 @@ BENCH_STAGES = [
     ("summarize", "Summarize"),
 ]
 
+IMPORT_STAGES = [
+    ("manifest", "Read peer manifest"),
+    ("transfer", "Transfer files"),
+    ("verify", "Verify artifact"),
+    ("register", "Register in local zoo"),
+]
+
 
 class Pipeline:
     def __init__(
@@ -81,6 +88,7 @@ class Pipeline:
         # Simulation follows the engine: a replay-engine server has no real toolchain
         # behind it, so pretending otherwise would only produce confusing failures.
         self.simulate = simulate
+        self.sim_speed = max(0.0, settings.simulation_speed)
 
     # --- pull -----------------------------------------------------------------
 
@@ -138,12 +146,11 @@ class Pipeline:
                     "weights.",
                     level="warning",
                 )
-                await _simulated_transfer(ctx, total, seconds=6.0)
-                target.mkdir(parents=True, exist_ok=True)
-                (target / "SIMULATED").write_text(
+                await _simulated_transfer(ctx, total, seconds=6.0, speed=self.sim_speed)
+                _write_simulation_note(
+                    target,
                     f"Simulated pull of {model.id} from {repo}.\n"
                     "No weights were downloaded.\n",
-                    encoding="utf-8",
                 )
                 return
 
@@ -224,6 +231,161 @@ class Pipeline:
 
         return stage
 
+    # --- import from a peer server -------------------------------------------
+
+    def start_import(self, *, url: str, model_id: str, name: str | None = None) -> Job:
+        """Install a model that another oga-server is sharing.
+
+        This is the receiving half of the share URL a port job prints: the peer serves
+        a manifest and its files, and this job reproduces the artifact and the catalog
+        entry here so the model behaves like any other local install.
+        """
+        target_id = name or model_id
+        job = self.jobs.create(
+            kind="import",
+            title=f"Import {model_id} from {url}",
+            stages=[Stage(name=n, label=label) for n, label in IMPORT_STAGES],
+            params={"url": url.rstrip("/"), "model": model_id, "name": target_id},
+        )
+        return self.jobs.start(job, self._import_stages(job))
+
+    def _import_stages(self, job: Job) -> dict[str, Any]:
+        params = job.params
+        peer, remote_id, local_id = params["url"], params["model"], params["name"]
+
+        async def manifest(ctx: JobContext) -> None:
+            import httpx
+
+            endpoint = f"{peer}/v1/artifacts/{remote_id}"
+            ctx.log(f"GET {endpoint}")
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(endpoint)
+            if response.status_code == 404:
+                raise RuntimeError(
+                    f"{peer} is not sharing '{remote_id}'. Check the id with "
+                    f"`curl {peer}/v1/local`."
+                )
+            response.raise_for_status()
+            data = response.json()
+            files = data.get("files") or []
+            if not files:
+                raise RuntimeError(f"{peer} reports '{remote_id}' has no files to transfer")
+            ctx.job.params["manifest"] = data
+            ctx.result(
+                files=len(files),
+                total_bytes=data.get("total_bytes", 0),
+                completed_bytes=0,
+                peer_origin=data.get("origin"),
+            )
+            ctx.log(
+                f"{len(files)} files, {_human(data.get('total_bytes') or 0)}, "
+                f"recipe {data.get('recipe') or 'unknown'}"
+            )
+            ctx.progress(1.0)
+
+        async def transfer(ctx: JobContext) -> None:
+            import httpx
+
+            data = ctx.job.params["manifest"]
+            files = data["files"]
+            total = data.get("total_bytes") or 1
+            target = self.store.path_for(local_id)
+            target.mkdir(parents=True, exist_ok=True)
+            done = 0
+
+            async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, read=None)) as client:
+                for entry in files:
+                    ctx.check_cancelled()
+                    destination = target / entry["path"]
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    if (
+                        destination.is_file()
+                        and destination.stat().st_size == entry["size_bytes"]
+                    ):
+                        # Re-running an interrupted import should not re-fetch the
+                        # shards that already arrived intact.
+                        done += entry["size_bytes"]
+                        ctx.log(f"{entry['path']} already present, skipping")
+                        ctx.progress(min(0.99, done / total), _human(done))
+                        continue
+
+                    url = f"{peer}/v1/artifacts/{remote_id}/files/{entry['path']}"
+                    partial = destination.with_suffix(destination.suffix + ".part")
+                    async with client.stream("GET", url) as response:
+                        response.raise_for_status()
+                        with partial.open("wb") as handle:
+                            async for chunk in response.aiter_bytes(1024 * 1024):
+                                handle.write(chunk)
+                                done += len(chunk)
+                                ctx.progress(min(0.99, done / total), _human(done))
+                    partial.replace(destination)
+                    ctx.result(completed_bytes=done)
+
+            ctx.progress(1.0, _human(done))
+
+        async def verify(ctx: JobContext) -> None:
+            data = ctx.job.params["manifest"]
+            target = self.store.path_for(local_id)
+            mismatched = []
+            for entry in data["files"]:
+                path = target / entry["path"]
+                if not path.is_file() or path.stat().st_size != entry["size_bytes"]:
+                    mismatched.append(entry["path"])
+            if mismatched:
+                raise RuntimeError(
+                    "transfer incomplete: "
+                    + ", ".join(mismatched[:5])
+                    + (f" and {len(mismatched) - 5} more" if len(mismatched) > 5 else "")
+                )
+            runnable = (target / "genai_config.json").is_file()
+            ctx.log(
+                "genai_config.json present; artifact is runnable"
+                if runnable
+                else "genai_config.json missing; the peer shared an unconverted artifact"
+            )
+            ctx.result(ready=runnable)
+            ctx.progress(1.0)
+
+        async def register(ctx: JobContext) -> None:
+            data = ctx.job.params["manifest"]
+            extra = dict(data.get("extra") or {})
+            catalog_entry = data.get("catalog")
+            if catalog_entry:
+                # Carry the peer's catalog metadata so the imported model shows the
+                # same quantization schema and capabilities it had at its origin.
+                for key in (
+                    "name",
+                    "tier",
+                    "type",
+                    "family",
+                    "base_model",
+                    "description",
+                    "quantization",
+                    "context",
+                    "capabilities",
+                    "footprint",
+                ):
+                    if catalog_entry.get(key) is not None:
+                        extra.setdefault(key, catalog_entry[key])
+            local = self.store.register(
+                local_id,
+                origin="imported",
+                source=f"{peer}/v1/artifacts/{remote_id}",
+                recipe=data.get("recipe"),
+                extra=extra,
+            )
+            entry = self.catalog.register(model_from_local(local))
+            ctx.result(model=local_id, path=local.path, size_gb=local.size_gb)
+            ctx.log(f"registered {local_id} as a {entry.status} model ({local.size_gb} GB)")
+            ctx.progress(1.0)
+
+        return {
+            "manifest": manifest,
+            "transfer": transfer,
+            "verify": verify,
+            "register": register,
+        }
+
     # --- port (bring your own model) -----------------------------------------
 
     def start_port(self, spec: dict[str, Any]) -> Job:
@@ -258,7 +420,7 @@ class Pipeline:
                     await fn(ctx, params, store=self.store)
                     return
                 ctx.log(f"toolkit has no '{stage_name}' stage; simulating", level="warning")
-            await _simulate_port_stage(ctx, stage_name, params)
+            await _simulate_port_stage(ctx, stage_name, params, speed=self.sim_speed)
 
         def make(stage_name: str):
             async def stage(ctx: JobContext) -> None:
@@ -271,6 +433,17 @@ class Pipeline:
         async def publish(ctx: JobContext) -> None:
             await run("publish", ctx)
             model_id = params["name"]
+            if self.simulate:
+                # A simulated port produces no artifact, but it still hands out a share
+                # URL. Without something on disk that URL would resolve to an empty
+                # manifest, and an import of it would succeed while installing nothing.
+                _write_simulation_note(
+                    self.store.path_for(model_id),
+                    f"Simulated port of {params['source']} as {model_id}.\n"
+                    f"Plan: {params.get('quantization')} chunk_size="
+                    f"{params.get('chunk_size')} prune_logit={params.get('prune_logit')}\n"
+                    "No weights were exported, quantized or converted.\n",
+                )
             local = self.store.register(
                 model_id,
                 origin="imported",
@@ -290,19 +463,19 @@ class Pipeline:
             entry = self.catalog.register(model_from_local(local))
 
             share_url = f"{self.settings.base_url}/v1/catalog/{model_id}"
-            download_url = f"{self.settings.base_url}/api/artifacts/{model_id}"
+            manifest_url = f"{self.settings.base_url}/v1/artifacts/{model_id}"
             ctx.result(
                 model=model_id,
                 path=local.path,
                 share_url=share_url,
-                download_url=download_url,
+                download_url=manifest_url,
                 share_command=f"hipep pull {model_id} --from {self.settings.base_url}",
                 openai_base_url=f"{self.settings.base_url}/v1",
                 simulated=self.simulate,
             )
             ctx.log(f"published {model_id} as a {entry.status} model")
             ctx.log(f"share:    {share_url}")
-            ctx.log(f"download: {download_url}")
+            ctx.log(f"artifact: {manifest_url}")
             ctx.log(
                 f"chat:     POST {self.settings.base_url}/v1/chat/completions "
                 f'with {{"model": "{model_id}"}}'
@@ -368,11 +541,26 @@ class Pipeline:
 # --- simulation ---------------------------------------------------------------
 
 
-async def _simulated_transfer(ctx: JobContext, total: int, seconds: float) -> None:
+def _write_simulation_note(target: Path, text: str) -> None:
+    """Leave a marker in place of the artifact a simulated stage did not produce."""
+    target.mkdir(parents=True, exist_ok=True)
+    (target / "SIMULATED").write_text(text, encoding="utf-8")
+
+
+async def _sim_sleep(seconds: float, speed: float) -> None:
+    """Sleep for a simulated stage, compressed by `speed`. 0 removes the wait."""
+    if speed <= 0:
+        return
+    await asyncio.sleep(seconds / speed)
+
+
+async def _simulated_transfer(
+    ctx: JobContext, total: int, seconds: float, speed: float = 1.0
+) -> None:
     steps = 40
     for i in range(1, steps + 1):
         ctx.check_cancelled()
-        await asyncio.sleep(seconds / steps)
+        await _sim_sleep(seconds / steps, speed)
         got = int(total * i / steps)
         ctx.result(completed_bytes=got)
         ctx.progress(i / steps, f"{_human(got)} / {_human(total)}")
@@ -429,7 +617,7 @@ _PORT_STAGE_SCRIPT: dict[str, tuple[float, list[str]]] = {
 
 
 async def _simulate_port_stage(
-    ctx: JobContext, stage_name: str, params: dict[str, Any]
+    ctx: JobContext, stage_name: str, params: dict[str, Any], speed: float = 1.0
 ) -> None:
     seconds, steps = _PORT_STAGE_SCRIPT.get(stage_name, (2.0, ["working"]))
     ctx.log(
@@ -448,7 +636,7 @@ async def _simulate_port_stage(
     for i, step in enumerate(steps, 1):
         ctx.check_cancelled()
         ctx.log(step)
-        await asyncio.sleep(per)
+        await _sim_sleep(per, speed)
         ctx.progress(i / len(steps), step)
     ctx.result(simulated=True)
 

@@ -55,15 +55,30 @@ class Benchmark:
 
     @property
     def context_lengths(self) -> list[int]:
-        return sorted(self.ttft_s)
+        """Prompt lengths this model was measured at.
+
+        Speech and vision results are scalars, and are stored under the sentinel key 0
+        so that one Benchmark type serves every tier. Zero is not a prompt length, so
+        it is excluded here: an empty list is what tells a caller "this model has no
+        per-context series" rather than "measured at a zero-token prompt".
+        """
+        return sorted(n for n in self.ttft_s if n > 0)
+
+    # A prompt within this ratio of a measured context is treated as that context.
+    # TTFT rises steeply between the measured points, so interpolating a length that
+    # is only a token-estimate away from 2048 can shift TTFT by tens of percent. The
+    # measured value is the better answer there than a slope drawn through two points
+    # an order of magnitude apart.
+    SNAP_RATIO = 1.15
 
     def at(self, context: int) -> tuple[float | None, float | None]:
-        """Interpolate TTFT and TPS for an arbitrary prompt length.
+        """TTFT and TPS for an arbitrary prompt length.
 
-        Published numbers exist at 128 / 2048 / 16384 only. The replay engine and the
-        console both need a value at whatever length the user actually typed, so we
-        interpolate linearly in log-context space, which tracks the measured curves
-        much better than linear-in-tokens does.
+        Published numbers exist at 128 / 2048 / 16384 only, but the replay engine and
+        the console need a value at whatever length the user actually typed. A length
+        close to a measured context uses that measurement; anything else interpolates
+        linearly in log-context space, which tracks the measured curves much better
+        than linear-in-tokens does.
         """
         lengths = self.context_lengths
         if not lengths:
@@ -73,6 +88,9 @@ class Benchmark:
             known = [(n, series[n]) for n in lengths if series.get(n) is not None]
             if not known:
                 return None
+            for length, value in known:
+                if 1 / self.SNAP_RATIO <= context / length <= self.SNAP_RATIO:
+                    return value
             if context <= known[0][0]:
                 return known[0][1]
             if context >= known[-1][0]:
@@ -155,6 +173,23 @@ class Model:
         return float(value) if value is not None else None
 
     @property
+    def weights_gb(self) -> float:
+        """On-disk size of the quantized weights, estimated when not measured.
+
+        Not every certified entry has a measured artifact size. The declared VRAM floor
+        is the next best evidence, since it was chosen to hold the weights plus a KV
+        cache and working set. Across the generative entries that publish both numbers
+        the weights take 0.51 to 0.85 of the floor, so the midpoint is used here. This
+        only feeds size estimates such as replayed load time, never a real allocation.
+        """
+        measured = self.footprint.get("weights_gb")
+        if measured is not None:
+            return float(measured)
+        if self.min_vram_gb is not None:
+            return self.min_vram_gb * 0.7
+        return 4.0
+
+    @property
     def quant_label(self) -> str:
         """Short human label such as "INT4 AWQ g128" for lists and cards."""
         q = self.quantization or {}
@@ -231,6 +266,11 @@ class Catalog:
         return True
 
     # --- lookup ---------------------------------------------------------------
+
+    @property
+    def models(self) -> list[Model]:
+        """Every entry, in the same order `list()` returns."""
+        return self.list()
 
     def __len__(self) -> int:
         return len(self._models)

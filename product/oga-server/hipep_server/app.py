@@ -34,7 +34,7 @@ An OpenAI- and Ollama-compatible inference server for AMD GPUs, backed by HIP EP
 * **OpenAI** — point any OpenAI SDK at `/v1` and change nothing else.
 * **Ollama** — the default port is 11434, so existing Ollama clients work as-is.
 * **Console** — HIP EP Studio is served at `/`.
-* **Docs** — the product documentation is served at `/docs-site`.
+* **Docs** — the generated documentation site is served at `/docs`, when it has been built.
 
 Chat responses carry `ttft_s`, `decode_s` and `tps` in the usage block, because a local
 inference server that cannot tell you its latency is not much use.
@@ -163,7 +163,9 @@ def _mount_static(app: FastAPI, settings: Settings) -> None:
         if assets.is_dir():
             app.mount("/assets", StaticFiles(directory=str(assets)), name="assets")
 
-        @app.get("/landing", include_in_schema=False)
+        # response_model=None: the return type is a union of Response subclasses, and
+        # FastAPI would otherwise try to derive a Pydantic response model from it.
+        @app.get("/landing", include_in_schema=False, response_model=None)
         async def landing() -> FileResponse | RedirectResponse:
             index = site / "index.html"
             if index.is_file():

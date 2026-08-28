@@ -4,8 +4,8 @@
 
 Recipes are the reproducible half of the model zoo: each certified model names the
 recipe that produced it, and a user porting their own model picks one as a starting
-point. They are plain YAML under toolkit/recipes/ so a user can copy one, edit two
-fields and run it.
+point. They are plain YAML in the hipep_toolkit package so a user can copy one, edit
+two fields and run it.
 """
 
 from __future__ import annotations

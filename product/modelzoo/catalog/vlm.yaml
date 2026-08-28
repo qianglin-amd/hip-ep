@@ -53,7 +53,7 @@ models:
     type: image-text-to-text
     base_model: Qwen/Qwen3.5-9B
     license: apache-2.0
-    parameters: null
+    parameters: 9B
     description: >-
       Dense mid-size VLM with strong document and chart understanding. The best
       accuracy-per-gigabyte option in the VLM tier.
@@ -83,7 +83,7 @@ models:
     type: image-text-to-text
     base_model: Qwen/Qwen3.5-35B-A3B
     license: apache-2.0
-    parameters: null
+    parameters: 35B
     active_parameters: ~3B
     description: >-
       Sparse mixture-of-experts VLM. Roughly four times the parameters of the 9B dense
@@ -114,7 +114,7 @@ models:
     type: image-text-to-text
     base_model: Qwen/Qwen3.6-27B
     license: apache-2.0
-    parameters: null
+    parameters: 27B
     description: >-
       Dense 27B VLM. The heaviest dense vision model we certify; prefer the A3B sparse
       variants unless you specifically need dense-model behaviour.
@@ -144,7 +144,7 @@ models:
     type: image-text-to-text
     base_model: Qwen/Qwen3.6-35B-A3B
     license: apache-2.0
-    parameters: null
+    parameters: 35B
     active_parameters: ~3B
     description: >-
       The fastest large VLM in the catalog and the default recommendation for vision
@@ -175,7 +175,7 @@ models:
     type: image-text-to-text
     base_model: Qwen/Qwen3.8-27B
     license: apache-2.0
-    parameters: null
+    parameters: 27B
     description: >-
       Newest Qwen vision generation in the catalog, quantized with k-quant at group 128
       rather than the group-32 RTN used by the 3.5 and 3.6 entries.
@@ -205,7 +205,7 @@ models:
     type: image-text-to-text
     base_model: google/gemma-4-12b-it
     license: gemma
-    parameters: null
+    parameters: 12B
     description: >-
       Dense Gemma 4 vision model. Very fast at short context, but throughput falls off
       sharply past 8k tokens — check the published 16384 numbers before committing to
@@ -236,7 +236,7 @@ models:
     type: image-text-to-text
     base_model: google/gemma-4-26B-A4B-it
     license: gemma
-    parameters: null
+    parameters: 26B
     active_parameters: ~4B
     description: >-
       Sparse mixture-of-experts Gemma 4. Quantized with the MoE-aware qmoe path, which

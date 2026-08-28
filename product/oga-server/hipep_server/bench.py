@@ -46,11 +46,14 @@ _FILLER = (
 
 
 def build_prompt(target_tokens: int) -> str:
-    """A prompt of approximately `target_tokens` tokens."""
+    """A prompt of approximately `target_tokens` tokens.
+
+    One filler word is one token: every word above is common enough to be a single
+    BPE token in the tokenizers the certified models use, so the word count is the
+    token count to within a percent or two.
+    """
     words = _FILLER.split()
-    needed = max(1, int(target_tokens / 1.05))
-    out = [words[i % len(words)] for i in range(needed)]
-    return " ".join(out)
+    return " ".join(words[i % len(words)] for i in range(max(1, target_tokens)))
 
 
 class BenchRunner:
@@ -115,12 +118,16 @@ class BenchRunner:
         # harness still produces comparable numbers rather than zeros.
         engine_ttft = float(usage.get("ttft_s") or 0.0) or e2e_ttft
         engine_tps = float(usage.get("tps") or 0.0) or e2e_tps
+        # Warmup normally absorbs the model load, but --warmup 0 leaves it in the first
+        # run, where it would otherwise be charged to transport.
+        load = float(usage.get("load_s") or 0.0)
         return {
             "ttft_s": engine_ttft,
             "tps": engine_tps,
             "e2e_ttft_s": e2e_ttft,
             "e2e_tps": e2e_tps,
-            "transport_s": max(0.0, e2e_ttft - engine_ttft),
+            "load_s": load,
+            "transport_s": max(0.0, e2e_ttft - engine_ttft - load),
             "decode_s": decode,
             "tokens": float(tokens),
             "prompt_tokens": float(usage.get("prompt_tokens") or 0.0),

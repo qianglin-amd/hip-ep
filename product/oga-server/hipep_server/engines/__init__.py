@@ -48,7 +48,7 @@ def select_engine(settings: Settings, host: HostInfo) -> tuple[Engine, str]:
     choice = (settings.engine or "auto").lower()
 
     if choice == "replay":
-        return ReplayEngine(), "replay engine requested via HIPEP_ENGINE"
+        return _replay(settings), "replay engine requested via HIPEP_ENGINE"
 
     if choice == "oga":
         ok, why = oga_available()
@@ -61,12 +61,16 @@ def select_engine(settings: Settings, host: HostInfo) -> tuple[Engine, str]:
     # auto
     ok, why = oga_available()
     if not ok:
-        return ReplayEngine(), f"{why}; falling back to the replay engine"
+        return _replay(settings), f"{why}; falling back to the replay engine"
     if not host.has_amd_gpu:
-        return ReplayEngine(), "no AMD GPU detected; falling back to the replay engine"
+        return _replay(settings), "no AMD GPU detected; falling back to the replay engine"
     gpu = host.primary_gpu
     log.info("selected OGA engine on %s (%s)", gpu.name, gpu.gfx_arch)
     return (
         OgaEngine(models_dir=settings.models_dir),
         f"onnxruntime-genai on {gpu.name} ({gpu.gfx_arch})",
     )
+
+
+def _replay(settings: Settings) -> ReplayEngine:
+    return ReplayEngine(speed=settings.replay_speed)

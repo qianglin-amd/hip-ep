@@ -64,8 +64,7 @@ class ReplayEngine(Engine):
     async def load(self, model: Model) -> None:
         if model.id in self._loaded:
             return
-        weights_gb = float((model.footprint or {}).get("weights_gb") or 4.0)
-        await self._sleep(max(_MIN_LOAD_SECONDS, weights_gb * _LOAD_SECONDS_PER_GB))
+        await self._sleep(max(_MIN_LOAD_SECONDS, model.weights_gb * _LOAD_SECONDS_PER_GB))
         self._loaded[model.id] = model
 
     async def unload(self, model_id: str) -> None:
@@ -140,7 +139,7 @@ class ReplayEngine(Engine):
                 return float(ttft), float(tps)
         # No published numbers: fall back to a rough size-based model so a
         # newly imported model still streams at a believable rate.
-        weights_gb = float((model.footprint or {}).get("weights_gb") or 8.0)
+        weights_gb = model.weights_gb
         return 0.2 + weights_gb * 0.02, max(4.0, 320.0 / max(1.0, weights_gb))
 
     def _compose(
