@@ -12,7 +12,9 @@ code in this module knows the name of any individual model.
 from __future__ import annotations
 
 import copy
+import math
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -75,10 +77,8 @@ class Benchmark:
                 return known[0][1]
             if context >= known[-1][0]:
                 return known[-1][1]
-            for (x0, y0), (x1, y1) in zip(known, known[1:]):
+            for (x0, y0), (x1, y1) in zip(known, known[1:], strict=False):
                 if x0 <= context <= x1:
-                    import math
-
                     span = math.log(x1) - math.log(x0)
                     t = 0.0 if span == 0 else (math.log(context) - math.log(x0)) / span
                     return y0 + t * (y1 - y0)
@@ -159,7 +159,10 @@ class Model:
         """Short human label such as "INT4 AWQ g128" for lists and cards."""
         q = self.quantization or {}
         scheme = (q.get("scheme") or "").upper()
-        if scheme in {"", "NONE"}:
+        if scheme == "":
+            # An imported model may only know which recipe produced it.
+            return str(q.get("recipe") or q.get("weight_dtype") or "fp16").upper()
+        if scheme == "NONE":
             return str(q.get("weight_dtype", "fp16")).upper()
         dtype = str(q.get("weight_dtype", "int4")).upper()
         parts = [dtype, scheme]
@@ -201,11 +204,31 @@ class Model:
 
 
 class Catalog:
-    """In-memory view of the certified model registry."""
+    """In-memory view of the model registry.
+
+    Holds the certified models loaded from YAML plus any the user imported on this
+    machine. Imported entries are registered at runtime so that a model someone just
+    ported is immediately usable everywhere a certified one is: /v1/models, chat, the
+    benchmark harness and the console.
+    """
 
     def __init__(self, models: list[Model], benchmark_meta: dict[str, Any]):
         self._models = {m.id: m for m in models}
         self.benchmark_meta = benchmark_meta
+
+    def register(self, model: Model) -> Model:
+        """Add or replace an entry. Used for models imported on this machine."""
+        self._models[model.id] = model
+        return model
+
+    def unregister(self, model_id: str) -> bool:
+        model = self._models.get(model_id)
+        if model is None or model.status == "certified":
+            # Removing a certified entry would make the catalog depend on install
+            # state, which is exactly the coupling this class exists to avoid.
+            return False
+        del self._models[model_id]
+        return True
 
     # --- lookup ---------------------------------------------------------------
 
@@ -298,6 +321,12 @@ def _load_tier(path: Path) -> list[Model]:
     return models
 
 
+def _as_text(value: Any) -> str | None:
+    if value is None:
+        return None
+    return value.isoformat() if isinstance(value, date | datetime) else str(value)
+
+
 def _latest_benchmark_file(benchmarks_dir: Path) -> Path | None:
     files = sorted(benchmarks_dir.glob("*.yaml"))
     return files[-1] if files else None
@@ -315,7 +344,9 @@ def load_catalog(catalog_dir: Path, benchmarks_dir: Path) -> Catalog:
         meta = {
             "release": raw.get("release"),
             "previous_release": raw.get("previous_release"),
-            "run_date": raw.get("run_date"),
+            # YAML parses an unquoted date into datetime.date, which is not JSON
+            # serializable and would break the status stream mid-flight.
+            "run_date": _as_text(raw.get("run_date")),
             "source": raw.get("source"),
             "harness": raw.get("harness"),
             "device": raw.get("device", {}),
@@ -352,3 +383,55 @@ def load_catalog(catalog_dir: Path, benchmarks_dir: Path) -> Catalog:
                 model.benchmark = bench
 
     return Catalog(models, meta)
+
+
+def model_from_local(local: Any) -> Model:
+    """Synthesize a catalog entry for a model installed on this machine.
+
+    A ported model has no certification and no published benchmark, but it must still
+    be a first-class `Model`, or the request path would need a second lookup and every
+    caller would have to know which kind of model it is holding. Metadata the port job
+    recorded is used where available; the rest is left empty rather than invented.
+    """
+    extra = getattr(local, "extra", None) or {}
+    quantization = extra.get("quantization")
+    if isinstance(quantization, str):
+        # Older sidecars recorded only the recipe id. Keep it rather than guessing a
+        # scheme from the name; quant_label falls back to showing the recipe.
+        quantization = {"recipe": quantization}
+    elif not isinstance(quantization, dict):
+        quantization = {}
+    if extra.get("chunk_size") is not None:
+        quantization.setdefault("chunk_size", extra["chunk_size"])
+    if extra.get("prune_logit") is not None:
+        quantization.setdefault("prune_logit", extra["prune_logit"])
+
+    return Model(
+        id=local.id,
+        name=extra.get("name") or local.id,
+        tier=extra.get("tier") or "llm",
+        type=extra.get("type") or "text-to-text",
+        family=extra.get("family"),
+        base_model=extra.get("base_model") or local.source,
+        description=extra.get("description")
+        or f"Imported on this machine from {local.source or 'a local path'}.",
+        quantization=quantization,
+        context=extra.get("context") or {},
+        capabilities=extra.get("capabilities") or {},
+        footprint=extra.get("footprint") or {"weights_gb": local.size_gb},
+        artifact={"format": "oga-pipeline", "source": {"kind": "local", "path": local.path}},
+        recipe=local.recipe,
+        status="imported",
+    )
+
+
+def merge_local_models(catalog: Catalog, local_models: list[Any]) -> list[Model]:
+    """Register every installed model the certified catalog does not already describe."""
+    added: list[Model] = []
+    for local in local_models:
+        if getattr(local, "origin", "certified") == "certified":
+            continue
+        if catalog.get(local.id) is not None:
+            continue
+        added.append(catalog.register(model_from_local(local)))
+    return added

@@ -84,9 +84,7 @@ class ActiveRequest:
 
     def to_dict(self) -> dict[str, Any]:
         now = time.time()
-        ttft = (
-            round(self.first_token_at - self.queued_at, 3) if self.first_token_at else None
-        )
+        ttft = round(self.first_token_at - self.queued_at, 3) if self.first_token_at else None
         elapsed = now - self.queued_at
         tps = None
         if self.first_token_at and self.tokens:
@@ -155,9 +153,7 @@ class Scheduler:
 
     def _slot(self, model_id: str) -> asyncio.Semaphore:
         if model_id not in self._slots:
-            self._slots[model_id] = asyncio.Semaphore(
-                self.settings.max_concurrent_per_model
-            )
+            self._slots[model_id] = asyncio.Semaphore(self.settings.max_concurrent_per_model)
         return self._slots[model_id]
 
     @property

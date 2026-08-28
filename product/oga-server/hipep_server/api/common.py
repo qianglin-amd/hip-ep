@@ -55,9 +55,7 @@ def open_session(request: Request, api: str):
     client = client_address(request)
     user_agent = request.headers.get("user-agent", "unknown")
     session_id = explicit or f"s-{abs(hash((client, user_agent))) % 10**10:010d}"
-    return scheduler.session(
-        session_id, client=client, user_agent=user_agent, api=api
-    )
+    return scheduler.session(session_id, client=client, user_agent=user_agent, api=api)
 
 
 def resolve_model(request: Request, model_id: str, *, generative: bool = True) -> Model:
@@ -134,7 +132,9 @@ def parse_openai_messages(raw: list[dict[str, Any]]) -> list[ChatMessage]:
                 if data:
                     images.append(decode_image(data))
         messages.append(
-            ChatMessage(role=role, content="\n".join(p for p in text_parts if p), images=images)
+            ChatMessage(
+                role=role, content="\n".join(p for p in text_parts if p), images=images
+            )
         )
     return messages
 
@@ -200,13 +200,20 @@ def build_params(
     )
 
 
+def _dumps(data: Any) -> str:
+    # `default` is a safety net, not a convenience: an unserializable value inside a
+    # long-lived stream would otherwise abort the response mid-body, which a browser
+    # reports only as a truncated connection.
+    return json.dumps(data, separators=(",", ":"), default=str)
+
+
 def sse(data: Any) -> str:
     """Format one Server-Sent Events frame."""
     if isinstance(data, str):
         return f"data: {data}\n\n"
-    return f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
+    return f"data: {_dumps(data)}\n\n"
 
 
 def ndjson(data: Any) -> str:
     """Format one newline-delimited JSON frame, which is what Ollama clients read."""
-    return json.dumps(data, separators=(",", ":")) + "\n"
+    return _dumps(data) + "\n"

@@ -1,0 +1,54 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+
+id: int4-awq-g128
+name: INT4 AWQ, group 128
+recommended_for: any dense decoder where INT4 quality matters
+description: >-
+  Activation-aware weight quantization: a calibration pass measures which weight
+  channels matter most to the activations and scales them before rounding. Recovers most
+  of the quality round-to-nearest loses, for the cost of one calibration pass over a few
+  hundred sequences.
+
+applies_to:
+  families: [any]
+  architectures: [any causal decoder exportable to ONNX]
+
+quantization:
+  tool: quark
+  scheme: awq
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 128
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head]
+  prune_logit: true
+  chunk_size: 512
+
+calibration:
+  dataset: pileval
+  samples: 128
+  sequence_length: 512
+  # A larger set rarely helps beyond a few hundred sequences and costs linear time.
+  max_samples: 512
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 1.5
+  smoke_prompts: 8
+  require_gpu_execution: true
+
+notes: >-
+  Use a calibration set that resembles your workload when you have one. A code model
+  calibrated on prose is measurably worse at code than the same model calibrated on code.

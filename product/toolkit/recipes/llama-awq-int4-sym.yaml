@@ -1,0 +1,55 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified deepseek-r1-distill:70b artifact.
+
+id: llama-awq-int4-sym
+name: Llama - AWQ INT4 symmetric, group 128
+recommended_for: large Llama-architecture models, 70B class
+description: >-
+  The certified recipe for the 70B distill. Symmetric INT4 at this size costs nothing
+  measurable against asymmetric and halves the zero-point bookkeeping, which matters
+  when the model only just fits in unified memory.
+
+applies_to:
+  families: [llama3.1, llama3.3, deepseek-r1-distill]
+  architectures: [LlamaForCausalLM]
+  produces: [deepseek-r1-distill:70b]
+
+quantization:
+  tool: quark
+  scheme: awq
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 128
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head]
+  prune_logit: true
+  chunk_size: 512
+
+calibration:
+  dataset: pileval
+  samples: 128
+  sequence_length: 512
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 1.5
+  smoke_prompts: 8
+  require_gpu_execution: true
+  compare_against: deepseek-r1-distill:70b
+
+notes: >-
+  Quantizing a 70B model needs far more host memory than GPU memory. Keep chunk_size at
+  512 and expect the quantize stage to be the longest in the pipeline by a wide margin.

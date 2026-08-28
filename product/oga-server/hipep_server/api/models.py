@@ -75,7 +75,10 @@ async def delete_local(request: Request, model_id: str):
     store = get_store(request)
     if not store.remove(model_id):
         raise HTTPException(status_code=404, detail=f"{model_id} is not installed")
-    return {"deleted": model_id}
+    # An imported model exists only because it was installed, so deleting the files
+    # must also retire the catalog entry. Certified entries are left alone.
+    removed_entry = get_catalog(request).unregister(model_id)
+    return {"deleted": model_id, "catalog_entry_removed": removed_entry}
 
 
 @router.post("/pull")

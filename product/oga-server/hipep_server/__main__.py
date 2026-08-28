@@ -19,7 +19,9 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--host", default=None, help="bind address")
-    parser.add_argument("--port", type=int, default=None, help=f"bind port (Ollama uses {DEFAULT_PORT})")
+    parser.add_argument(
+        "--port", type=int, default=None, help=f"bind port (Ollama uses {DEFAULT_PORT})"
+    )
     parser.add_argument(
         "--engine",
         choices=["auto", "oga", "replay"],

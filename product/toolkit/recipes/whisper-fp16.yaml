@@ -1,0 +1,57 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified Whisper artifacts.
+
+id: whisper-fp16
+name: Whisper - fp16 encoder and decoder
+recommended_for: Whisper speech recognition models
+description: >-
+  No weight quantization. Whisper's encoder-decoder pair is small enough that INT4 saves
+  little memory, and word error rate is sensitive to it: the trade goes the wrong way.
+  The work in this recipe is graph-level, not numeric - fusing attention and exporting
+  the encoder and decoder as a pair the runtime can pipeline.
+
+applies_to:
+  families: [whisper]
+  architectures: [WhisperForConditionalGeneration]
+  produces:
+    - whisper:tiny
+    - whisper:base
+    - whisper:small
+    - whisper:medium
+    - whisper:large-v3
+    - whisper:large-v3-turbo
+
+quantization:
+  tool: quark
+  scheme: none
+  weight_dtype: fp16
+  activation_dtype: fp16
+  prune_logit: false # the decoder emits the full multilingual vocabulary
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+  encoder_decoder: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+  processor: whisper
+
+validation:
+  wer_regression_max_pct: 1.0
+  smoke_clips: 8
+  require_gpu_execution: true
+  compare_against: whisper:large-v3
+
+notes: >-
+  Report speech performance as real-time factor, not tokens per second. A transcriber
+  that runs at 40x real time is the useful statement; its decode rate is not.

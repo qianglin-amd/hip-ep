@@ -115,9 +115,7 @@ class ReplayEngine(Engine):
         self, request: GenerationRequest, prompt_tokens: int, ttft: float, tps: float
     ) -> str:
         model = request.model
-        user = next(
-            (m.content for m in reversed(request.messages) if m.role == "user"), ""
-        )
+        user = next((m.content for m in reversed(request.messages) if m.role == "user"), "")
         images = request.images
         bench = model.benchmark
         release = bench.release if bench else "unpublished"

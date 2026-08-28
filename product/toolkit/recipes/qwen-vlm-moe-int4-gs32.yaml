@@ -1,0 +1,52 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified qwen3.5-vl:35b-a3b and qwen3.6-vl:35b-a3b artifacts.
+
+id: qwen-vlm-moe-int4-gs32
+name: Qwen VLM MoE - INT4 group 32 experts, fp16 vision encoder
+recommended_for: sparse Qwen3.x vision-language models (A3B class)
+description: >-
+  The sparse counterpart to qwen-vlm-int4-gs32. Group 32 across the expert weights, the
+  router left alone, and the vision encoder in fp16. These models decode far faster than
+  their parameter count suggests, so the memory that the fp16 encoder costs is well spent.
+
+applies_to:
+  families: [qwen3.5, qwen3.6]
+  architectures: [Qwen3VLMoeForConditionalGeneration]
+  produces: [qwen3.5-vl:35b-a3b, qwen3.6-vl:35b-a3b]
+
+quantization:
+  tool: quark
+  scheme: rtn
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 32
+  activation_dtype: fp16
+  vision_encoder_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head, visual, merger, router, gate]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+  multimodal: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+  processor: auto
+
+validation:
+  perplexity_regression_max_pct: 2.5
+  smoke_prompts: 8
+  smoke_images: 4
+  require_gpu_execution: true
+  compare_against: qwen3.5-vl:35b-a3b

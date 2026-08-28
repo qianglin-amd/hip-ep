@@ -16,6 +16,7 @@ Layout under $HIPEP_HOME/models/:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import shutil
 import time
@@ -155,12 +156,10 @@ class ModelStore:
             sidecar = child / SIDECAR
             model_id = child.name.replace("--", ":").replace("__", "/")
             if sidecar.is_file():
-                try:
+                with contextlib.suppress(OSError, json.JSONDecodeError):
                     model_id = json.loads(sidecar.read_text(encoding="utf-8")).get(
                         "id", model_id
                     )
-                except (OSError, json.JSONDecodeError):
-                    pass
             local = self.read(model_id)
             if local:
                 models.append(local)

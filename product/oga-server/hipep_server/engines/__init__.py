@@ -54,7 +54,9 @@ def select_engine(settings: Settings, host: HostInfo) -> tuple[Engine, str]:
         ok, why = oga_available()
         if not ok:
             raise EngineError(f"HIPEP_ENGINE=oga but {why}")
-        return OgaEngine(models_dir=settings.models_dir), "OGA engine requested via HIPEP_ENGINE"
+        return OgaEngine(
+            models_dir=settings.models_dir
+        ), "OGA engine requested via HIPEP_ENGINE"
 
     # auto
     ok, why = oga_available()

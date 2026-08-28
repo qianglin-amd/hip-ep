@@ -130,9 +130,7 @@ def draw_shape(draw, shape, problems, slide_px):
             if para.space_after:
                 y += px(para.space_after)
     if y > y1 + 6 and shape_fill(shape):
-        problems.append(
-            f"text overflows shape bottom by {y - y1}px at ({x0},{y0})"
-        )
+        problems.append(f"text overflows shape bottom by {y - y1}px at ({x0},{y0})")
     if x1 > slide_px[0] + 2 or y1 > slide_px[1] + 2 or shape.left < 0 or shape.top < 0:
         problems.append(f"shape outside slide: ({x0},{y0})-({x1},{y1})")
 

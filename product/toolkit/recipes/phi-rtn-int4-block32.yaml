@@ -1,0 +1,52 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified phi4:14b artifact.
+
+id: phi-rtn-int4-block32
+name: Phi - INT4 round-to-nearest, block 32
+recommended_for: Microsoft Phi-4 and Phi-3 dense models
+description: >-
+  Phi's weight distributions carry more quantization error per group than the Llama or
+  Qwen families, so this recipe drops the block size from 128 to 32. That costs about
+  three percent extra footprint and recovers most of the gap without a calibration pass.
+
+applies_to:
+  families: [phi3, phi4]
+  architectures: [Phi3ForCausalLM, PhiMoEForCausalLM]
+  produces: [phi4:14b]
+
+quantization:
+  tool: quark
+  scheme: rtn
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 32
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 2.0
+  smoke_prompts: 8
+  require_gpu_execution: true
+  compare_against: phi4:14b
+
+notes: >-
+  Block 32 costs decode throughput as well as size: more scales to read per output
+  element. If the quality at 128 is acceptable for your workload, prefer int4-rtn-g128.

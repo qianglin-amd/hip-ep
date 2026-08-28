@@ -1,0 +1,50 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified mistral:7b artifact.
+
+id: mistral-awq-int4
+name: Mistral - AWQ INT4, block 128
+recommended_for: Mistral and dense Mixtral decoders
+description: >-
+  The certified Mistral recipe. Standard symmetric AWQ at block 128; this family needs
+  no special handling, which is part of why it is the fastest decoder in the catalog.
+
+applies_to:
+  families: [mistral, mixtral-dense]
+  architectures: [MistralForCausalLM]
+  produces: [mistral:7b]
+
+quantization:
+  tool: quark
+  scheme: awq
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 128
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head]
+  prune_logit: true
+  chunk_size: 512
+
+calibration:
+  dataset: pileval
+  samples: 128
+  sequence_length: 512
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 1.5
+  smoke_prompts: 8
+  require_gpu_execution: true
+  compare_against: mistral:7b

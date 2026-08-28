@@ -63,7 +63,9 @@ def _model_object(model, owned_by: str = "amd") -> dict[str, Any]:
 
 
 @router.get("/models")
-async def list_models(request: Request, capability: str | None = None, tier: str | None = None):
+async def list_models(
+    request: Request, capability: str | None = None, tier: str | None = None
+):
     catalog = get_catalog(request)
     models = catalog.list(tier=tier)
     if capability:
@@ -102,7 +104,12 @@ async def chat_completions(request: Request):
     if stream:
         return StreamingResponse(
             _stream_chat(
-                scheduler, gen, session, completion_id, created, model.id,
+                scheduler,
+                gen,
+                session,
+                completion_id,
+                created,
+                model.id,
                 client=client_address(request),
             ),
             media_type="text/event-stream",
@@ -171,9 +178,7 @@ async def _stream_chat(
 
     yield frame({"role": "assistant", "content": ""})
     try:
-        async for delta in scheduler.stream(
-            gen, session=session, api="openai", client=client
-        ):
+        async for delta in scheduler.stream(gen, session=session, api="openai", client=client):
             if delta.text:
                 yield frame({"content": delta.text})
             if delta.done:
@@ -236,9 +241,7 @@ async def completions(request: Request):
                                 "object": "text_completion",
                                 "created": created,
                                 "model": model.id,
-                                "choices": [
-                                    {"index": 0, "text": "", "finish_reason": "stop"}
-                                ],
+                                "choices": [{"index": 0, "text": "", "finish_reason": "stop"}],
                                 "usage": delta.usage,
                             }
                         )

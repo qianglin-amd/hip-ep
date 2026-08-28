@@ -1,0 +1,58 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified gpt-oss:120b artifact.
+
+id: moe-awq-uint4-pergroup
+name: MoE - AWQ UINT4 per-group
+recommended_for: large sparse mixture-of-experts models, 100B class
+description: >-
+  The recipe for a model that only fits at all on a large unified-memory part. UINT4
+  with per-group scales gives the tightest packing the runtime can decode at speed, and
+  AWQ pays for its calibration pass here: at this compression ratio, round-to-nearest
+  loses measurable quality.
+
+applies_to:
+  families: [gpt-oss]
+  architectures: [MoE causal decoders]
+  produces: [gpt-oss:120b]
+
+quantization:
+  tool: quark
+  scheme: awq
+  weight_dtype: uint4
+  symmetry: asymmetric
+  granularity: per_group
+  group_size: 128
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head, router, gate]
+  prune_logit: true
+  chunk_size: 512
+
+calibration:
+  dataset: pileval
+  samples: 128
+  sequence_length: 512
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 2.5
+  smoke_prompts: 8
+  require_gpu_execution: true
+  compare_against: gpt-oss:120b
+
+notes: >-
+  Quantizing this model needs substantially more host RAM than the finished artifact
+  needs GPU memory. Run it on the largest-memory host available, not on the machine that
+  will serve it.

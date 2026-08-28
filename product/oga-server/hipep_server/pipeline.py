@@ -16,12 +16,11 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import random
 import time
 from pathlib import Path
 from typing import Any
 
-from .catalog import Catalog, Model
+from .catalog import Catalog, Model, model_from_local
 from .config import Settings
 from .jobs import Job, JobContext, JobManager, Stage
 from .store import ModelStore
@@ -89,7 +88,7 @@ class Pipeline:
         job = self.jobs.create(
             kind="pull",
             title=f"Pull {model.name}",
-            stages=[Stage(name=n, label=l) for n, l in PULL_STAGES],
+            stages=[Stage(name=n, label=label) for n, label in PULL_STAGES],
             params={"model": model.id, "source": (model.artifact or {}).get("source", {})},
         )
         return self.jobs.start(
@@ -233,7 +232,7 @@ class Pipeline:
         job = self.jobs.create(
             kind="port",
             title=f"Port {source}",
-            stages=[Stage(name=n, label=l) for n, l in PORT_STAGES],
+            stages=[Stage(name=n, label=label) for n, label in PORT_STAGES],
             params={
                 "source": source,
                 "name": name,
@@ -258,9 +257,7 @@ class Pipeline:
                 if fn is not None:
                     await fn(ctx, params, store=self.store)
                     return
-                ctx.log(
-                    f"toolkit has no '{stage_name}' stage; simulating", level="warning"
-                )
+                ctx.log(f"toolkit has no '{stage_name}' stage; simulating", level="warning")
             await _simulate_port_stage(ctx, stage_name, params)
 
         def make(stage_name: str):
@@ -287,18 +284,29 @@ class Pipeline:
                     "prune_logit": params.get("prune_logit"),
                 },
             )
-            share_url = f"{self.settings.base_url}/v1/models/{model_id}"
+            # Registering in the catalog is what makes the model usable immediately:
+            # chat, /v1/models and the benchmark harness all resolve through it, so
+            # without this the user would have to restart the server to use their port.
+            entry = self.catalog.register(model_from_local(local))
+
+            share_url = f"{self.settings.base_url}/v1/catalog/{model_id}"
             download_url = f"{self.settings.base_url}/api/artifacts/{model_id}"
             ctx.result(
                 model=model_id,
                 path=local.path,
                 share_url=share_url,
                 download_url=download_url,
+                share_command=f"hipep pull {model_id} --from {self.settings.base_url}",
+                openai_base_url=f"{self.settings.base_url}/v1",
                 simulated=self.simulate,
             )
-            ctx.log(f"published {model_id}")
+            ctx.log(f"published {model_id} as a {entry.status} model")
             ctx.log(f"share:    {share_url}")
             ctx.log(f"download: {download_url}")
+            ctx.log(
+                f"chat:     POST {self.settings.base_url}/v1/chat/completions "
+                f'with {{"model": "{model_id}"}}'
+            )
 
         stages["publish"] = publish
         return stages
@@ -310,7 +318,7 @@ class Pipeline:
         job = self.jobs.create(
             kind="benchmark",
             title=f"Benchmark {model.name}",
-            stages=[Stage(name=n, label=l) for n, l in BENCH_STAGES],
+            stages=[Stage(name=n, label=label) for n, label in BENCH_STAGES],
             params={
                 "model": model.id,
                 "contexts": contexts,
@@ -371,7 +379,10 @@ async def _simulated_transfer(ctx: JobContext, total: int, seconds: float) -> No
 
 
 _PORT_STAGE_SCRIPT: dict[str, tuple[float, list[str]]] = {
-    "fetch": (5.0, ["resolving revision", "downloading safetensors shards", "verifying checksums"]),
+    "fetch": (
+        5.0,
+        ["resolving revision", "downloading safetensors shards", "verifying checksums"],
+    ),
     "inspect": (
         1.5,
         [

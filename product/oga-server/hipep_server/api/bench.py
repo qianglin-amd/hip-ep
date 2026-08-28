@@ -70,8 +70,7 @@ async def run(request: Request, body: dict[str, Any] = Body(default={})):
         raise HTTPException(
             status_code=400,
             detail=(
-                f"{model.id} supports at most {model.max_context} tokens; "
-                f"requested {over}"
+                f"{model.id} supports at most {model.max_context} tokens; requested {over}"
             ),
         )
     spec = {

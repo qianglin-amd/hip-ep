@@ -1,0 +1,51 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified gemma4-vl:26b-a4b artifact.
+
+id: gemma-vlm-qmoe-int4
+name: Gemma VLM MoE - qmoe INT4 experts, fp16 shared layers
+recommended_for: sparse Gemma 4 vision-language models (A4B class)
+description: >-
+  The MoE-aware path: expert weights go to 4 bits while the router, the shared layers
+  and the vision encoder stay in fp16. Roughly a quarter of the parameters are active
+  per token, so this artifact decodes like a much smaller model while keeping the parts
+  of the graph that cannot absorb quantization error intact.
+
+applies_to:
+  families: [gemma4]
+  architectures: [Gemma4MoeForConditionalGeneration]
+  produces: [gemma4-vl:26b-a4b]
+
+quantization:
+  tool: quark
+  scheme: qmoe
+  weight_dtype: int4
+  activation_dtype: fp16
+  vision_encoder_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head, vision_tower, multi_modal_projector, router, gate, shared_expert]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+  multimodal: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+  processor: auto
+
+validation:
+  perplexity_regression_max_pct: 2.5
+  smoke_prompts: 8
+  smoke_images: 4
+  require_gpu_execution: true
+  compare_against: gemma4-vl:26b-a4b

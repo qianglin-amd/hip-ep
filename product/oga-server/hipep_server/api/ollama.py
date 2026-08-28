@@ -116,7 +116,9 @@ async def ps(request: Request):
 @router.post("/show")
 async def show(request: Request):
     body = await request.json()
-    model = resolve_model(request, body.get("model") or body.get("name") or "", generative=False)
+    model = resolve_model(
+        request, body.get("model") or body.get("name") or "", generative=False
+    )
     store = get_store(request)
     local = store.read(model.id)
     return {
@@ -260,7 +262,9 @@ async def pull(request: Request):
 @router.delete("/delete")
 async def delete(request: Request):
     body = await request.json()
-    model = resolve_model(request, body.get("model") or body.get("name") or "", generative=False)
+    model = resolve_model(
+        request, body.get("model") or body.get("name") or "", generative=False
+    )
     store = get_store(request)
     if not store.remove(model.id):
         raise HTTPException(status_code=404, detail=f"{model.id} is not installed")
@@ -289,9 +293,7 @@ async def _collect(scheduler, gen, session, client) -> tuple[list[str], dict[str
     parts: list[str] = []
     usage: dict[str, Any] = {}
     try:
-        async for delta in scheduler.stream(
-            gen, session=session, api="ollama", client=client
-        ):
+        async for delta in scheduler.stream(gen, session=session, api="ollama", client=client):
             if delta.text:
                 parts.append(delta.text)
             if delta.done and delta.usage:
@@ -315,16 +317,12 @@ async def _stream_ollama(
         return base
 
     try:
-        async for delta in scheduler.stream(
-            gen, session=session, api="ollama", client=client
-        ):
+        async for delta in scheduler.stream(gen, session=session, api="ollama", client=client):
             if delta.text:
                 yield ndjson(payload(delta.text))
             if delta.done:
                 final = payload("")
-                final.update(
-                    {"done": True, "done_reason": delta.finish_reason or "stop"}
-                )
+                final.update({"done": True, "done_reason": delta.finish_reason or "stop"})
                 final.update(_durations(delta.usage or {}))
                 yield ndjson(final)
     except (QueueFull, EngineError) as exc:

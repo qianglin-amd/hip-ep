@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<!--
+  Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+  Licensed under the MIT License.
+
+  HIP EP Studio. Deliberately build-free: no bundler, no npm, no CDN. It is served as
+  static files by oga-server, works offline and inside air-gapped labs, and can be
+  copied to any static host unchanged.
+-->
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HIP EP Studio</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%23E8112D'/><path d='M9 22V10h4.6c3 0 4.7 1.5 4.7 4s-1.7 4.1-4.7 4.1H12V22H9zm3-6.3h1.4c1.2 0 1.9-.6 1.9-1.6s-.7-1.6-1.9-1.6H12v3.2zM20 22V10h3v12h-3z' fill='white'/></svg>">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div id="app" class="app">
+
+  <aside class="sidebar">
+    <a class="brand" href="#/chat">
+      <span class="brand-mark">EP</span>
+      <span class="brand-text">
+        <strong>HIP EP</strong>
+        <small>Studio</small>
+      </span>
+    </a>
+
+    <nav class="nav" id="nav">
+      <a href="#/chat"      data-view="chat">      <span class="ico">&#9679;</span> Chat</a>
+      <a href="#/vision"    data-view="vision">    <span class="ico">&#9635;</span> Vision</a>
+      <a href="#/models"    data-view="models">    <span class="ico">&#9636;</span> Models</a>
+      <a href="#/port"      data-view="port">      <span class="ico">&#8681;</span> Port a model</a>
+      <a href="#/benchmark" data-view="benchmark"> <span class="ico">&#9650;</span> Benchmarks</a>
+      <a href="#/server"    data-view="server">    <span class="ico">&#9881;</span> Server</a>
+      <a href="#/develop"   data-view="develop">   <span class="ico">&#60;&#62;</span> Develop</a>
+    </nav>
+
+    <div class="sidebar-foot">
+      <div id="engine-badge" class="badge badge-muted">
+        <span class="dot"></span><span class="label">connecting</span>
+      </div>
+      <div id="device-line" class="muted small">detecting hardware</div>
+      <div class="sidebar-links">
+        <a href="/docs" target="_blank">Docs</a>
+        <a href="/api-docs" target="_blank">API</a>
+        <button id="theme-toggle" type="button" title="Toggle theme">&#9789;</button>
+      </div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <div id="crumb" class="crumb"></div>
+      <div class="topbar-right">
+        <div id="activity" class="activity" hidden></div>
+        <div id="load-pill" class="pill" title="Active / queued requests and sessions"></div>
+      </div>
+    </header>
+    <section id="view" class="view"></section>
+  </main>
+
+</div>
+
+<div id="modal-root"></div>
+<div id="toast-root" class="toast-root"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>

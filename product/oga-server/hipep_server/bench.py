@@ -198,9 +198,7 @@ class BenchRunner:
                     "ttft_pct": round(
                         (measured["ttft_s"] - ref["ttft_s"]) / ref["ttft_s"] * 100, 1
                     ),
-                    "tps_pct": round(
-                        (measured["tps"] - ref["tps"]) / ref["tps"] * 100, 1
-                    ),
+                    "tps_pct": round((measured["tps"] - ref["tps"]) / ref["tps"] * 100, 1),
                 }
 
         summary = {

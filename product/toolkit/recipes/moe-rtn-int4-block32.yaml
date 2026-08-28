@@ -1,0 +1,53 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified gpt-oss:20b artifact.
+
+id: moe-rtn-int4-block32
+name: MoE - INT4 round-to-nearest, block 32
+recommended_for: sparse mixture-of-experts models up to ~30B total
+description: >-
+  Expert weights tolerate quantization worse than a dense tower does, because each
+  expert sees a fraction of the tokens and so has less redundancy to spare. Block 32
+  compensates. The router and the shared attention blocks stay at higher precision:
+  a router that picks the wrong expert is far more damaging than a slightly noisy expert.
+
+applies_to:
+  families: [gpt-oss]
+  architectures: [MoE causal decoders]
+  produces: [gpt-oss:20b]
+
+quantization:
+  tool: quark
+  scheme: rtn
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 32
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head, router, gate]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 2.5
+  smoke_prompts: 8
+  require_gpu_execution: true
+  compare_against: gpt-oss:20b
+
+notes: >-
+  Never quantize the router. It is a tiny fraction of the parameters and the single most
+  accuracy-critical tensor in the model.

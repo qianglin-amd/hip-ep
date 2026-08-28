@@ -1,0 +1,52 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified qwen3.8-vl:27b artifact.
+
+id: qwen-vlm-kquant-int4
+name: Qwen VLM - k-quant INT4 group 128, fp16 vision encoder
+recommended_for: Qwen3.8 vision-language models
+description: >-
+  K-quant assigns bit budget per weight block by importance instead of spending it
+  uniformly, which is what lets this recipe use group 128 and still match what the
+  group-32 RTN recipe achieves on the earlier Qwen generations. Cheaper to decode as a
+  result: fewer scales to read per output element.
+
+applies_to:
+  families: [qwen3.8]
+  architectures: [Qwen3VLForConditionalGeneration]
+  produces: [qwen3.8-vl:27b]
+
+quantization:
+  tool: quark
+  scheme: k_quant
+  weight_dtype: int4
+  group_size: 128
+  activation_dtype: fp16
+  vision_encoder_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head, visual, merger]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+  multimodal: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+  processor: auto
+
+validation:
+  perplexity_regression_max_pct: 2.0
+  smoke_prompts: 8
+  smoke_images: 4
+  require_gpu_execution: true
+  compare_against: qwen3.8-vl:27b

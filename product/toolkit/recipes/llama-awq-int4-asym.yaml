@@ -1,0 +1,52 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified llama3.1:8b artifact.
+
+id: llama-awq-int4-asym
+name: Llama - AWQ INT4 asymmetric, group 128
+recommended_for: Llama 3.x dense decoders
+description: >-
+  The certified Llama recipe. Asymmetric INT4 is the one place this family differs from
+  the generic plan: its weight distributions are offset enough that a zero point earns
+  its keep, and the asymmetric variant measured better than the symmetric one at the
+  same group size.
+
+applies_to:
+  families: [llama3.1, llama3.2, llama3.3]
+  architectures: [LlamaForCausalLM]
+  produces: [llama3.1:8b]
+
+quantization:
+  tool: quark
+  scheme: awq
+  weight_dtype: int4
+  symmetry: asymmetric
+  group_size: 128
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head]
+  prune_logit: true
+  chunk_size: 512
+
+calibration:
+  dataset: pileval
+  samples: 128
+  sequence_length: 512
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 1.5
+  smoke_prompts: 8
+  require_gpu_execution: true
+  compare_against: llama3.1:8b

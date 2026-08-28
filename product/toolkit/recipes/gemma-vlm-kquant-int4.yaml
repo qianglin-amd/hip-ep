@@ -1,0 +1,52 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified gemma4-vl:12b artifact.
+
+id: gemma-vlm-kquant-int4
+name: Gemma VLM - k-quant INT4 block 32, fp16 vision encoder
+recommended_for: dense Gemma 4 vision-language models
+description: >-
+  K-quant at block 32 for the text tower, vision encoder in fp16. The small block size
+  is what keeps short-context quality high on this family; be aware that throughput on
+  these models falls off past roughly 8k tokens regardless of the quantization plan, so
+  check the published long-context numbers before choosing it for document work.
+
+applies_to:
+  families: [gemma4]
+  architectures: [Gemma4ForConditionalGeneration]
+  produces: [gemma4-vl:12b]
+
+quantization:
+  tool: quark
+  scheme: k_quant
+  weight_dtype: int4
+  block_size: 32
+  activation_dtype: fp16
+  vision_encoder_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head, vision_tower, multi_modal_projector]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+  multimodal: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+  processor: auto
+
+validation:
+  perplexity_regression_max_pct: 2.0
+  smoke_prompts: 8
+  smoke_images: 4
+  require_gpu_execution: true
+  compare_against: gemma4-vl:12b

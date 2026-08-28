@@ -16,8 +16,9 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from .api import ROUTERS
-from .catalog import load_catalog
-from .config import Settings, settings as default_settings
+from .catalog import load_catalog, merge_local_models
+from .config import Settings
+from .config import settings as default_settings
 from .engines import select_engine
 from .hardware import detect_host
 from .jobs import JobManager
@@ -48,6 +49,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.host = detect_host()
     app.state.catalog = load_catalog(settings.catalog_dir, settings.benchmarks_dir)
     app.state.store = ModelStore(settings.models_dir)
+    imported = merge_local_models(app.state.catalog, app.state.store.list())
 
     engine, reason = select_engine(settings, app.state.host)
     app.state.engine_reason = reason
@@ -67,8 +69,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     log.info("  gpu     %s", f"{gpu.name} ({gpu.gfx_arch})" if gpu else "none detected")
     # Plain ASCII: the Windows console defaults to cp1252 and mangles anything else.
     log.info("  engine  %s - %s", engine.name, reason)
-    log.info("  catalog %d models (%s)", len(app.state.catalog),
-             app.state.catalog.benchmark_meta.get("release", "no benchmarks"))
+    log.info(
+        "  catalog %d models (%s)",
+        len(app.state.catalog),
+        app.state.catalog.benchmark_meta.get("release", "no benchmarks"),
+    )
+    if imported:
+        log.info(
+            "  local   %d imported model(s): %s",
+            len(imported),
+            ", ".join(m.id for m in imported),
+        )
     log.info("  models  %s", settings.models_dir)
     log.info("  listen  %s", settings.base_url)
 

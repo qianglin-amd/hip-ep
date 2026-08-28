@@ -1,0 +1,52 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified qwen2.5:14b and qwen2.5-coder:14b artifacts.
+
+id: qwen-rtn-int4
+name: Qwen - INT4 round-to-nearest, group 128
+recommended_for: Qwen2.5 and Qwen3 dense decoders
+description: >-
+  The certified Qwen recipe, and the cheapest one in the collection: this family is
+  robust enough to round-to-nearest that AWQ's calibration pass does not pay for itself.
+  No calibration data means a port that anyone can reproduce byte for byte.
+
+applies_to:
+  families: [qwen2.5, qwen3]
+  architectures: [Qwen2ForCausalLM, Qwen3ForCausalLM]
+  produces: [qwen2.5:14b, qwen2.5-coder:14b]
+
+quantization:
+  tool: quark
+  scheme: rtn
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 128
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 2.0
+  smoke_prompts: 8
+  require_gpu_execution: true
+  compare_against: qwen2.5:14b
+
+notes: >-
+  For the coder variant, calibrate with int4-awq-g128 on a code corpus only if you can
+  measure a win on your own completion benchmark. The certified artifact does not.

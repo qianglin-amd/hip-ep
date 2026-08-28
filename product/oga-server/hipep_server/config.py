@@ -60,7 +60,9 @@ class Settings:
 
     # Read-only product data shipped with the repo.
     catalog_dir: Path = field(default_factory=lambda: PRODUCT_DIR / "modelzoo" / "catalog")
-    benchmarks_dir: Path = field(default_factory=lambda: PRODUCT_DIR / "modelzoo" / "benchmarks")
+    benchmarks_dir: Path = field(
+        default_factory=lambda: PRODUCT_DIR / "modelzoo" / "benchmarks"
+    )
     recipes_dir: Path = field(default_factory=lambda: PRODUCT_DIR / "toolkit" / "recipes")
     web_dir: Path = field(default_factory=lambda: PACKAGE_DIR / "web")
     site_dir: Path = field(default_factory=lambda: PRODUCT_DIR / "site")
@@ -76,7 +78,9 @@ class Settings:
         default_factory=lambda: _env_int("HIPEP_MAX_CONCURRENT", 4)
     )
     max_queue_depth: int = field(default_factory=lambda: _env_int("HIPEP_MAX_QUEUE", 64))
-    idle_unload_seconds: int = field(default_factory=lambda: _env_int("HIPEP_IDLE_UNLOAD", 900))
+    idle_unload_seconds: int = field(
+        default_factory=lambda: _env_int("HIPEP_IDLE_UNLOAD", 900)
+    )
 
     # Generation defaults, overridable per request.
     default_max_tokens: int = field(default_factory=lambda: _env_int("HIPEP_MAX_TOKENS", 512))

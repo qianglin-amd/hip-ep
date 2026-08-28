@@ -1,0 +1,60 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified classification, detection and BEV artifacts.
+
+id: vision-fp16
+name: Vision - fp16, graph-level optimization only
+recommended_for: classifiers, detectors and BEV perception models
+description: >-
+  These models are activation bound rather than weight bound: a ResNet or a DETR spends
+  its time moving feature maps, not reading parameters, so quantizing weights buys
+  almost no speed and costs accuracy. This recipe leaves precision alone and does the
+  work where it pays - operator fusion, constant folding and layout selection.
+
+applies_to:
+  families: [resnet, mobilenet, yolo, detr, ssd, swin, swinv2, bevformer, simplebev]
+  architectures: [image classification, object detection, BEV perception]
+  produces:
+    - resnet50-v1.5
+    - mobilenetv2
+    - yolov5-lu
+    - detr
+    - ssd-resnet34
+    - mb1-ssd
+    - swin-tiny
+    - swinv2-tiny
+    - swinv2-small
+    - swinv2-base
+    - bevformer
+    - bevformer-tiny
+    - simplebev
+
+quantization:
+  tool: quark
+  scheme: none
+  weight_dtype: fp16
+  activation_dtype: fp16
+  prune_logit: false
+
+calibration: null
+
+export:
+  tool: onnx
+  target: onnx
+  opset: 17
+  external_data: false
+  optimizations: [fuse_conv_bn, constant_folding, layout_nhwc]
+
+build:
+  tool: onnxruntime
+  execution_provider: hip
+
+validation:
+  accuracy_regression_max_pct: 0.5
+  require_gpu_execution: true
+
+notes: >-
+  Report first-inference latency separately from the steady-state average. The first
+  call includes kernel selection and autotuning, and reporting only the average hides a
+  cost that a short-lived process actually pays.

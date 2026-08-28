@@ -1,0 +1,49 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+
+id: int4-rtn-g128
+name: INT4 round-to-nearest, group 128
+recommended_for: any dense decoder, no calibration data needed
+description: >-
+  The default starting point for a model that is not in the certified catalog.
+  Round-to-nearest needs no calibration set, so it always runs and always produces the
+  same artifact from the same weights. Expect a small quality loss against AWQ; move to
+  int4-awq-g128 if that loss matters for your workload.
+
+applies_to:
+  families: [any]
+  architectures: [any causal decoder exportable to ONNX]
+
+quantization:
+  tool: quark
+  scheme: rtn
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 128
+  activation_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null # round-to-nearest is data free
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+
+validation:
+  perplexity_regression_max_pct: 3.0
+  smoke_prompts: 8
+  require_gpu_execution: true
+
+notes: >-
+  If export fails on a model with unusual attention, try opset 20 before changing the
+  quantization plan: the failure is far more often a graph-export gap than a numeric one.

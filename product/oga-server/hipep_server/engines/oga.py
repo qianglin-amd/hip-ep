@@ -262,7 +262,9 @@ def _render_prompt(request: GenerationRequest) -> str:
         content = message.content
         if message.images:
             # Image placeholders are what the multimodal processors expect to find.
-            content = "".join(f"<|image_{i + 1}|>" for i in range(len(message.images))) + content
+            content = (
+                "".join(f"<|image_{i + 1}|>" for i in range(len(message.images))) + content
+            )
         parts.append(f"<|{tag}|>\n{content}<|end|>")
     parts.append("<|assistant|>\n")
     return "\n".join(parts)

@@ -1,0 +1,54 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# Produces the certified gemma3-vl:4b artifact.
+
+id: gemma-vlm-rtn-int4
+name: Gemma VLM - INT4 text tower, fp16 vision encoder
+recommended_for: Gemma 3 vision-language models
+description: >-
+  The entry-point VLM recipe. The text tower is quantized to INT4 at group 128 and the
+  vision encoder is left in fp16. That split is the whole point: the encoder is a small
+  fraction of the weights but dominates how well the model reads an image, so quantizing
+  it costs far more quality than it saves memory.
+
+applies_to:
+  families: [gemma3]
+  architectures: [Gemma3ForConditionalGeneration]
+  produces: [gemma3-vl:4b]
+
+quantization:
+  tool: quark
+  scheme: rtn
+  weight_dtype: int4
+  symmetry: symmetric
+  group_size: 128
+  activation_dtype: fp16
+  vision_encoder_dtype: fp16
+  kv_cache_dtype: fp16
+  exclude: [lm_head, vision_tower, multi_modal_projector]
+  prune_logit: true
+  chunk_size: 512
+
+calibration: null
+
+export:
+  tool: quark
+  target: onnx
+  opset: 21
+  external_data: true
+  # A VLM exports as more than one graph: encoder, projector and decoder.
+  multimodal: true
+
+build:
+  tool: onnxruntime-genai
+  pipeline: oga-pipeline
+  execution_provider: hip
+  processor: auto
+
+validation:
+  perplexity_regression_max_pct: 2.0
+  smoke_prompts: 8
+  smoke_images: 4
+  require_gpu_execution: true
+  compare_against: gemma3-vl:4b
