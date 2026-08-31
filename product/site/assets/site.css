@@ -174,8 +174,16 @@ pre code { background: none; border: 0; padding: 0; }
   border-top: 1px solid var(--line);
   border-bottom: 1px solid var(--line);
   background: var(--ink-2);
+  /* The band spans the viewport so its background and rules run edge to edge,
+     while its content sits in the same centred column as every other section.
+     A grid track does that placement, deliberately rather than auto margins: a
+     child only has to write the `margin` shorthand once to reset margin-inline
+     to 0, and it would then silently escape to the left edge. `table.data` and
+     `.stat-row` both did exactly that. */
+  display: grid;
+  grid-template-columns: 1fr min(var(--width), 100%) 1fr;
 }
-.band > * { max-width: var(--width); margin-inline: auto; padding-inline: 24px; }
+.band > * { grid-column: 2; padding-inline: 24px; }
 .band h2 { padding-top: 42px; }
 .band > p { padding-bottom: 4px; }
 .band table { margin-bottom: 12px; }
@@ -185,9 +193,6 @@ pre code { background: none; border: 0; padding: 0; }
   display: flex;
   flex-wrap: wrap;
   gap: 16px;
-  /* margin-block, not the shorthand: inside a .band this element is centred by
-     `.band > * { margin-inline: auto }`, and a shorthand would reset that to 0
-     and pin the row to the left edge while every other section stayed centred. */
   margin-block: 24px;
 }
 .stat-row.wide { padding: 34px 24px; }
@@ -223,7 +228,11 @@ pre code { background: none; border: 0; padding: 0; }
 .site-foot {
   border-top: 1px solid var(--line);
   background: var(--ink-2);
-  padding: 34px 24px;
+  /* Full-bleed background, content in the centred column. The inline padding
+     grows to whatever the centred column's margin is, so the footer text starts
+     under the page text instead of at the viewport edge. */
+  padding-block: 34px;
+  padding-inline: max(24px, calc((100% - var(--width)) / 2 + 24px));
   display: flex;
   flex-wrap: wrap;
   gap: 32px;
