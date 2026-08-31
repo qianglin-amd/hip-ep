@@ -185,7 +185,10 @@ pre code { background: none; border: 0; padding: 0; }
   display: flex;
   flex-wrap: wrap;
   gap: 16px;
-  margin: 24px 0;
+  /* margin-block, not the shorthand: inside a .band this element is centred by
+     `.band > * { margin-inline: auto }`, and a shorthand would reset that to 0
+     and pin the row to the left edge while every other section stayed centred. */
+  margin-block: 24px;
 }
 .stat-row.wide { padding: 34px 24px; }
 .stat {
