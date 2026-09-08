@@ -37,8 +37,12 @@ dependencies = [
 # The inference stack. Installed separately in practice because the wheels are
 # platform- and GPU-architecture-specific; see product/site/content/install-*.md.
 gpu = ["onnxruntime-genai", "onnxruntime"]
-# Quantization via AMD Quark.
-quant = ["amd-quark", "torch", "transformers", "datasets", "onnx"]
+# Quantization via AMD Quark. The floor is not about features: `amd-quark` 0.1.0 is an
+# unrelated placeholder that predates AMD taking the name and installs no modules at
+# all, so an unpinned install on an interpreter with no real release available resolves
+# to it, succeeds, and leaves nothing behind. AMD's own releases stop below Python 3.14,
+# which is exactly when that happens.
+quant = ["amd-quark>=0.6", "torch", "transformers", "datasets", "onnx"]
 plan = ["python-pptx>=0.6.23"]
 # The documentation site generator. Only Markdown rendering is external; the HTML,
 # CSS and navigation are produced by product/site/build.py.

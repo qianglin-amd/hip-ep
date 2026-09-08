@@ -12,10 +12,13 @@ from __future__ import annotations
 
 import argparse
 import sys
+from pathlib import Path
 
 import pytest
 from hipep_toolkit import cli, commands
 from hipep_toolkit import doctor as doc
+
+PRODUCT_DIR = Path(__file__).resolve().parent.parent
 
 STATES = {doc.OK, doc.WARN, doc.FAIL}
 
@@ -104,6 +107,47 @@ def test_a_missing_porting_toolchain_warns_rather_than_fails(monkeypatch) -> Non
     doc._check_quantization(report)
     assert report.checks[0].state == doc.WARN
     assert "simulation" in report.checks[0].detail
+
+
+def test_an_interpreter_too_new_for_quark_says_so(monkeypatch) -> None:
+    """Otherwise the remedy sends the reader round a loop that cannot terminate.
+
+    No AMD Quark release supports 3.14, and `pip install amd-quark` there resolves to
+    an unrelated 0.1.0 placeholder that ships no modules: the install reports success,
+    this check still finds nothing, and the advice was to run the install again.
+    """
+    monkeypatch.setattr(doc, "_installed", lambda module: False)
+    monkeypatch.setattr(doc.sys, "version_info", (3, 14, 7))
+    monkeypatch.setattr(doc.platform, "python_version", lambda: "3.14.7")
+
+    report = doc.Report()
+    doc._check_quantization(report)
+    check = report.checks[0]
+
+    assert check.state == doc.WARN, "serving does not need Quark, so this cannot fail"
+    assert "3.14.7" in check.detail
+    assert "pip install" not in check.remedy, "the install being suggested is the no-op"
+    assert "3.11-3.13" in check.remedy
+
+
+def test_a_supported_interpreter_still_suggests_the_install(monkeypatch) -> None:
+    monkeypatch.setattr(doc, "_installed", lambda module: False)
+    monkeypatch.setattr(doc.sys, "version_info", (3, 12, 10))
+
+    report = doc.Report()
+    doc._check_quantization(report)
+    assert "pip install" in report.checks[0].remedy
+
+
+def test_the_quant_extra_cannot_resolve_to_the_placeholder() -> None:
+    """`amd-quark` 0.1.0 is a different project that installs nothing at all."""
+    import tomllib
+
+    text = (PRODUCT_DIR / "pyproject.toml").read_bytes()
+    quant = tomllib.loads(text.decode())["project"]["optional-dependencies"]["quant"]
+    pin = next(spec for spec in quant if spec.startswith("amd-quark"))
+    assert pin != "amd-quark", "an unpinned amd-quark can resolve to the empty 0.1.0"
+    assert ">=" in pin
 
 
 def test_store_check_follows_hipep_home(monkeypatch, tmp_path) -> None:

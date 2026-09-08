@@ -28,6 +28,10 @@ FAIL = "fail"
 
 MIN_PYTHON = (3, 10)
 
+# The first interpreter no AMD Quark release supports. Serving has no such ceiling, so
+# this bounds the porting check alone.
+QUARK_MAX_PYTHON = (3, 14)
+
 # Free space below this cannot hold one mid-sized certified model plus the working copy
 # a conversion makes of it.
 LOW_DISK_GB = 20.0
@@ -208,15 +212,31 @@ def _check_quantization(report: Report) -> None:
     """
     needed = {"quark": "amd-quark", "torch": "torch", "transformers": "transformers"}
     missing = sorted({dist for mod, dist in needed.items() if not _installed(mod)})
-    if missing:
+    if not missing:
+        report.add("porting toolchain", OK, "Quark, torch and transformers present")
+        return
+
+    # Every AMD Quark release so far caps the interpreter below 3.14. On a newer one
+    # the install resolves to an unrelated 0.1.0 placeholder that ships no modules, so
+    # it reports success and this check still finds nothing -- and the remedy below
+    # would send the reader round that loop again without ever explaining it.
+    if sys.version_info >= QUARK_MAX_PYTHON:
+        major, minor = QUARK_MAX_PYTHON
         report.add(
             "porting toolchain",
             WARN,
-            f"missing: {', '.join(missing)}; ports will run in simulation",
-            'pip install -e "product[quant]"',
+            f"amd-quark has no release for Python {platform.python_version()}; "
+            "ports will run in simulation",
+            f"port from a Python 3.11-{major}.{minor - 1} environment; serving is unaffected",
         )
-    else:
-        report.add("porting toolchain", OK, "Quark, torch and transformers present")
+        return
+
+    report.add(
+        "porting toolchain",
+        WARN,
+        f"missing: {', '.join(missing)}; ports will run in simulation",
+        'pip install -e "product[quant]"',
+    )
 
 
 def _check_store(report: Report) -> None:
