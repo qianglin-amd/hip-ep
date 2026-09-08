@@ -219,7 +219,12 @@ def main() -> int:
     )
 
     print("\n== vision routing ==")
-    vlm = vlms[0]["id"]
+    # The replay engine answers for any catalog entry, but a GPU host can only serve a
+    # VLM whose weights are here. Picking the first certified one regardless reported a
+    # missing download as a broken image path.
+    installed_vlms = [m for m in vlms if m.get("installed")]
+    vlm = (installed_vlms or vlms)[0]["id"]
+    vlm_servable = bool(installed_vlms) or not engine.get("real", True)
     image_message = {
         "model": vlm,
         "messages": [
@@ -240,7 +245,18 @@ def main() -> int:
         "max_tokens": 20,
     }
     vision = client.post("/v1/chat/completions", json=image_message)
-    check("VLM accepts an image", vision.status_code == 200, f"{vlm} -> {vision.status_code}")
+    if vlm_servable:
+        check(
+            "VLM accepts an image",
+            vision.status_code == 200,
+            f"{vlm} -> {vision.status_code}",
+        )
+    else:
+        check(
+            "an undownloaded VLM is reported as missing, not as a server fault",
+            vision.status_code == 404,
+            f"{vlm} -> {vision.status_code} (no VLM downloaded on this host)",
+        )
 
     text_only = client.post("/v1/chat/completions", json={**image_message, "model": model})
     check(

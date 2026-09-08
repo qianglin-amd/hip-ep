@@ -137,6 +137,13 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         )
         checks.ok("load pill populated", "session" in page.locator("#load-pill").inner_text())
 
+        # Some later checks depend on whether real weights are being executed: the
+        # replay engine answers for any model, a GPU one needs an artifact on disk.
+        engine_is_real = bool(
+            page.request.get(f"{base}/v1/status").json().get("engine", {}).get("real")
+        )
+        print(f"  ..    engine is {'real' if engine_is_real else 'replay'}")
+
         # --- chat --------------------------------------------------------------
         print("\nchat")
         checks.ok(
@@ -145,7 +152,14 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         checks.ok("empty state shown", page.locator(".chat-log .empty").count() == 1)
         checks.ok("composer present", page.locator(".composer textarea").count() == 1)
 
-        page.fill(".composer textarea", "Say hello in one short sentence.")
+        # Asking for a short greeting and then asserting a long answer made a correct
+        # model fail the check: "Hello!" is six characters and exactly what was asked
+        # for. The check is that a streamed reply renders, so the prompt has to be one
+        # whose correct answer is a paragraph.
+        page.fill(
+            ".composer textarea",
+            "In two or three sentences, explain what a GPU execution provider does.",
+        )
         page.click(".composer-actions .btn-primary")
         page.wait_for_selector(".msg.assistant .md p", timeout=60_000)
         page.wait_for_function(
@@ -266,16 +280,43 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         checks.ok(
             "ported model is selectable", any(ported in o for o in options), str(options[:3])
         )
-        page.select_option(".chat-side select", ported)
-        page.fill(".composer textarea", "Does my imported model answer?")
-        page.click(".composer-actions .btn-primary")
-        page.wait_for_selector(".msg.assistant .md p", timeout=60_000)
-        page.wait_for_function(
-            "() => document.querySelector('.composer-actions .btn-primary')?.hidden === false",
-            timeout=120_000,
+
+        # A GPU host with no export toolchain simulates the port, which produces a
+        # catalog entry and no weights. Asking it to generate is then not a fair check:
+        # what has to be true is that the server explains itself instead of failing as
+        # though the model were merely missing.
+        local = next(
+            (
+                m
+                for m in page.request.get(f"{base}/v1/local").json()["models"]
+                if m["id"] == ported
+            ),
+            {},
         )
-        answer = page.locator(".msg.assistant .md").inner_text()
-        checks.ok("ported model answers", len(answer) > 40, f"{len(answer)} chars")
+        weightless = local.get("extra", {}).get("simulated") and engine_is_real
+        if weightless:
+            reply = page.request.post(
+                f"{base}/v1/chat/completions",
+                data={"model": ported, "messages": [{"role": "user", "content": "Hi"}]},
+            )
+            detail = reply.text()
+            checks.ok(
+                "a weightless port says why it cannot serve",
+                not reply.ok and "simulated port" in detail,
+                f"{reply.status}: {detail[:160]}",
+            )
+        else:
+            page.select_option(".chat-side select", ported)
+            page.fill(".composer textarea", "Does my imported model answer?")
+            page.click(".composer-actions .btn-primary")
+            page.wait_for_selector(".msg.assistant .md p", timeout=60_000)
+            page.wait_for_function(
+                "() => document.querySelector('.composer-actions .btn-primary')?.hidden"
+                " === false",
+                timeout=120_000,
+            )
+            answer = page.locator(".msg.assistant .md").inner_text()
+            checks.ok("ported model answers", len(answer) > 40, f"{len(answer)} chars")
 
         # Leave no trace: the imported model would otherwise persist in the data
         # directory and change what the next run sees.

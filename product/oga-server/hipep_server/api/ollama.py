@@ -22,7 +22,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import __version__
-from ..engines import ChatMessage, EngineError, GenerationRequest
+from ..engines import ChatMessage, EngineError, GenerationRequest, ModelNotAvailable
 from ..scheduler import QueueFull
 from .common import (
     build_params,
@@ -303,6 +303,9 @@ async def _collect(scheduler, gen, session, client) -> tuple[list[str], dict[str
                 usage = delta.usage
     except QueueFull as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ModelNotAvailable as exc:
+        # Ollama clients treat 404 on a chat as "pull it first", which is the fix.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except EngineError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
     return parts, usage

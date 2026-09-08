@@ -15,6 +15,7 @@ from .base import (
     EngineError,
     GenerationParams,
     GenerationRequest,
+    ModelNotAvailable,
     Usage,
     estimate_tokens,
 )
@@ -30,6 +31,7 @@ __all__ = [
     "EngineError",
     "GenerationParams",
     "GenerationRequest",
+    "ModelNotAvailable",
     "OgaEngine",
     "ReplayEngine",
     "Usage",

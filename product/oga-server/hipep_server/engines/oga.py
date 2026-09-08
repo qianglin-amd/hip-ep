@@ -36,6 +36,7 @@ from .base import (
     Engine,
     EngineError,
     GenerationRequest,
+    ModelNotAvailable,
     Stopwatch,
     estimate_tokens,
 )
@@ -162,7 +163,16 @@ class OgaEngine(Engine):
                 raise EngineError(why)
             path = self.model_path(model)
             if not (path / "genai_config.json").is_file():
-                raise EngineError(
+                # A simulated port leaves a marker where the artifact would be. It is
+                # listed and selectable like any other local model, so without this the
+                # user is told to download something they appear to already have.
+                if (path / "SIMULATED").is_file():
+                    raise ModelNotAvailable(
+                        f"'{model.id}' came from a simulated port and has no weights. "
+                        "Install the porting toolchain with: "
+                        'pip install -e "product[quant]" , then port it again.'
+                    )
+                raise ModelNotAvailable(
                     f"model '{model.id}' is not downloaded. "
                     f"Pull it first: POST /api/pull or `hipep pull {model.id}`."
                 )

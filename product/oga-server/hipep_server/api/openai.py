@@ -25,7 +25,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..engines import ChatMessage, EngineError, GenerationRequest
+from ..engines import ChatMessage, EngineError, GenerationRequest, ModelNotAvailable
 from ..scheduler import QueueFull
 from .common import (
     build_params,
@@ -132,6 +132,10 @@ async def chat_completions(request: Request):
                 usage = delta.usage
     except QueueFull as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ModelNotAvailable as exc:
+        # The caller can fix this by pulling the model; a 500 would tell an OpenAI
+        # client to retry a request that cannot succeed until they do.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except EngineError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -263,6 +267,10 @@ async def completions(request: Request):
                 usage = delta.usage
     except QueueFull as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except ModelNotAvailable as exc:
+        # The caller can fix this by pulling the model; a 500 would tell an OpenAI
+        # client to retry a request that cannot succeed until they do.
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except EngineError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 

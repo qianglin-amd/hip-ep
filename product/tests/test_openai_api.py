@@ -46,6 +46,48 @@ def test_retrieve_unknown_model_is_404(client: TestClient) -> None:
     assert client.get("/v1/models/nope:0b").status_code == 404
 
 
+def test_a_model_that_is_not_downloaded_is_404_not_500(
+    client: TestClient, chat_model: str, monkeypatch
+) -> None:
+    """A missing download is the caller's to fix, and the status has to say so.
+
+    Every engine failure mapped to 500, so an OpenAI client met a retryable server
+    fault for a request that could not succeed until the model was pulled. The message
+    was already right; only the code disagreed with it.
+    """
+    from hipep_server.engines import ModelNotAvailable
+
+    async def refuse(model):
+        raise ModelNotAvailable(f"model '{model.id}' is not downloaded. Pull it first.")
+
+    monkeypatch.setattr(client.app.state.scheduler.engine, "load", refuse)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": chat_model, "messages": [{"role": "user", "content": "Hi"}]},
+    )
+    assert response.status_code == 404, response.text
+    assert "not downloaded" in response.json()["detail"]
+
+
+def test_a_genuine_engine_failure_is_still_500(
+    client: TestClient, chat_model: str, monkeypatch
+) -> None:
+    """The narrower status must not swallow real faults."""
+    from hipep_server.engines import EngineError
+
+    async def explode(model):
+        raise EngineError("the GPU fell over")
+
+    monkeypatch.setattr(client.app.state.scheduler.engine, "load", explode)
+
+    response = client.post(
+        "/v1/chat/completions",
+        json={"model": chat_model, "messages": [{"role": "user", "content": "Hi"}]},
+    )
+    assert response.status_code == 500, response.text
+
+
 def test_chat_completion_returns_content_and_timing(
     client: TestClient, chat_model: str
 ) -> None:

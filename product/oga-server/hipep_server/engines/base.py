@@ -103,6 +103,14 @@ class EngineError(RuntimeError):
     """Raised when an engine cannot serve a request."""
 
 
+class ModelNotAvailable(EngineError):
+    """The model is known but its weights are not on this machine.
+
+    Separate from a general engine failure because the caller can fix it and a
+    generic 500 tells an OpenAI client to retry a request that will never succeed.
+    """
+
+
 class Engine(abc.ABC):
     """Base class for inference engines."""
 
