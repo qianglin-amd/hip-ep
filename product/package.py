@@ -72,6 +72,10 @@ EXCLUDE = (
     "site/dist",
     # The plan deck and its slide renders are review material, not product.
     "plan",
+    # Tests for the packaging tool, which is not shipped: assembling a bundle is
+    # something this repository does, not something its recipient does. Left in, it
+    # breaks collection for the whole suite the recipient runs to check their install.
+    "tests/test_package.py",
 )
 
 # Copied from the repository root rather than product/, because a bundle without a

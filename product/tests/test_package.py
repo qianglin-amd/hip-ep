@@ -12,6 +12,8 @@ absent from the one directory the recipient actually opens.
 from __future__ import annotations
 
 import json
+import os
+import subprocess
 import sys
 import zipfile
 from pathlib import Path
@@ -94,6 +96,36 @@ def test_the_sweep_removes_bytecode_a_later_step_leaves_behind(tmp_path) -> None
 def test_the_review_deck_is_not_shipped(bundle: Path) -> None:
     """`plan/` is how the product is reviewed internally, not part of it."""
     assert not (bundle / "plan").exists()
+
+
+def test_the_bundled_test_suite_collects(bundle: Path) -> None:
+    """The recipient runs this suite to check their install, so it has to at least
+    import. It shipped a test for the packaging tool, which is not shipped, and one
+    uncollectable module fails the whole run."""
+    # No cache directory and no bytecode: this runs inside the staged bundle that the
+    # other tests inspect, and either one would appear as an unchecksummed file.
+    out = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-p",
+            "no:cacheprovider",
+            "tests",
+        ],
+        cwd=bundle,
+        capture_output=True,
+        text=True,
+        env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        check=False,
+    )
+    assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-2000:]
+
+
+def test_the_packaging_tests_are_not_shipped(bundle: Path) -> None:
+    assert not (bundle / "tests" / "test_package.py").exists()
 
 
 def test_the_documentation_is_prebuilt(bundle: Path) -> None:
