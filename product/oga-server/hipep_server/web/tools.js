@@ -112,7 +112,9 @@ export const TOOLS = [
           properties: {
             timezone: {
               type: "string",
-              description: "An IANA timezone such as Europe/London. Defaults to local.",
+              description:
+                "An IANA timezone such as Europe/London. Omit it for this machine's " +
+                "own timezone.",
             },
           },
           required: [],
@@ -121,13 +123,30 @@ export const TOOLS = [
     },
     async run({ timezone } = {}) {
       const now = new Date();
-      // An unknown timezone makes toLocaleString throw, and the model chose it, so it
-      // is reported back as a tool error rather than breaking the loop.
-      const options = timezone ? { timeZone: timezone } : {};
+      const here = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+      // Models pass words like "local", "system" or "current" here, partly because
+      // asking for the current time invites them and partly because the description
+      // used to say "defaults to local". Only IANA names work, so an unusable value
+      // falls back to this machine's zone and says which one it used. Returning an
+      // error instead spends a whole round trip teaching the model what a timezone is,
+      // and small models do not learn it.
+      let zone = timezone;
+      if (zone) {
+        try {
+          now.toLocaleString(undefined, { timeZone: zone });
+        } catch {
+          zone = null;
+        }
+      }
+
       return {
         iso: now.toISOString(),
-        local: now.toLocaleString(undefined, options),
-        timezone: timezone || Intl.DateTimeFormat().resolvedOptions().timeZone,
+        local: now.toLocaleString(undefined, zone ? { timeZone: zone } : {}),
+        timezone: zone || here,
+        ...(timezone && !zone
+          ? { note: `"${timezone}" is not an IANA timezone; used ${here} instead` }
+          : {}),
       };
     },
   },

@@ -128,7 +128,8 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         nav = page.locator("#nav a").evaluate_all("els => els.map(e => e.dataset.view)")
         checks.ok(
             "sidebar rendered",
-            nav == ["chat", "vision", "agent", "models", "port", "benchmark", "server", "develop"],
+            nav
+            == ["chat", "vision", "agent", "models", "port", "benchmark", "server", "develop"],
             str(nav),
         )
         checks.ok(
@@ -202,7 +203,8 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         print("\nagent")
         goto("agent")
         checks.ok(
-            "tools offered", page.locator(".tool-list .tool-row").count() >= 4,
+            "tools offered",
+            page.locator(".tool-list .tool-row").count() >= 4,
             f"{page.locator('.tool-list .tool-row').count()} tools",
         )
 
@@ -226,17 +228,56 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
               };
             }"""
         )
-        checks.ok("operator precedence honoured", parser["precedence"].get("value") == 14,
-                  str(parser["precedence"]))
-        checks.ok("parentheses honoured",
-                  abs(parser["parens"].get("value", 0) - 4285.714285714286) < 1e-6,
-                  str(parser["parens"]))
-        checks.ok("unary minus handled", parser["negative"].get("value") == -3,
-                  str(parser["negative"]))
+
+        # A model asked for timezone "local", which is not an IANA name, and the tool
+        # failed the round trip on its own argument. Any tool the model can break with
+        # a plausible value is a tool that will be broken.
+        clock = page.evaluate(
+            """async () => {
+              const { TOOLS_BY_NAME } = await import('/tools.js');
+              const clock = TOOLS_BY_NAME.get('get_current_time');
+              return {
+                bare: await clock.run({}),
+                word: await clock.run({ timezone: 'local' }),
+                real: await clock.run({ timezone: 'Europe/London' }),
+              };
+            }"""
+        )
+        checks.ok("the clock reads the clock", "iso" in clock["bare"], str(clock["bare"])[:80])
+        checks.ok(
+            "a timezone the model invented still answers",
+            "iso" in clock["word"] and "note" in clock["word"],
+            str(clock["word"])[:120],
+        )
+        checks.ok(
+            "a real timezone is honoured",
+            clock["real"].get("timezone") == "Europe/London",
+            str(clock["real"])[:120],
+        )
+        checks.ok(
+            "operator precedence honoured",
+            parser["precedence"].get("value") == 14,
+            str(parser["precedence"]),
+        )
+        checks.ok(
+            "parentheses honoured",
+            abs(parser["parens"].get("value", 0) - 4285.714285714286) < 1e-6,
+            str(parser["parens"]),
+        )
+        checks.ok(
+            "unary minus handled",
+            parser["negative"].get("value") == -3,
+            str(parser["negative"]),
+        )
         checks.ok("division by zero refused", "error" in parser["zero"], str(parser["zero"]))
-        checks.ok("code is not evaluated", "error" in parser["injected"], str(parser["injected"]))
-        checks.ok("a truncated expression is refused", "error" in parser["trailing"],
-                  str(parser["trailing"]))
+        checks.ok(
+            "code is not evaluated", "error" in parser["injected"], str(parser["injected"])
+        )
+        checks.ok(
+            "a truncated expression is refused",
+            "error" in parser["trailing"],
+            str(parser["trailing"]),
+        )
 
         if engine_is_real:
             # The whole point of the view is the round trip, so the check is that a tool
