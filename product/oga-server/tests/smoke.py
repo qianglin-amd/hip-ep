@@ -321,11 +321,22 @@ def main() -> int:
                 measured["tps"] > 0,
                 f"TTFT {measured['ttft_s']:.2f}s, {measured['tps']:.1f} tok/s",
             )
-            check(
-                "measurements compared against published numbers",
-                "128" in summary["delta_vs_published"],
-                json.dumps(summary["delta_vs_published"].get("128", {})),
-            )
+            # A model ported on this machine has no certified baseline, so there is
+            # nothing to compare it against and the absence is the correct result. Only
+            # a model that does have published numbers must produce a comparison.
+            published = summary.get("published") or {}
+            if published:
+                check(
+                    "measurements compared against published numbers",
+                    "128" in summary["delta_vs_published"],
+                    json.dumps(summary["delta_vs_published"].get("128", {})),
+                )
+            else:
+                check(
+                    "no published baseline to compare against",
+                    not summary["delta_vs_published"],
+                    f"{summary['model']} was ported here, not certified",
+                )
 
     print("\n== multi-user status ==")
     status = client.get("/v1/status").json()

@@ -9,6 +9,7 @@ produces language.
 
 from __future__ import annotations
 
+import subprocess
 import sys
 
 import pytest
@@ -250,6 +251,55 @@ class TestToolchainDiscovery:
         stages._probe.cache_clear()
 
         assert stages.toolchain_python() == str(chosen)
+
+
+class TestGraphInspection:
+    """Counting the quantized matmuls in the graph the builder produced."""
+
+    def test_the_graph_is_read_on_the_toolchain_interpreter(self, tmp_path, monkeypatch):
+        # `onnx` belongs to the porting toolchain, not the server: a clean server
+        # install has no protobuf library, so importing it in-process turned every real
+        # port into "No module named 'onnx'" at the quantize stage, after the source
+        # weights had already been downloaded and the graph built.
+        interpreter = tmp_path / "toolchain-python"
+        interpreter.write_text("")
+        monkeypatch.setattr(stages, "toolchain_python", lambda: str(interpreter))
+        seen = {}
+
+        def fake_run(command, **kwargs):
+            seen["command"] = command
+            return subprocess.CompletedProcess(command, 0, '{"MatMulNBits": 168}', "")
+
+        monkeypatch.setattr(stages.subprocess, "run", fake_run)
+
+        counts = stages._count_quantized_ops(tmp_path / "model.onnx")
+
+        assert counts == {"MatMulNBits": 168}
+        assert seen["command"][0] == str(interpreter)
+
+    def test_the_weights_are_not_loaded_to_read_the_node_list(self):
+        # On a large model the difference between reading the nodes and reading the
+        # weights is megabytes against tens of gigabytes.
+        assert "load_external_data=False" in stages._COUNT_SCRIPT
+
+    def test_a_failure_reading_the_graph_is_reported(self, tmp_path, monkeypatch):
+        interpreter = tmp_path / "toolchain-python"
+        interpreter.write_text("")
+        monkeypatch.setattr(stages, "toolchain_python", lambda: str(interpreter))
+        monkeypatch.setattr(
+            stages.subprocess,
+            "run",
+            lambda command, **kw: subprocess.CompletedProcess(command, 1, "", "boom"),
+        )
+
+        with pytest.raises(RuntimeError, match="boom"):
+            stages._count_quantized_ops(tmp_path / "model.onnx")
+
+    def test_no_toolchain_is_named_as_such(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(stages, "toolchain_python", lambda: None)
+
+        with pytest.raises(stages.ToolchainMissing):
+            stages._count_quantized_ops(tmp_path / "model.onnx")
 
 
 class TestBuildTarget:

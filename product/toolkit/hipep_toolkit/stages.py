@@ -670,19 +670,41 @@ def _scheme_with_block(scheme: str, block: int) -> str:
     return "-".join(parts)
 
 
+# Reading the node list needs onnx, which belongs to the porting toolchain rather than
+# to the server: the server never opens a graph, and adding onnx to its dependencies
+# would put a 15 MB protobuf library into every install that only serves models. So the
+# count runs on the toolchain interpreter, the same one that produced the graph.
+#
+# The weights live in external data next to the graph and are not needed to read the
+# node list, which on a large model is the difference between megabytes and tens of
+# gigabytes.
+_COUNT_SCRIPT = """
+import json, sys
+import onnx
+
+model = onnx.load(sys.argv[1], load_external_data=False)
+counts = {}
+for node in model.graph.node:
+    if node.op_type in ("MatMul", "MatMulNBits"):
+        counts[node.op_type] = counts.get(node.op_type, 0) + 1
+json.dump(counts, sys.stdout)
+"""
+
+
 def _count_quantized_ops(graph: Path) -> dict[str, int]:
     """Count the operators that decide whether quantization actually happened."""
-    import onnx
-
-    # The weights live in external data next to the graph and are not needed to read
-    # the node list, which on a large model is the difference between megabytes and
-    # tens of gigabytes.
-    model = onnx.load(str(graph), load_external_data=False)
-    counts: dict[str, int] = {}
-    for node in model.graph.node:
-        if node.op_type in {"MatMul", "MatMulNBits"}:
-            counts[node.op_type] = counts.get(node.op_type, 0) + 1
-    return counts
+    python = _require_toolchain()
+    out = subprocess.run(
+        [python, "-c", _COUNT_SCRIPT, str(graph)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if out.returncode != 0:
+        raise RuntimeError(
+            f"reading the graph's node list failed: {out.stderr.strip()[-400:]}"
+        )
+    return json.loads(out.stdout)
 
 
 async def _run(ctx, command: list[str], label: str) -> None:

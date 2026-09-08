@@ -69,6 +69,24 @@ When an install misbehaves, `hipep doctor` is the faster answer than the test su
 runs without a server and reports each precondition separately, so the failure names a
 layer instead of a symptom. `hipep doctor --json` is the form to use in a CI step.
 
+## Packaging a release
+
+```bash
+python product/package.py --out dist/
+python product/package.py --out dist/ --gpu-wheels ../wheels
+```
+
+This assembles the delivery bundle: the server, the console, the toolkit, the registry,
+the recipes, the samples, the install scripts and the prebuilt documentation site, with
+a `START-HERE.md`, a `MANIFEST.json` recording the commit and the wheel provenance, and
+a checksum per file. Nothing produced on the packaging host is included, so the bundle
+installs the same way on a machine that has never seen this repository.
+
+The GPU wheels are optional and passed by path, because each set is built for one ROCm
+version, one GPU architecture and one Python version. Without them the bundle installs
+and runs on the replay engine; with them the installer reads the required Python version
+from the wheel file names and builds the virtualenv on a matching interpreter.
+
 ## Principles
 
 1. **The server is the product boundary.** The console, the benchmarks and the samples
