@@ -324,7 +324,12 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
             )
         else:
             page.select_option(".chat-side select", ported)
-            page.fill(".composer textarea", "Does my imported model answer?")
+            # "Does my imported model answer?" is a yes/no question, and a correct
+            # answer to it is about thirty characters, so asserting a longer reply
+            # failed a working model. The prompt has to be one whose correct answer is
+            # prose. The model ported here is a 135M checkpoint chosen for download
+            # size, so the bar is a real reply rather than a good one.
+            page.fill(".composer textarea", "Describe what a laptop is, in two sentences.")
             page.click(".composer-actions .btn-primary")
             page.wait_for_selector(".msg.assistant .md p", timeout=60_000)
             page.wait_for_function(
