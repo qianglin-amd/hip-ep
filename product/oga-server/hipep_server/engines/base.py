@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..catalog import Model
+from .tools import ToolCall
 
 
 @dataclass
@@ -31,6 +32,12 @@ class ChatMessage:
     role: str
     content: str
     images: list[bytes] = field(default_factory=list)
+    # Set on an assistant turn the model produced earlier, and on a `tool` turn
+    # carrying a result, so a multi-step agent loop can be replayed back to a model
+    # that keeps no state of its own between requests.
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    tool_call_id: str | None = None
+    name: str | None = None
 
     @property
     def has_images(self) -> bool:
@@ -55,6 +62,10 @@ class GenerationRequest:
     messages: list[ChatMessage]
     params: GenerationParams = field(default_factory=GenerationParams)
     session_id: str | None = None
+    # OpenAI-shaped tool definitions. The engine renders them into the prompt, since
+    # no certified artifact accepts them through any other channel.
+    tools: list[dict[str, Any]] = field(default_factory=list)
+    tool_choice: Any = None
 
     @property
     def images(self) -> list[bytes]:
@@ -73,6 +84,7 @@ class Delta:
     done: bool = False
     finish_reason: str | None = None
     usage: dict[str, Any] | None = None
+    tool_calls: list[ToolCall] = field(default_factory=list)
 
 
 @dataclass

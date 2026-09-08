@@ -40,6 +40,7 @@ from .base import (
     Stopwatch,
     estimate_tokens,
 )
+from .tools import describe_tools, extract_tool_calls
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +56,7 @@ def _drain(out: queue.Queue) -> list[Any]:
     except queue.Empty:
         pass
     return items
+
 
 _ep_ready = False
 
@@ -220,6 +222,11 @@ class OgaEngine(Engine):
         completion_tokens = 0
         prompt_tokens = estimate_tokens(request.prompt_text)
         finished = False
+        # A tool call is markup the user must never see, and it is only recognisable
+        # once complete, so a request carrying tools is accumulated and split at the
+        # end rather than streamed through. Requests without tools stream unchanged.
+        collecting = bool(request.tools)
+        collected: list[str] = []
         try:
             while not finished:
                 # One thread hand-off per burst rather than per token. The worker holds
@@ -239,13 +246,27 @@ class OgaEngine(Engine):
                         continue
                     watch.mark_first_token()
                     completion_tokens += 1
-                    yield Delta(text=item)
+                    if collecting:
+                        collected.append(item)
+                    else:
+                        yield Delta(text=item)
         finally:
             cancel.set()
 
+        calls = []
+        if collecting:
+            text, calls = extract_tool_calls("".join(collected))
+            if text:
+                yield Delta(text=text)
+
         watch.finish()
         usage = watch.usage(prompt_tokens, completion_tokens)
-        yield Delta(done=True, finish_reason="stop", usage=usage.to_dict())
+        yield Delta(
+            done=True,
+            finish_reason="tool_calls" if calls else "stop",
+            usage=usage.to_dict(),
+            tool_calls=calls,
+        )
 
     def _generate_blocking(
         self,
@@ -269,7 +290,7 @@ class OgaEngine(Engine):
             if request.params.repetition_penalty != 1.0:
                 search["repetition_penalty"] = request.params.repetition_penalty
 
-            prompt = loaded.chat.render(request.messages)
+            prompt = loaded.chat.render(request.messages, request.tools)
 
             # The model holds one generator at a time; concurrent requests for the same
             # model are serialised here and queued by the scheduler above.
@@ -370,17 +391,52 @@ class ChatFormat:
     prefix: str = ""
     stops: tuple[str, ...] = ()
 
-    def render(self, messages: Any) -> str:
+    def render(self, messages: Any, tools: list[dict[str, Any]] | None = None) -> str:
         parts = [self.prefix]
+        if tools:
+            # The tool list is a system turn because that is where these models were
+            # trained to look for it, and because it must not read as something the
+            # user said.
+            description = describe_tools(tools)
+            if description:
+                parts.append(
+                    self.turns.get("system", self.turns["user"]).format(content=description)
+                )
         for message in messages:
             content = message.content
+            if message.tool_calls:
+                # Replay the model's own earlier call, or a later turn has a result
+                # arriving in answer to nothing.
+                content = "\n".join(
+                    filter(
+                        None,
+                        [
+                            content,
+                            *(
+                                f'<tool_call>{{"name": "{call.name}", '
+                                f'"arguments": {call.arguments}}}</tool_call>'
+                                for call in message.tool_calls
+                            ),
+                        ],
+                    )
+                )
+            role = message.role
+            if role == "tool":
+                # No family has a role for this, so the result is handed back in the
+                # user turn, tagged with the tool it came from.
+                label = message.name or message.tool_call_id or "tool"
+                content = (
+                    f'<tool_response>{{"name": "{label}", '
+                    f'"content": {json.dumps(content, ensure_ascii=False)}}}</tool_response>'
+                )
+                role = "user"
             if message.images:
                 # Image placeholders are what the multimodal processors look for.
                 placeholders = "".join(
                     f"<|image_{i + 1}|>" for i in range(len(message.images))
                 )
                 content = placeholders + content
-            template = self.turns.get(message.role, self.turns["user"])
+            template = self.turns.get(role, self.turns["user"])
             parts.append(template.format(content=content))
         parts.append(self.reply)
         return "".join(parts)

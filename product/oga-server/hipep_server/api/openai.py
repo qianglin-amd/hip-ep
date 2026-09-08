@@ -34,6 +34,7 @@ from .common import (
     get_scheduler,
     open_session,
     parse_openai_messages,
+    parse_tools,
     reject_unsupported_images,
     resolve_model,
     sse,
@@ -93,8 +94,14 @@ async def chat_completions(request: Request):
         body, default_max_tokens=request.app.state.settings.default_max_tokens, model=model
     )
     session = open_session(request, "openai")
+    tools, tool_choice = parse_tools(body)
     gen = GenerationRequest(
-        model=model, messages=messages, params=params, session_id=session.id
+        model=model,
+        messages=messages,
+        params=params,
+        session_id=session.id,
+        tools=tools,
+        tool_choice=tool_choice,
     )
 
     completion_id = f"chatcmpl-{uuid.uuid4().hex[:24]}"
@@ -122,14 +129,19 @@ async def chat_completions(request: Request):
 
     text_parts: list[str] = []
     usage: dict[str, Any] = {}
+    tool_calls: list[Any] = []
+    finish_reason = "stop"
     try:
         async for delta in scheduler.stream(
             gen, session=session, api="openai", client=client_address(request)
         ):
             if delta.text:
                 text_parts.append(delta.text)
-            if delta.done and delta.usage:
-                usage = delta.usage
+            if delta.tool_calls:
+                tool_calls.extend(delta.tool_calls)
+            if delta.done:
+                usage = delta.usage or usage
+                finish_reason = delta.finish_reason or finish_reason
     except QueueFull as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ModelNotAvailable as exc:
@@ -138,6 +150,14 @@ async def chat_completions(request: Request):
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except EngineError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+    content = "".join(text_parts)
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if tool_calls:
+        message["tool_calls"] = [call.to_openai() for call in tool_calls]
+        # OpenAI pairs tool calls with null content, and clients that type the field
+        # strictly reject the empty string a plain join would leave here.
+        message["content"] = content or None
 
     return JSONResponse(
         {
@@ -148,8 +168,8 @@ async def chat_completions(request: Request):
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": "".join(text_parts)},
-                    "finish_reason": "stop",
+                    "message": message,
+                    "finish_reason": finish_reason,
                 }
             ],
             "usage": usage,
@@ -185,6 +205,18 @@ async def _stream_chat(
         async for delta in scheduler.stream(gen, session=session, api="openai", client=client):
             if delta.text:
                 yield frame({"content": delta.text})
+            if delta.tool_calls:
+                # A call is only recognisable once complete, so it arrives whole in one
+                # frame rather than as the argument fragments OpenAI streams. Clients
+                # accumulate by index either way.
+                yield frame(
+                    {
+                        "tool_calls": [
+                            {"index": index, **call.to_openai()}
+                            for index, call in enumerate(delta.tool_calls)
+                        ]
+                    }
+                )
             if delta.done:
                 yield frame({}, finish=delta.finish_reason or "stop", usage=delta.usage)
     except QueueFull as exc:

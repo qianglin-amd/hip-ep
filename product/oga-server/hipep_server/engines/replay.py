@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import math
 import random
 import textwrap
@@ -31,6 +32,7 @@ from .base import (
     estimate_tokens,
     image_prefill_tokens,
 )
+from .tools import ToolCall, new_call_id
 
 # Model-load cost scales with weight size; this is the observed rate for reading a
 # converted artifact from warm page cache on the certification host.
@@ -86,6 +88,15 @@ class ReplayEngine(Engine):
             prompt_tokens += image_prefill_tokens(len(images), resize)
 
         ttft, tps = self._timing(model, prompt_tokens)
+
+        # A caller offering tools is exercising the agent path, and replaying prose at
+        # it would leave that path untested everywhere there is no GPU. The call names
+        # the first tool offered so the round trip is deterministic.
+        if request.tools:
+            async for delta in self._replay_tool_call(request, prompt_tokens, ttft):
+                yield delta
+            return
+
         text = self._compose(request, prompt_tokens, ttft, tps)
         pieces = _tokenize_for_streaming(text)
         pieces = pieces[: max(1, request.params.max_tokens)]
@@ -116,6 +127,51 @@ class ReplayEngine(Engine):
         watch.finish()
         usage = watch.usage(prompt_tokens, emitted)
         yield Delta(done=True, finish_reason="stop", usage=usage.to_dict())
+
+    async def _replay_tool_call(
+        self, request: GenerationRequest, prompt_tokens: int, ttft: float
+    ) -> AsyncIterator[Delta]:
+        """Answer a tool-enabled request the way a model that decided to call one would.
+
+        Once a result has been handed back the replay stops calling, so an agent loop
+        terminates here exactly as it would on hardware instead of calling forever.
+        """
+        watch = Stopwatch()
+        await self._sleep(ttft)
+        watch.mark_first_token()
+
+        already_answered = any(m.role == "tool" for m in request.messages)
+        calls: list[ToolCall] = []
+        if already_answered:
+            text = (
+                "Replayed answer: the tool result above would be used here. "
+                "This server is running the replay engine, so no model was consulted."
+            )
+            yield Delta(text=text)
+            emitted = len(text.split())
+        else:
+            first = request.tools[0]
+            function = first.get("function") if first.get("type") == "function" else first
+            name = (function or {}).get("name") or "unknown_tool"
+            required = ((function or {}).get("parameters") or {}).get("required") or []
+            arguments = {key: f"replayed-{key}" for key in required if isinstance(key, str)}
+            calls = [
+                ToolCall(
+                    id=new_call_id(),
+                    name=name,
+                    arguments=json.dumps(arguments, ensure_ascii=False),
+                )
+            ]
+            emitted = 1
+
+        watch.finish()
+        usage = watch.usage(prompt_tokens, emitted)
+        yield Delta(
+            done=True,
+            finish_reason="tool_calls" if calls else "stop",
+            usage=usage.to_dict(),
+            tool_calls=calls,
+        )
 
     # --- internals ------------------------------------------------------------
 

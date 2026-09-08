@@ -14,6 +14,7 @@ from fastapi import HTTPException, Request
 
 from ..catalog import Catalog, Model
 from ..engines import ChatMessage, GenerationParams
+from ..engines.tools import ToolCall, new_call_id
 from ..scheduler import Scheduler
 from ..store import ModelStore
 
@@ -104,6 +105,25 @@ def decode_image(value: str) -> bytes:
     return data
 
 
+def _parsed_tool_calls(item: dict[str, Any]) -> list[ToolCall]:
+    """Read back tool calls the server itself returned on an earlier turn."""
+    calls = []
+    for raw in item.get("tool_calls") or []:
+        if not isinstance(raw, dict):
+            continue
+        function = raw.get("function") or {}
+        name = function.get("name")
+        if not name:
+            continue
+        arguments = function.get("arguments")
+        if not isinstance(arguments, str):
+            arguments = _dumps(arguments if arguments is not None else {})
+        calls.append(
+            ToolCall(id=raw.get("id") or new_call_id(), name=name, arguments=arguments)
+        )
+    return calls
+
+
 def parse_openai_messages(raw: list[dict[str, Any]]) -> list[ChatMessage]:
     """Convert OpenAI chat messages, including multimodal content parts."""
     messages: list[ChatMessage] = []
@@ -111,7 +131,15 @@ def parse_openai_messages(raw: list[dict[str, Any]]) -> list[ChatMessage]:
         role = item.get("role", "user")
         content = item.get("content")
         if isinstance(content, str) or content is None:
-            messages.append(ChatMessage(role=role, content=content or ""))
+            messages.append(
+                ChatMessage(
+                    role=role,
+                    content=content or "",
+                    tool_calls=_parsed_tool_calls(item),
+                    tool_call_id=item.get("tool_call_id"),
+                    name=item.get("name"),
+                )
+            )
             continue
         text_parts: list[str] = []
         images: list[bytes] = []
@@ -149,9 +177,44 @@ def parse_ollama_messages(raw: list[dict[str, Any]]) -> list[ChatMessage]:
                 role=item.get("role", "user"),
                 content=item.get("content", "") or "",
                 images=images,
+                tool_calls=_parsed_tool_calls(item),
+                name=item.get("tool_name") or item.get("name"),
             )
         )
     return messages
+
+
+def parse_tools(body: dict[str, Any]) -> tuple[list[dict[str, Any]], Any]:
+    """Read the tool definitions off a request, rejecting shapes we cannot honour.
+
+    `tool_choice` may name a required function. Nothing here can force a model to
+    comply, so a caller asking for a guarantee the server cannot give is told rather
+    than left to discover it from a plain answer.
+    """
+    tools = body.get("tools") or []
+    if not isinstance(tools, list):
+        raise HTTPException(status_code=400, detail="tools must be a list")
+
+    named = [
+        t
+        for t in tools
+        if isinstance(t, dict) and ((t.get("function") or {}).get("name") or t.get("name"))
+    ]
+    if tools and not named:
+        raise HTTPException(
+            status_code=400,
+            detail="each tool needs a function with a name; see the OpenAI tools schema",
+        )
+
+    choice = body.get("tool_choice")
+    if isinstance(choice, str) and choice not in {"auto", "none", "required"}:
+        raise HTTPException(
+            status_code=400,
+            detail=f"tool_choice '{choice}' is not supported; use auto, none or required",
+        )
+    if choice == "none":
+        return [], choice
+    return named, choice
 
 
 def reject_unsupported_images(model: Model, messages: list[ChatMessage]) -> None:

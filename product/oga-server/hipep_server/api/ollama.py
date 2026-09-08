@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from .. import __version__
 from ..engines import ChatMessage, EngineError, GenerationRequest, ModelNotAvailable
+from ..engines.tools import ToolCall
 from ..scheduler import QueueFull
 from .common import (
     build_params,
@@ -33,6 +34,7 @@ from .common import (
     ndjson,
     open_session,
     parse_ollama_messages,
+    parse_tools,
     reject_unsupported_images,
     resolve_model,
 )
@@ -152,8 +154,14 @@ async def chat(request: Request):
         body, default_max_tokens=request.app.state.settings.default_max_tokens, model=model
     )
     session = open_session(request, "ollama")
+    tools, tool_choice = parse_tools(body)
     gen = GenerationRequest(
-        model=model, messages=messages, params=params, session_id=session.id
+        model=model,
+        messages=messages,
+        params=params,
+        session_id=session.id,
+        tools=tools,
+        tool_choice=tool_choice,
     )
     stream = body.get("stream", True)
 
@@ -165,14 +173,20 @@ async def chat(request: Request):
             media_type="application/x-ndjson",
         )
 
-    parts, usage = await _collect(scheduler, gen, session, client_address(request))
+    parts, usage, calls, reason = await _collect(
+        scheduler, gen, session, client_address(request)
+    )
+    message: dict[str, Any] = {"role": "assistant", "content": "".join(parts)}
+    if calls:
+        message["tool_calls"] = [call.to_ollama() for call in calls]
+
     return JSONResponse(
         {
             "model": model.id,
             "created_at": _iso(time.time()),
-            "message": {"role": "assistant", "content": "".join(parts)},
+            "message": message,
             "done": True,
-            "done_reason": "stop",
+            "done_reason": reason,
             **_durations(usage),
         }
     )
@@ -214,7 +228,8 @@ async def generate(request: Request):
             media_type="application/x-ndjson",
         )
 
-    parts, usage = await _collect(scheduler, gen, session, client_address(request))
+    # /api/generate has no tool surface, so the calls and reason are not used here.
+    parts, usage, _, _ = await _collect(scheduler, gen, session, client_address(request))
     return JSONResponse(
         {
             "model": model.id,
@@ -292,15 +307,22 @@ def _durations(usage: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-async def _collect(scheduler, gen, session, client) -> tuple[list[str], dict[str, Any]]:
+async def _collect(
+    scheduler, gen, session, client
+) -> tuple[list[str], dict[str, Any], list[ToolCall], str]:
     parts: list[str] = []
     usage: dict[str, Any] = {}
+    calls: list[ToolCall] = []
+    reason = "stop"
     try:
         async for delta in scheduler.stream(gen, session=session, api="ollama", client=client):
             if delta.text:
                 parts.append(delta.text)
-            if delta.done and delta.usage:
-                usage = delta.usage
+            if delta.tool_calls:
+                calls.extend(delta.tool_calls)
+            if delta.done:
+                usage = delta.usage or usage
+                reason = delta.finish_reason or reason
     except QueueFull as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     except ModelNotAvailable as exc:
@@ -308,7 +330,7 @@ async def _collect(scheduler, gen, session, client) -> tuple[list[str], dict[str
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except EngineError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return parts, usage
+    return parts, usage, calls, reason
 
 
 async def _stream_ollama(
@@ -326,6 +348,10 @@ async def _stream_ollama(
         async for delta in scheduler.stream(gen, session=session, api="ollama", client=client):
             if delta.text:
                 yield ndjson(payload(delta.text))
+            if delta.tool_calls and chat:
+                frame = payload("")
+                frame["message"]["tool_calls"] = [c.to_ollama() for c in delta.tool_calls]
+                yield ndjson(frame)
             if delta.done:
                 final = payload("")
                 final.update({"done": True, "done_reason": delta.finish_reason or "stop"})
