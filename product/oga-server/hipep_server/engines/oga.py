@@ -19,11 +19,14 @@ Two properties matter for correctness of the product, not just of the code:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import queue
 import threading
+import time
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -41,9 +44,52 @@ log = logging.getLogger(__name__)
 
 _SENTINEL = object()
 
+_ep_ready = False
+
+
+def _prepare_amdgpu_ep() -> None:
+    """Point onnxruntime-genai at the AMD GPU execution provider before it loads.
+
+    The plugin EP ships as its own wheel rather than being compiled into
+    onnxruntime-genai, which imposes three ordering constraints. Each one fails either
+    silently or with a message that points somewhere other than the cause, so they are
+    handled here once instead of at the call sites:
+
+    * Windows resolves a bare `onnxruntime.dll` out of system32 ahead of PATH, and the
+      Windows ML copy that lives there is several versions behind the wheel. Loading
+      the wheel's copy first leaves the right module resident, so the EP binds to it.
+    * onnxruntime-genai loads the EP itself from `AMDGPU_EP_PATH`, so that variable has
+      to exist before the module is imported.
+    * The EP must *not* also be handed to `register_execution_provider_library`.
+      Registering it twice leaves genai reporting no supported AMD GPU devices at all.
+    """
+    global _ep_ready
+    if _ep_ready:
+        return
+    _ep_ready = True
+    try:
+        import onnxruntime_ep_amdgpu
+    except ImportError:
+        # No plugin wheel. A genai build with the provider compiled in still works,
+        # so leave it to fail later with its own message if it cannot.
+        return
+
+    try:
+        import ctypes
+
+        import onnxruntime
+
+        bundled = Path(onnxruntime.__file__).parent / "capi" / "onnxruntime.dll"
+        if bundled.is_file():
+            ctypes.CDLL(str(bundled))
+        os.environ.setdefault("AMDGPU_EP_PATH", onnxruntime_ep_amdgpu.get_library_path())
+    except Exception as exc:  # noqa: BLE001
+        log.warning("could not prepare the AMD GPU execution provider: %s", exc)
+
 
 def oga_available() -> tuple[bool, str]:
     """Whether onnxruntime-genai can be imported, and why not if it cannot."""
+    _prepare_amdgpu_ep()
     try:
         import onnxruntime_genai  # noqa: F401
     except ImportError as exc:
@@ -56,6 +102,8 @@ class _LoadedModel:
         self.model = model
         self.path = path
         self.og_model = og.Model(str(path))
+        self.model_type = _model_type(path)
+        self.chat = chat_format(self.model_type)
         # Multimodal models expose a processor; text-only models expose a tokenizer.
         self.processor = None
         self.tokenizer = None
@@ -155,6 +203,8 @@ class OgaEngine(Engine):
                     raise EngineError(str(item)) from item
                 if isinstance(item, dict):  # metadata from the worker
                     prompt_tokens = item.get("prompt_tokens", prompt_tokens)
+                    if "first_token_at" in item:
+                        watch.mark_first_token_at(item["first_token_at"])
                     continue
                 watch.mark_first_token()
                 completion_tokens += 1
@@ -174,15 +224,12 @@ class OgaEngine(Engine):
         cancel: threading.Event,
     ) -> None:
         """Run onnxruntime-genai on a worker thread, pushing decoded text to `out`."""
+        first_token_at: float | None = None
         try:
             import onnxruntime_genai as og
 
             params = og.GeneratorParams(loaded.og_model)
             search = {
-                "max_length": min(
-                    request.model.max_context,
-                    estimate_tokens(request.prompt_text) + request.params.max_tokens,
-                ),
                 "temperature": request.params.temperature,
                 "top_p": request.params.top_p,
                 "top_k": request.params.top_k,
@@ -190,9 +237,8 @@ class OgaEngine(Engine):
             }
             if request.params.repetition_penalty != 1.0:
                 search["repetition_penalty"] = request.params.repetition_penalty
-            params.set_search_options(**search)
 
-            prompt = _render_prompt(request)
+            prompt = loaded.chat.render(request.messages)
 
             # The model holds one generator at a time; concurrent requests for the same
             # model are serialised here and queued by the scheduler above.
@@ -200,25 +246,49 @@ class OgaEngine(Engine):
                 if loaded.processor is not None:
                     images = _load_images(og, request)
                     inputs = loaded.processor(prompt, images=images)
-                    params.set_inputs(inputs)
+                    tokens = None
                     detok = loaded.processor.create_stream()
                     prompt_len = 0
                 else:
+                    inputs = None
                     tokens = loaded.tokenizer.encode(prompt)
-                    params.input_ids = tokens
-                    detok = og.TokenizerStream(loaded.tokenizer)
+                    detok = loaded.tokenizer.create_stream()
                     prompt_len = len(tokens)
 
-                out.put({"prompt_tokens": prompt_len or estimate_tokens(prompt)})
+                # Reported before the generator is built, because building it is where
+                # the prompt is actually processed and the caller times that as TTFT.
+                counted = prompt_len or estimate_tokens(prompt)
+                out.put({"prompt_tokens": counted})
 
+                # max_length has to cover the prompt actually sent, so it can only be
+                # settled once that prompt exists. Sizing it from the raw request text
+                # misses everything the chat markup adds, and onnxruntime-genai rejects
+                # a budget smaller than the input outright rather than clamping it.
+                search["max_length"] = min(
+                    request.model.max_context, counted + request.params.max_tokens
+                )
+                params.set_search_options(**search)
+
+                # The prompt attaches to the generator rather than to the params, and
+                # logits are computed by generate_next_token. Both moved when
+                # onnxruntime-genai gained continuous batching.
                 generator = og.Generator(loaded.og_model, params)
-                stops = request.params.stop
+                if inputs is not None:
+                    generator.set_inputs(inputs)
+                else:
+                    generator.append_tokens(tokens)
+                # The family's own end-of-turn markers, on top of anything the caller
+                # asked for, so a model whose artifact under-declares its EOS ids still
+                # stops at the end of its answer instead of continuing the transcript.
+                stops = list(dict.fromkeys([*(request.params.stop or ()), *loaded.chat.stops]))
                 buffered = ""
                 while not generator.is_done():
                     if cancel.is_set():
                         break
-                    generator.compute_logits()
                     generator.generate_next_token()
+                    if first_token_at is None:
+                        first_token_at = time.perf_counter()
+                        out.put({"first_token_at": first_token_at})
                     token = generator.get_next_tokens()[0]
                     piece = detok.decode(token)
                     if not piece:
@@ -247,27 +317,149 @@ class OgaEngine(Engine):
             out.put(_SENTINEL)
 
 
-def _render_prompt(request: GenerationRequest) -> str:
-    """Build the prompt string for the model's chat template.
+@dataclass(frozen=True)
+class ChatFormat:
+    """How one model family marks up a conversation.
 
-    onnxruntime-genai does not apply a chat template for every architecture, so we
-    render a generic one. Models whose converted artifact carries a template will have
-    it applied by the processor; this is the fallback that keeps unknown models usable.
+    `turns` maps a role to a template taking `{content}`; a role absent from the mapping
+    reuses the user template. `reply` opens the assistant turn the model is expected to
+    complete, and `stops` are the markers it closes that turn with.
+
+    The stops matter as much as the markup. Several converted artifacts declare only a
+    bare end-of-text id in genai_config.json -- Llama 3.1 lists `<|end_of_text|>` but
+    not the `<|eot_id|>` it actually emits after a chat turn -- so a generator left to
+    rely on that id alone never reports itself done and runs to max_tokens.
     """
-    parts: list[str] = []
-    for message in request.messages:
-        tag = {"system": "system", "user": "user", "assistant": "assistant"}.get(
-            message.role, "user"
-        )
-        content = message.content
-        if message.images:
-            # Image placeholders are what the multimodal processors expect to find.
-            content = (
-                "".join(f"<|image_{i + 1}|>" for i in range(len(message.images))) + content
-            )
-        parts.append(f"<|{tag}|>\n{content}<|end|>")
-    parts.append("<|assistant|>\n")
-    return "\n".join(parts)
+
+    turns: dict[str, str]
+    reply: str
+    prefix: str = ""
+    stops: tuple[str, ...] = ()
+
+    def render(self, messages: Any) -> str:
+        parts = [self.prefix]
+        for message in messages:
+            content = message.content
+            if message.images:
+                # Image placeholders are what the multimodal processors look for.
+                placeholders = "".join(
+                    f"<|image_{i + 1}|>" for i in range(len(message.images))
+                )
+                content = placeholders + content
+            template = self.turns.get(message.role, self.turns["user"])
+            parts.append(template.format(content=content))
+        parts.append(self.reply)
+        return "".join(parts)
+
+
+def _symmetric(
+    turn: str, reply: str, *, prefix: str = "", stops: tuple[str, ...] = ()
+) -> ChatFormat:
+    """A format whose three roles differ only by name."""
+    return ChatFormat(
+        turns={
+            role: turn.format(role=role, content="{content}")
+            for role in ("system", "user", "assistant")
+        },
+        reply=reply,
+        prefix=prefix,
+        stops=stops,
+    )
+
+
+# ChatML, used by the Qwen families and the default for anything unrecognised, since it
+# is by far the most common markup among current converted artifacts.
+_CHATML = _symmetric(
+    "<|im_start|>{role}\n{content}<|im_end|>\n",
+    "<|im_start|>assistant\n",
+    stops=("<|im_end|>",),
+)
+
+_CHAT_FORMATS: tuple[tuple[str, ChatFormat], ...] = (
+    ("qwen3", _CHATML),
+    ("qwen2", _CHATML),
+    ("qwen", _CHATML),
+    (
+        "llama",
+        _symmetric(
+            "<|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>",
+            "<|start_header_id|>assistant<|end_header_id|>\n\n",
+            prefix="<|begin_of_text|>",
+            stops=("<|eot_id|>", "<|end_of_text|>"),
+        ),
+    ),
+    (
+        "phi4",
+        _symmetric(
+            "<|im_start|>{role}<|im_sep|>{content}<|im_end|>",
+            "<|im_start|>assistant<|im_sep|>",
+            stops=("<|im_end|>",),
+        ),
+    ),
+    (
+        "phi",
+        _symmetric(
+            "<|{role}|>\n{content}<|end|>\n",
+            "<|assistant|>\n",
+            stops=("<|end|>", "<|user|>"),
+        ),
+    ),
+    (
+        "gemma",
+        # Gemma has no system role and calls the assistant "model".
+        ChatFormat(
+            turns={
+                "system": "<start_of_turn>user\n{content}<end_of_turn>\n",
+                "user": "<start_of_turn>user\n{content}<end_of_turn>\n",
+                "assistant": "<start_of_turn>model\n{content}<end_of_turn>\n",
+            },
+            reply="<start_of_turn>model\n",
+            stops=("<end_of_turn>",),
+        ),
+    ),
+    (
+        "mistral",
+        # Mistral wraps only the user turn, so this one is genuinely asymmetric.
+        ChatFormat(
+            turns={
+                "system": "[INST] {content} [/INST]",
+                "user": "[INST] {content} [/INST]",
+                "assistant": "{content}</s>",
+            },
+            reply="",
+            prefix="<s>",
+            stops=("</s>", "[INST]"),
+        ),
+    ),
+)
+
+
+def chat_format(model_type: str | None) -> ChatFormat:
+    """Pick the chat markup for an artifact's `model.type`.
+
+    onnxruntime-genai applies no chat template of its own, so the server has to supply
+    one. Matching on the type recorded in genai_config.json is what the reference
+    benchmark scripts do, and it is why a model can behave correctly under
+    model_benchmark.exe while looking broken here: sending one family's markup to
+    another leaves the markers as ordinary text, so the model continues the transcript
+    it appears to have been given and answers on the user's behalf.
+    """
+    name = (model_type or "").lower()
+    for prefix, fmt in _CHAT_FORMATS:
+        if name.startswith(prefix):
+            return fmt
+    return _CHATML
+
+
+def _model_type(path: Path) -> str | None:
+    """Read `model.type` out of an artifact's genai_config.json."""
+    try:
+        config = json.loads((path / "genai_config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        log.warning("could not read genai_config.json in %s: %s", path, exc)
+        return None
+    model = config.get("model")
+    return model.get("type") if isinstance(model, dict) else None
 
 
 def _load_images(og: Any, request: GenerationRequest) -> Any:

@@ -287,6 +287,6 @@ async def embeddings(request: Request):
         status_code=501,
         detail=(
             "embeddings are not implemented yet. No embedding model is certified for "
-            "HIP EP; this endpoint is planned for M2. Track it in product/MILESTONES.md."
+            "HIP EP; this endpoint is planned for P2. Track it in product/MILESTONES.md."
         ),
     )

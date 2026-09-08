@@ -10,13 +10,36 @@ why the shipped YAML is validated rather than a fixture.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
-from hipep_server.catalog import Benchmark, Catalog, Model
+from hipep_server.catalog import SHIPPED_TIERS, Benchmark, Catalog, Model, load_catalog
+
+PRODUCT_DIR = Path(__file__).resolve().parent.parent
 
 
-def test_catalog_loads_every_tier(catalog: Catalog) -> None:
-    assert len(catalog) > 30
-    assert set(catalog.tiers()) == {"llm", "vlm", "speech", "vision"}
+def test_catalog_loads_every_shipped_tier(catalog: Catalog) -> None:
+    assert len(catalog) > 20
+    assert set(catalog.tiers()) == set(SHIPPED_TIERS)
+
+
+def test_unshipped_tiers_stay_out_of_the_default_catalog() -> None:
+    """The catalog directory carries tiers still being brought up. They load only when
+    asked for explicitly, so no caller can list them by forgetting to filter."""
+    everything = load_catalog(
+        PRODUCT_DIR / "modelzoo" / "catalog",
+        PRODUCT_DIR / "modelzoo" / "benchmarks",
+        shipped_only=False,
+    )
+    assert set(everything.tiers()) > set(SHIPPED_TIERS), "nothing is being held back"
+
+    shipped = load_catalog(
+        PRODUCT_DIR / "modelzoo" / "catalog", PRODUCT_DIR / "modelzoo" / "benchmarks"
+    )
+    assert len(shipped) < len(everything)
+    for model in shipped.models:
+        assert model.tier in SHIPPED_TIERS
+        assert (model.certification or {}).get("status") != "fail"
 
 
 def test_every_model_is_completely_described(catalog: Catalog) -> None:
@@ -68,7 +91,7 @@ def test_llm_models_do_not_claim_vision(catalog: Catalog) -> None:
 
 def test_list_is_ordered_by_tier_then_size(catalog: Catalog) -> None:
     tiers = [m.tier for m in catalog.models]
-    assert tiers == sorted(tiers, key=lambda t: ["llm", "vlm", "speech", "vision"].index(t))
+    assert tiers == sorted(tiers, key=lambda t: list(SHIPPED_TIERS).index(t))
 
 
 @pytest.mark.parametrize(

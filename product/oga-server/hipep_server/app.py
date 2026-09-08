@@ -158,6 +158,13 @@ def _mount_static(app: FastAPI, settings: Settings) -> None:
     if site.is_dir():
         docs = site / "docs"
         if docs.is_dir():
+            # A mount serves its index at "/docs/" only; the bare "/docs" is a miss.
+            # Registered before the mount so it matches first. Without it the console's
+            # own Docs link 404s, as does the path a reader would type.
+            @app.get("/docs", include_in_schema=False)
+            async def docs_index() -> RedirectResponse:
+                return RedirectResponse("/docs/")
+
             app.mount("/docs", StaticFiles(directory=str(docs), html=True), name="docs")
         assets = site / "assets"
         if assets.is_dir():

@@ -23,6 +23,10 @@ previous_release: release_0.3
 run_date: 2026-08-27
 source: internal ROCm HIP EP benchmark tracker
 harness: model_benchmark (OGA) / onnxruntime_perf_test (vision)
+# The harness behind the results the site publishes. The generative tiers are the
+# published ones and all come from OGA; naming the vision harness on a public page
+# would advertise a suite that has not shipped.
+published_harness: model_benchmark (OGA)
 
 device:
   name: AMD Ryzen AI Max+ (Strix Halo)

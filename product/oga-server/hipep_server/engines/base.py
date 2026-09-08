@@ -176,8 +176,18 @@ class Stopwatch:
         self.end: float | None = None
 
     def mark_first_token(self) -> None:
+        self.mark_first_token_at(time.perf_counter())
+
+    def mark_first_token_at(self, when: float) -> None:
+        """Record when the first token existed, which may predate reading it.
+
+        An engine that generates on a worker thread can run ahead of whoever is
+        draining its queue. Timing the read instead of the generation charges that
+        backlog to TTFT and collapses the decode window, which inflates tokens/second
+        to values the hardware never reached.
+        """
         if self.first_token is None:
-            self.first_token = time.perf_counter()
+            self.first_token = when
 
     def finish(self) -> None:
         self.end = time.perf_counter()

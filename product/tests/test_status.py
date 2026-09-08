@@ -29,12 +29,12 @@ def test_status_admits_it_is_replaying(client: TestClient) -> None:
     assert body["engine_reason"]
 
 
-def test_status_reports_limits_storage_and_catalog(client: TestClient) -> None:
+def test_status_reports_limits_storage_and_catalog(client: TestClient, catalog) -> None:
     body = client.get("/v1/status").json()
 
     assert body["limits"]["max_loaded_models"] > 0
     assert body["limits"]["max_queue_depth"] > 0
-    assert body["catalog"]["models"] > 30
+    assert body["catalog"]["models"] == len(catalog)
     assert body["catalog"]["release"]
     assert body["storage"]["models"] == 0
     assert body["jobs"] == {"running": 0, "total": 0}

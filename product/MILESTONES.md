@@ -4,8 +4,12 @@ Licensed under the MIT License.
 -->
 # Milestones
 
-Every milestone below is a git tag on the `feat/hipep-product` branch. To review or
-re-test any checkpoint:
+The schedule runs in three phases to GA 1.0 on 31 October 2026. M0 below is the
+completed foundation work that the phases build on; see
+[`plan/PRODUCT_PLAN.md`](plan/PRODUCT_PLAN.md) for the roadmap.
+
+Every phase and checkpoint below is a git tag on the `feat/hipep-product` branch. To
+review or re-test any checkpoint:
 
 ```bash
 git checkout <tag>
@@ -20,7 +24,7 @@ Nothing here has been pushed to a remote. All tags and commits are local.
 
 ---
 
-## M0 — Foundations · Aug 28 – Sep 11, 2026
+## M0 — Foundations · Aug 28 – Sep 1, 2026
 
 Goal: the product exists as a runnable thing, and the plan is reviewable.
 
@@ -135,31 +139,58 @@ on a Linux host.
 
 ---
 
-## M1 — Serving Alpha · Sep 12 – Oct 2, 2026
+## P1 — Serving on hardware · Sep 2 – Sep 30, 2026
 
-Planned. Real OGA engine streaming on Strix Halo, OpenAI + Ollama parity verified
-against the reference clients, VLM image path on hardware, console chat with live
-TTFT/TPS from real runs, multi-user status under load.
+Goal: the certified model set runs through HIP EP on real hardware, and the numbers the
+console reports are the numbers the hardware produced.
 
-## M2 — Model Pipeline · Oct 3 – Oct 23, 2026
+| Checkpoint | Tag | Status |
+|---|---|---|
+| P1.1 AMD GPU EP wheels installed; real OGA engine streaming on Strix Halo | `hipep-product-p1.1-engine` | Done |
+| P1.2 Per-family chat templates and stop markers | `hipep-product-p1.2-templates` | Done |
+| P1.3 VLM image path on hardware | `hipep-product-p1.3-vision` | Planned |
+| P1.4 OpenAI + Ollama parity verified against reference clients | `hipep-product-p1.4-parity` | Planned |
+| P1.5 Multi-user scheduling under load | `hipep-product-p1.5-load` | Planned |
+| P1 complete | `hipep-product-p1` | Planned |
+
+### P1.1 — Real engine on HIP EP
+
+The AMD GPU umbrella EP ships as its own wheels rather than compiled into
+onnxruntime-genai, which imposes a load order the server now handles in
+`engines/oga.py`: preload the wheel's `onnxruntime.dll` ahead of the Windows ML copy in
+`system32`, set `AMDGPU_EP_PATH` before importing genai, and do *not* also call
+`register_execution_provider_library` — registering the EP twice leaves genai reporting
+no supported AMD GPU devices.
+
+Review with: `python -m hipep_server --engine oga`, then a chat completion against a
+downloaded model.
+
+### P1.2 — Chat templates
+
+onnxruntime-genai applies no chat template, so the server supplies one per family,
+selected from `model.type` in the artifact's `genai_config.json`. Sending one family's
+markup to another does not raise; the model reads the markers as text, continues the
+transcript it appears to have been handed, and answers on the user's behalf until it
+reaches `max_tokens`.
+
+Review with: `pytest tests/test_chat_format.py`.
+
+## P2 — Pipeline & certification · Oct 1 – Oct 16, 2026
 
 Planned. Hugging Face URL to a benchmarked local model, unattended, from the console.
+Bench harness runs through `oga-server`; nightly certification matrix; published numbers
+reconciled with the internal dashboard.
 
-## M3 — Benchmark & Certification · Oct 24 – Nov 13, 2026
+Certification records the artifact identity alongside its throughput. A benchmark that
+measures speed without printing output cannot tell a base model from an instruction-tuned
+one, and that gap has already cost debugging time.
 
-Planned. Nightly certification matrix; published numbers reconciled with the internal
-dashboard.
+## P3 — Cross-platform, docs & GA 1.0 · Oct 17 – Oct 31, 2026
 
-## M4 — Cross-platform · Nov 14 – Dec 4, 2026
+Planned. Linux server and container, Windows installer, four device profiles, remote and
+bring-your-own-machine mode. A card for every certified model, recipes for six or more
+architectures, C++/Python/WinML samples. Security review, opt-in telemetry, perf
+hardening, support rotation. Public launch.
 
-Planned. Linux server and container, Windows installer, four device profiles, remote
-and bring-your-own-machine mode. Gated on a Linux GPU host, which we do not have yet.
-
-## M5 — Docs & SDK · Dec 5 – Dec 25, 2026
-
-Planned. Full docs, a card for every certified model, recipes for six or more
-architectures.
-
-## M6 — GA 1.0 · Jan 5 – Jan 30, 2027
-
-Planned. Public launch.
+Gated on a Linux GPU host, which we do not have yet. This is the largest single schedule
+risk in the plan and it now sits in the final two weeks.

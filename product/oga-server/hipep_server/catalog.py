@@ -22,6 +22,11 @@ import yaml
 
 TIER_ORDER = {"llm": 0, "vlm": 1, "speech": 2, "vision": 3}
 
+# The tiers that have shipped. The catalog directory also carries tiers that are still
+# being brought up; their YAML stays in the tree so the work is reviewable, but the
+# loader is where it stops, so nothing downstream has to remember to hide it.
+SHIPPED_TIERS = ("llm", "vlm", "speech")
+
 
 def _deep_merge(base: dict, override: dict) -> dict:
     """Merge `override` onto a copy of `base`, recursing into nested dicts.
@@ -372,10 +377,28 @@ def _latest_benchmark_file(benchmarks_dir: Path) -> Path | None:
     return files[-1] if files else None
 
 
-def load_catalog(catalog_dir: Path, benchmarks_dir: Path) -> Catalog:
+def load_catalog(
+    catalog_dir: Path, benchmarks_dir: Path, *, shipped_only: bool = True
+) -> Catalog:
+    """Load the certified catalog.
+
+    By default this returns only what has shipped: the tiers in `SHIPPED_TIERS`, minus
+    any entry whose certification did not pass. That bar is a release-over-release
+    performance rule, so a failing entry is a model that works but regressed, and
+    shipping it would advertise a known regression. Pass `shipped_only=False` to see
+    the whole tree, which is what release tooling and the tests that police this
+    boundary need.
+    """
     models: list[Model] = []
     for path in sorted(catalog_dir.glob("*.yaml")):
         models.extend(_load_tier(path))
+
+    if shipped_only:
+        models = [
+            m
+            for m in models
+            if m.tier in SHIPPED_TIERS and (m.certification or {}).get("status") != "fail"
+        ]
 
     meta: dict[str, Any] = {}
     bench_path = _latest_benchmark_file(benchmarks_dir)
