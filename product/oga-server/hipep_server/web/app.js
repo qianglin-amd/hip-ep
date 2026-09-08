@@ -6,6 +6,7 @@
 import { api, subscribe } from "./api.js";
 import { $, $$, clear, el, fill, toast } from "./ui.js";
 
+import { renderAgent } from "./views/agent.js";
 import { renderChat } from "./views/chat.js";
 import { renderModels } from "./views/models.js";
 import { renderPort } from "./views/port.js";
@@ -39,6 +40,7 @@ function emit() {
 const VIEWS = {
   chat: { title: "Chat", subtitle: "Talk to a certified model", render: renderChat },
   vision: { title: "Vision", subtitle: "Image and text with a VLM", render: (r) => renderChat(r, { vision: true }) },
+  agent: { title: "Agent", subtitle: "Tool calling, with the tools running here", render: renderAgent },
   models: { title: "Models", subtitle: "Certified model zoo", render: renderModels },
   port: { title: "Port a model", subtitle: "Bring your own weights", render: renderPort },
   benchmark: { title: "Benchmarks", subtitle: "Published results and local runs", render: renderBenchmark },

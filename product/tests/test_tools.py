@@ -116,6 +116,37 @@ def test_unparseable_markup_never_reaches_the_user() -> None:
     assert "tool_call" not in text and text == ""
 
 
+def test_an_unterminated_marker_does_not_become_the_answer() -> None:
+    """What Qwen2.5-0.5B did on the GPU: it opened `<tool_call>`, wrote the object and
+    never closed the tag. The closed-tag pattern missed it, the bare-object path took
+    the JSON, and the lone opener was returned as the assistant's content -- which
+    every OpenAI client renders."""
+    text, calls = extract_tool_calls(
+        '<tool_call>\n{"name": "get_current_time", "arguments": {}}'
+    )
+    assert len(calls) == 1
+    assert calls[0].name == "get_current_time"
+    assert text == "", f"marker leaked into the reply: {text!r}"
+
+
+def test_an_orphan_closing_tag_is_not_shown() -> None:
+    text, calls = extract_tool_calls(
+        '<tool_call>{"name": "get_time", "arguments": {}}</tool_call></tool_call>'
+    )
+    assert len(calls) == 1
+    assert "tool_call" not in text
+
+
+def test_narration_before_an_unterminated_marker_survives() -> None:
+    """A model that explains itself first should keep the explanation; only the markup
+    is the part the user must not see."""
+    text, calls = extract_tool_calls(
+        'Let me check the clock.\n<tool_call>{"name": "get_time", "arguments": {}}'
+    )
+    assert len(calls) == 1
+    assert text == "Let me check the clock."
+
+
 def test_prose_is_left_alone() -> None:
     text, calls = extract_tool_calls("The weather in Paris is mild today.")
     assert calls == []

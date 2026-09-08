@@ -123,7 +123,14 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         print("\nshell")
         goto("chat")
         checks.ok("title", "HIP EP" in page.title(), page.title())
-        checks.ok("sidebar rendered", page.locator("#nav a").count() == 7)
+        # Named rather than counted: a count says nothing about which entry went
+        # missing, and it fails on a new view instead of on a broken one.
+        nav = page.locator("#nav a").evaluate_all("els => els.map(e => e.dataset.view)")
+        checks.ok(
+            "sidebar rendered",
+            nav == ["chat", "vision", "agent", "models", "port", "benchmark", "server", "develop"],
+            str(nav),
+        )
         checks.ok(
             "engine badge resolved",
             page.locator("#engine-badge").inner_text().strip().lower()
@@ -190,6 +197,81 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         checks.ok("vision models only", len(options) > 0, f"{len(options)} options")
         checks.ok("attach button visible", page.locator("text=Attach image").count() == 1)
         shot("vision")
+
+        # --- agent -------------------------------------------------------------
+        print("\nagent")
+        goto("agent")
+        checks.ok(
+            "tools offered", page.locator(".tool-list .tool-row").count() >= 4,
+            f"{page.locator('.tool-list .tool-row').count()} tools",
+        )
+
+        # The calculator parses arithmetic by hand rather than calling eval, because a
+        # tool argument is model output and a prompt can talk a model into emitting
+        # anything. These run the shipped parser in the page.
+        parser = page.evaluate(
+            """async () => {
+              const { evaluateArithmetic } = await import('/tools.js');
+              const attempt = (expr) => {
+                try { return { value: evaluateArithmetic(expr) }; }
+                catch (e) { return { error: String(e.message || e) }; }
+              };
+              return {
+                precedence: attempt('2 + 3 * 4'),
+                parens: attempt('(2500 * 12) / 7'),
+                negative: attempt('-5 + 2'),
+                zero: attempt('1 / 0'),
+                injected: attempt('globalThis.alert(1)'),
+                trailing: attempt('2 +'),
+              };
+            }"""
+        )
+        checks.ok("operator precedence honoured", parser["precedence"].get("value") == 14,
+                  str(parser["precedence"]))
+        checks.ok("parentheses honoured",
+                  abs(parser["parens"].get("value", 0) - 4285.714285714286) < 1e-6,
+                  str(parser["parens"]))
+        checks.ok("unary minus handled", parser["negative"].get("value") == -3,
+                  str(parser["negative"]))
+        checks.ok("division by zero refused", "error" in parser["zero"], str(parser["zero"]))
+        checks.ok("code is not evaluated", "error" in parser["injected"], str(parser["injected"]))
+        checks.ok("a truncated expression is refused", "error" in parser["trailing"],
+                  str(parser["trailing"]))
+
+        if engine_is_real:
+            # The whole point of the view is the round trip, so the check is that a tool
+            # ran and the model answered afterwards -- not that it answered well. The
+            # models on a test host are small.
+            page.fill(".composer textarea", "What time is it right now?")
+            page.click(".composer-actions .btn-primary")
+            try:
+                page.wait_for_selector(".tool-call .tool-result", timeout=120_000)
+                called = True
+            except PlaywrightTimeout:
+                called = False
+            checks.ok("the model called a tool and got a result", called)
+
+            if called:
+                page.wait_for_function(
+                    "() => { const b = document.querySelector('.composer-actions .btn-primary');"
+                    " return b && !b.disabled; }",
+                    timeout=300_000,
+                )
+                result = page.locator(".tool-call .tool-result").first.inner_text()
+                checks.ok("the tool really ran", '"iso"' in result, result[:120])
+                answers = page.locator(".msg.assistant .md").all_inner_texts()
+                checks.ok(
+                    "the model answered after the tool",
+                    bool(answers) and len(answers[-1].strip()) > 10,
+                    (answers[-1].strip()[:80] if answers else ""),
+                )
+                # A leaked marker is the failure this view makes visible: it renders
+                # `message.content`, so markup the parser missed shows up on screen.
+                checks.ok(
+                    "no call markup reached the transcript",
+                    "tool_call" not in page.locator(".chat-main").inner_text(),
+                )
+        shot("agent")
 
         # --- models ------------------------------------------------------------
         print("\nmodels")

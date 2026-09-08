@@ -78,14 +78,21 @@ import base64
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:11434/v1", api_key="not-needed")
-data_uri = "data:image/jpeg;base64," + base64.b64encode(open("photo.jpg", "rb").read()).decode()
+data_uri = (
+    "data:image/jpeg;base64," + base64.b64encode(open("photo.jpg", "rb").read()).decode()
+)
 
 response = client.chat.completions.create(
     model="gemma3-vl:4b",
-    messages=[{"role": "user", "content": [
-        {"type": "text", "text": "What is in this image?"},
-        {"type": "image_url", "image_url": {"url": data_uri}},
-    ]}],
+    messages=[
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "What is in this image?"},
+                {"type": "image_url", "image_url": {"url": data_uri}},
+            ],
+        }
+    ],
 )
 ```
 
@@ -93,6 +100,47 @@ The server does not fetch remote `image_url` values. An inference server that fo
 supplied by its clients is an outbound HTTP client, which is a security problem rather than
 a convenience. Sending an image to a text-only model returns a 400 naming the vision models
 you could use instead.
+
+## Tool calling
+
+Pass `tools` in the OpenAI shape. The reply carries `tool_calls` and a `finish_reason` of
+`tool_calls`, and your code runs the tool and sends the result back as a `tool` message.
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "get_current_time",
+        "description": "Get the current date and time.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}]
+
+messages = [{"role": "user", "content": "What time is it?"}]
+first = client.chat.completions.create(model="qwen2.5:14b", messages=messages, tools=tools)
+call = first.choices[0].message.tool_calls[0]
+
+messages += [
+    first.choices[0].message,          # the turn that asked, sent back unchanged
+    {"role": "tool", "tool_call_id": call.id, "content": '{"iso": "2026-09-08T08:27:54Z"}'},
+]
+final = client.chat.completions.create(model="qwen2.5:14b", messages=messages, tools=tools)
+```
+
+The assistant turn that asked for the tool has to be sent back as it arrived. A tool result
+without the call it answers is a protocol error, and models that notice tend to repeat the
+call indefinitely.
+
+Tool calling is a prompting convention rather than something the model file supports:
+`onnxruntime-genai` returns text, so the server describes the tools in the prompt and reads
+the reply back for the markup the model was asked to use. Every wrapper the current
+instruction-tuned families emit is accepted, because rejecting the one a given artifact
+learned turns a working call into prose. A model whose `capabilities.tools` is false will
+often still call a tool, less reliably.
+
+The **Agent** page in HIP EP Studio runs this loop against your own server with four tools
+that execute in the browser, which is the quickest way to see whether a particular model on
+your machine drives a tool properly.
 
 ## Ollama compatibility
 

@@ -14,7 +14,7 @@ Around that compiler sits everything needed to actually use it for local AI:
 | Piece | What it does |
 |---|---|
 | **oga-server** | Local HTTP server. OpenAI and Ollama compatible, model management, benchmarking, porting jobs. |
-| **HIP EP Studio** | The console the server serves at `/`: chat, vision, model zoo, benchmarks, live server load. |
+| **HIP EP Studio** | The console the server serves at `/`: chat, vision, tool-calling agent, model zoo, benchmarks, live server load. |
 | **Model zoo** | Certified models with published benchmarks, quantization schemas and reproducible recipes. |
 | **Toolkit** | The export and quantization recipes the porting pipeline runs, using AMD Quark. |
 | **Client examples** | Streaming clients in Python, C++ and C#/.NET, plus curl and Ollama. |

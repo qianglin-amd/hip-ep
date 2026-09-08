@@ -54,8 +54,16 @@ def new_call_id() -> str:
 # `<tool_call>` is the ChatML convention used by the Qwen families; Llama 3.1 marks a
 # call with `<|python_tag|>`. Both wrap the same JSON object.
 _TAGGED = re.compile(r"<tool_call>\s*(?P<body>.*?)\s*</tool_call>", re.DOTALL)
+# Models that hit their token limit, or that simply never learned to close the tag,
+# leave the opener unterminated. Matching only the closed form let the bare-object
+# path below claim the JSON and leave a literal "<tool_call>" as the assistant's
+# content, which every OpenAI client then renders.
+_TAGGED_UNCLOSED = re.compile(r"<tool_call>\s*(?P<body>.*)", re.DOTALL)
 _PYTHON_TAG = re.compile(r"<\|python_tag\|>\s*(?P<body>.*?)(?=<\||$)", re.DOTALL)
 _FENCED = re.compile(r"```(?:json|tool_call)?\s*(?P<body>\{.*?\})\s*```", re.DOTALL)
+
+# A closing tag whose opener was consumed above, or that arrived on its own.
+_ORPHAN_MARKER = re.compile(r"</?tool_call>|<\|python_tag\|>")
 
 
 def describe_tools(tools: list[dict[str, Any]]) -> str:
@@ -188,15 +196,18 @@ def extract_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
     # has both removed. Stripping only the wrapper that happened to parse leaves the
     # other one on screen, which is what a real model did: it marked its call with
     # `<|python_tag|>` and left a malformed `<tool_call>` fragment behind.
+    #
+    # Order matters: the closed form is consumed first, so any `<tool_call>` still
+    # present when the unclosed pattern runs really is unterminated.
     tagged: list[ToolCall] = []
-    for pattern in (_TAGGED, _PYTHON_TAG):
+    for pattern in (_TAGGED, _TAGGED_UNCLOSED, _PYTHON_TAG):
         matches = list(pattern.finditer(text))
         if not matches:
             continue
         tagged.extend(call for m in matches if (call := _coerce(m.group("body").strip())))
         text = pattern.sub("", text)
     if tagged:
-        return text.strip(), tagged
+        return _ORPHAN_MARKER.sub("", text).strip(), tagged
 
     # A fenced block is ordinary markdown, so unlike the wrappers above it is removed
     # only when it really did carry a call.
@@ -229,4 +240,4 @@ def extract_tool_calls(text: str) -> tuple[str, list[ToolCall]]:
     cleaned = text
     for start, end in reversed(consumed):
         cleaned = cleaned[:start] + cleaned[end:]
-    return cleaned.strip(), calls
+    return _ORPHAN_MARKER.sub("", cleaned).strip(), calls

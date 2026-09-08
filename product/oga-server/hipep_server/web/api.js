@@ -45,6 +45,13 @@ export const api = {
   localBenchmarks: () => request("/v1/benchmarks/local"),
   runBenchmark: (spec) =>
     request("/v1/benchmarks/run", { method: "POST", body: JSON.stringify(spec) }),
+
+  // The agent loop reads `message.tool_calls`, which is only recognisable once a call
+  // is complete. Streaming it would mean reassembling frames to learn the same thing a
+  // turn later, so the loop uses the non-streamed form and streams nothing until the
+  // model stops asking for tools.
+  chat: (body) =>
+    request("/v1/chat/completions", { method: "POST", body: JSON.stringify(body) }),
 };
 
 /**
