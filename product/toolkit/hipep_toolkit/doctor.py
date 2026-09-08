@@ -205,36 +205,52 @@ def _check_engine(report: Report) -> None:
 
 
 def _check_quantization(report: Report) -> None:
-    """Porting dependencies, which most users never need.
+    """Whether a port on this machine would do real work or simulate.
 
-    A missing toolchain is not a broken install: the server serves certified models
-    without it, and the pipeline says so rather than failing halfway through a port.
+    Asked of the same resolver the port stages use, rather than of this interpreter,
+    because the exporter deliberately does not have to live here: it caps Python below
+    3.14 and pulls in torch, so it is usually a separate environment named by
+    `HIPEP_PORT_PYTHON`. Checking the imports here instead would report simulation on a
+    machine that ports perfectly well, which is the more expensive mistake -- it tells
+    someone to go fix what is already working.
     """
-    needed = {"quark": "amd-quark", "torch": "torch", "transformers": "transformers"}
-    missing = sorted({dist for mod, dist in needed.items() if not _installed(mod)})
-    if not missing:
-        report.add("porting toolchain", OK, "Quark, torch and transformers present")
+    try:
+        from hipep_toolkit import stages
+    except ImportError:
+        report.add(
+            "porting toolchain",
+            WARN,
+            "stage implementations not installed; ports will run in simulation",
+            'pip install -e "product[quant]"',
+        )
+        return
+
+    exporter = stages.toolchain_python()
+    if exporter is not None:
+        where = "this interpreter" if exporter == sys.executable else exporter
+        report.add("porting toolchain", OK, f"ONNX model builder at {where}")
         return
 
     # Every AMD Quark release so far caps the interpreter below 3.14. On a newer one
     # the install resolves to an unrelated 0.1.0 placeholder that ships no modules, so
-    # it reports success and this check still finds nothing -- and the remedy below
-    # would send the reader round that loop again without ever explaining it.
+    # it reports success and a check of the imports still finds nothing -- and the
+    # remedy below would send the reader round that loop again without explaining it.
+    major, minor = QUARK_MAX_PYTHON
     if sys.version_info >= QUARK_MAX_PYTHON:
-        major, minor = QUARK_MAX_PYTHON
         report.add(
             "porting toolchain",
             WARN,
-            f"amd-quark has no release for Python {platform.python_version()}; "
-            "ports will run in simulation",
-            f"port from a Python 3.11-{major}.{minor - 1} environment; serving is unaffected",
+            f"no exporter found, and Python {platform.python_version()} is too new for "
+            "one; ports will run in simulation",
+            f"run product/install-port-toolchain.ps1 to build a 3.11-{major}.{minor - 1} "
+            "environment; serving is unaffected",
         )
         return
 
     report.add(
         "porting toolchain",
         WARN,
-        f"missing: {', '.join(missing)}; ports will run in simulation",
+        "no ONNX model builder found; ports will run in simulation",
         'pip install -e "product[quant]"',
     )
 

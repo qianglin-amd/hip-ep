@@ -100,23 +100,52 @@ def test_missing_dependencies_fail_with_the_pip_command(monkeypatch) -> None:
     assert "pip install" in deps.remedy
 
 
-def test_a_missing_porting_toolchain_warns_rather_than_fails(monkeypatch) -> None:
-    """Serving certified models needs no Quark, so this must not block anything."""
-    monkeypatch.setattr(doc, "_installed", lambda module: False)
+@pytest.fixture
+def exporter(monkeypatch):
+    """Control what the porting check finds, without needing a real toolchain."""
+
+    def found(interpreter: str | None):
+        from hipep_toolkit import stages
+
+        monkeypatch.setattr(stages, "toolchain_python", lambda: interpreter)
+
+    return found
+
+
+def test_a_missing_porting_toolchain_warns_rather_than_fails(exporter) -> None:
+    """Serving certified models needs no exporter, so this must not block anything."""
+    exporter(None)
     report = doc.Report()
     doc._check_quantization(report)
     assert report.checks[0].state == doc.WARN
     assert "simulation" in report.checks[0].detail
 
 
-def test_an_interpreter_too_new_for_quark_says_so(monkeypatch) -> None:
+def test_an_exporter_in_another_environment_still_counts(exporter) -> None:
+    """The check has to follow the pipeline, not this interpreter.
+
+    The exporter deliberately lives in its own environment, so asking whether *this*
+    one can import Quark reports simulation on a machine that ports perfectly well --
+    telling the reader to go and fix something that is already working.
+    """
+    exporter(r"C:\Users\a\.hipep\toolchain\Scripts\python.exe")
+    report = doc.Report()
+    doc._check_quantization(report)
+    check = report.checks[0]
+
+    assert check.state == doc.OK
+    assert "toolchain" in check.detail
+    assert not check.remedy
+
+
+def test_an_interpreter_too_new_for_quark_says_so(exporter, monkeypatch) -> None:
     """Otherwise the remedy sends the reader round a loop that cannot terminate.
 
     No AMD Quark release supports 3.14, and `pip install amd-quark` there resolves to
     an unrelated 0.1.0 placeholder that ships no modules: the install reports success,
     this check still finds nothing, and the advice was to run the install again.
     """
-    monkeypatch.setattr(doc, "_installed", lambda module: False)
+    exporter(None)
     monkeypatch.setattr(doc.sys, "version_info", (3, 14, 7))
     monkeypatch.setattr(doc.platform, "python_version", lambda: "3.14.7")
 
@@ -127,11 +156,23 @@ def test_an_interpreter_too_new_for_quark_says_so(monkeypatch) -> None:
     assert check.state == doc.WARN, "serving does not need Quark, so this cannot fail"
     assert "3.14.7" in check.detail
     assert "pip install" not in check.remedy, "the install being suggested is the no-op"
-    assert "3.11-3.13" in check.remedy
+    assert "install-port-toolchain" in check.remedy
 
 
-def test_a_supported_interpreter_still_suggests_the_install(monkeypatch) -> None:
-    monkeypatch.setattr(doc, "_installed", lambda module: False)
+def test_the_remedy_names_a_script_that_exists(exporter, monkeypatch) -> None:
+    """A remedy pointing at a missing file is worse than no remedy."""
+    exporter(None)
+    monkeypatch.setattr(doc.sys, "version_info", (3, 14, 7))
+
+    report = doc.Report()
+    doc._check_quantization(report)
+    named = report.checks[0].remedy.split()[1]
+
+    assert (PRODUCT_DIR.parent / named).exists(), f"{named} is not in the repository"
+
+
+def test_a_supported_interpreter_still_suggests_the_install(exporter, monkeypatch) -> None:
+    exporter(None)
     monkeypatch.setattr(doc.sys, "version_info", (3, 12, 10))
 
     report = doc.Report()

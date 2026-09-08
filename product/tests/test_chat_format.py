@@ -88,6 +88,51 @@ def test_an_unknown_family_still_gets_usable_markup() -> None:
     assert chat_format(None).stops, "a missing model type would never stop"
 
 
+class TestDeclaredTemplateWins:
+    """An artifact's own chat template beats a guess from its architecture.
+
+    SmolLM2 is `LlamaForCausalLM` and speaks ChatML. Matching on the type alone wrapped
+    it in Llama 3 headers, and it answered by restating the question with a stray
+    `<|eot_id|>` on the end -- markup that had arrived as ordinary text.
+    """
+
+    # Trimmed from the file SmolLM2-360M-Instruct ships.
+    SMOLLM2 = (
+        "{% for message in messages %}"
+        "{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>\n'}}"
+        "{% endfor %}"
+    )
+
+    def test_a_chatml_template_on_a_llama_architecture_gets_chatml(self) -> None:
+        fmt = chat_format("llama", self.SMOLLM2)
+        prompt = fmt.render([ChatMessage(role="user", content="Hi")])
+
+        assert "<|im_start|>" in prompt
+        assert "<|start_header_id|>" not in prompt, "still being sent Llama markup"
+        assert "<|eot_id|>" not in fmt.stops
+
+    def test_a_llama_template_still_gets_llama_markup(self) -> None:
+        template = "{{'<|start_header_id|>' + role + '<|end_header_id|>'}}"
+        assert "<|start_header_id|>" in rendered_with("llama", template)
+
+    def test_phi4_is_not_mistaken_for_chatml(self) -> None:
+        # Phi-4 uses ChatML's turn markers with its own separator, so the more
+        # specific marker has to be tested first.
+        template = "{{'<|im_start|>' + role + '<|im_sep|>' + content + '<|im_end|>'}}"
+        assert "<|im_sep|>" in rendered_with("llama", template)
+
+    def test_a_template_naming_no_known_markup_falls_back_to_the_type(self) -> None:
+        fmt = chat_format("gemma", "{{ messages | join('\n') }}")
+        assert "<start_of_turn>" in fmt.render([ChatMessage(role="user", content="Hi")])
+
+    def test_no_template_behaves_as_before(self) -> None:
+        assert chat_format("llama", None).stops == chat_format("llama").stops
+
+
+def rendered_with(model_type: str, template: str) -> str:
+    return chat_format(model_type, template).render([ChatMessage(role="user", content="Hi")])
+
+
 def test_multi_turn_conversations_keep_the_roles_apart() -> None:
     messages = [
         ChatMessage(role="system", content="Be brief."),

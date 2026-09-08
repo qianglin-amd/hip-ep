@@ -117,7 +117,7 @@ class _LoadedModel:
         self.path = path
         self.og_model = og.Model(str(path))
         self.model_type = _model_type(path)
-        self.chat = chat_format(self.model_type)
+        self.chat = chat_format(self.model_type, _declared_template(path))
         # Multimodal models expose a processor; text-only models expose a tokenizer.
         self.processor = None
         self.tokenizer = None
@@ -524,16 +524,37 @@ _CHAT_FORMATS: tuple[tuple[str, ChatFormat], ...] = (
 )
 
 
-def chat_format(model_type: str | None) -> ChatFormat:
-    """Pick the chat markup for an artifact's `model.type`.
+# The marker that identifies each family's markup, most specific first. Phi-4 has to be
+# tested before ChatML because it uses ChatML's turn markers with its own separator.
+_FORMAT_MARKERS: tuple[tuple[str, str], ...] = (
+    ("<|im_sep|>", "phi4"),
+    ("<|im_start|>", "qwen"),
+    ("<|start_header_id|>", "llama"),
+    ("<start_of_turn>", "gemma"),
+    ("<|end|>", "phi"),
+    ("[INST]", "mistral"),
+)
+
+
+def chat_format(model_type: str | None, declared: str | None = None) -> ChatFormat:
+    """Pick the chat markup for an artifact.
 
     onnxruntime-genai applies no chat template of its own, so the server has to supply
-    one. Matching on the type recorded in genai_config.json is what the reference
-    benchmark scripts do, and it is why a model can behave correctly under
-    model_benchmark.exe while looking broken here: sending one family's markup to
-    another leaves the markers as ordinary text, so the model continues the transcript
-    it appears to have been given and answers on the user's behalf.
+    one, and sending one family's markup to another leaves the markers as ordinary text:
+    the model then continues the transcript it appears to have been given and answers on
+    the user's behalf.
+
+    `declared` is the model's own chat template, and it decides when it is there, because
+    architecture does not imply markup. SmolLM2 is `LlamaForCausalLM` and speaks ChatML,
+    so matching on the type alone wrapped it in Llama 3 headers and it replied by
+    restating the question with an `<|eot_id|>` on the end. The type is the fallback for
+    the artifacts that carry no template.
     """
+    if declared:
+        for marker, family in _FORMAT_MARKERS:
+            if marker in declared:
+                return dict(_CHAT_FORMATS)[family]
+
     name = (model_type or "").lower()
     for prefix, fmt in _CHAT_FORMATS:
         if name.startswith(prefix):
@@ -557,6 +578,34 @@ def _stop_prefix_len(text: str, stops: list[str]) -> int:
                 longest = size
                 break
     return longest
+
+
+def _declared_template(path: Path) -> str | None:
+    """The chat template an artifact ships, wherever the exporter happened to put it.
+
+    Recent transformers writes it to `chat_template.jinja`; older ones leave it inside
+    `tokenizer_config.json`. Only the markers in it are read, so an unparsed Jinja
+    string is all this needs to return.
+    """
+    jinja = path / "chat_template.jinja"
+    try:
+        if jinja.is_file():
+            return jinja.read_text(encoding="utf-8")
+    except OSError as exc:
+        log.warning("could not read chat_template.jinja in %s: %s", path, exc)
+
+    try:
+        config = json.loads((path / "tokenizer_config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    template = config.get("chat_template")
+    if isinstance(template, list):
+        # Some tokenizers ship several named templates; the default is the chat one.
+        template = next(
+            (t.get("template") for t in template if isinstance(t, dict)),
+            None,
+        )
+    return template if isinstance(template, str) else None
 
 
 def _model_type(path: Path) -> str | None:

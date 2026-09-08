@@ -468,15 +468,21 @@ class Pipeline:
                     f"{params.get('chunk_size')} prune_logit={params.get('prune_logit')}\n"
                     "No weights were exported, quantized or converted.\n",
                 )
+            # A stage may have had to build at a different setting than the one asked
+            # for -- a quantization block that does not divide the model's rows produces
+            # a broken artifact, so the export corrects it. The label has to follow, or
+            # the card describes a model nobody built.
+            applied = job.result.get("quantization_applied") or params.get("quantization")
             local = self.store.register(
                 model_id,
                 origin="imported",
                 source=params["source"],
-                recipe=params.get("quantization"),
+                recipe=applied,
                 note="simulated port" if pretended else None,
                 extra={
                     "simulated": pretended,
-                    "quantization": params.get("quantization"),
+                    "quantization": applied,
+                    "quantization_requested": params.get("quantization"),
                     "chunk_size": params.get("chunk_size"),
                     "prune_logit": params.get("prune_logit"),
                 },

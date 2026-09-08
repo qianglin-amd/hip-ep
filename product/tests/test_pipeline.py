@@ -13,6 +13,7 @@ stages are simulated. Simulation being *labelled* is itself part of the contract
 
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 PORT_STAGES = [
@@ -150,15 +151,26 @@ def test_a_ported_model_keeps_its_quantization_metadata(client: TestClient, fini
     assert "AWQ" in entry["quant_label"].upper() or "awq" in str(entry["quantization"])
 
 
+@pytest.fixture
+def without_stage_implementations(monkeypatch):
+    """A host whose toolkit carries no stage bodies.
+
+    The stage bodies are optional: they need an exporter toolchain that installs
+    separately from the server. Forcing their absence keeps the fallback tested on
+    machines that do have them, which is where the fallback last broke.
+    """
+    monkeypatch.setattr("hipep_server.pipeline._toolkit_stages", lambda: None)
+
+
 def test_a_gpu_host_without_stage_implementations_still_simulates(
-    client: TestClient, finished
+    client: TestClient, finished, without_stage_implementations
 ) -> None:
     """The path a real GPU host takes, which no replay-engine test reaches.
 
     `simulate` follows the engine, so a host running the real engine asks the toolkit
-    for the stage bodies. The toolkit is installed there but does not ship them yet,
-    and reaching through the package for the missing module raised instead of falling
-    back, failing every port job on exactly the machines meant to run them.
+    for the stage bodies. When they are absent, reaching through the package for the
+    missing module raised instead of falling back, failing every port job on exactly
+    the machines meant to run them.
     """
     client.app.state.pipeline.simulate = False
 
@@ -173,7 +185,7 @@ def test_a_gpu_host_without_stage_implementations_still_simulates(
 
 
 def test_a_simulated_port_on_a_gpu_host_is_still_declared_simulated(
-    client: TestClient, finished
+    client: TestClient, finished, without_stage_implementations
 ) -> None:
     """The disclosure has to follow the work, not the host.
 
@@ -185,9 +197,9 @@ def test_a_simulated_port_on_a_gpu_host_is_still_declared_simulated(
     """
     client.app.state.pipeline.simulate = False
 
-    job = client.post(
-        "/v1/port", json={"source": "org/pretend", "name": "pretend:1b"}
-    ).json()["job"]
+    job = client.post("/v1/port", json={"source": "org/pretend", "name": "pretend:1b"}).json()[
+        "job"
+    ]
     snapshot = finished(client, job["id"], timeout=60.0)
     assert snapshot["state"] == "succeeded", snapshot.get("error")
 

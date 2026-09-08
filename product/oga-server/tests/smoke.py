@@ -106,13 +106,17 @@ def main() -> int:
     vlms = [m for m in catalog["models"] if m["tier"] == "vlm"]
     check("LLM tier populated", len(llms) >= 8, f"{len(llms)} LLM")
     check("VLM tier populated", len(vlms) >= 8, f"{len(vlms)} VLM")
+
+    # Published numbers come from the certified release. A model the user ported on this
+    # machine is in the same tier and has none, which is correct rather than a gap.
+    certified = [m for m in llms if m.get("status") == "certified"]
     check(
         "published benchmarks attached",
-        all(m.get("benchmark") for m in llms),
-        "every certified LLM has TTFT/TPS",
+        certified and all(m.get("benchmark") for m in certified),
+        f"all {len(certified)} certified LLMs have TTFT/TPS",
     )
 
-    model = args.model or llms[0]["id"]
+    model = args.model or (certified or llms)[0]["id"]
     print(f"\n== chat: {model} ==")
 
     body = {

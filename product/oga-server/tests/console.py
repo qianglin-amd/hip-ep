@@ -244,8 +244,11 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         )
         shot("port")
 
+        # The smallest instruction-tuned checkpoint that ports to something worth
+        # chatting to. A placeholder repo did while ports were simulated and nothing was
+        # downloaded; a real port fetches this, so it has to exist and stay small.
         ported = "console-test-port"
-        page.fill("input[placeholder^='org/model']", f"hf-internal-testing/{ported}")
+        page.fill("input[placeholder^='org/model']", "HuggingFaceTB/SmolLM2-135M-Instruct")
         page.fill("input[placeholder='Optional display name']", ported)
         page.click("text=Start porting")
         page.wait_for_selector(".job-panel", timeout=10_000)
