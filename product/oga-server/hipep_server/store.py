@@ -98,6 +98,11 @@ class ModelStore:
             except (OSError, json.JSONDecodeError):
                 meta = {}
         known = set(LocalModel.__dataclass_fields__)
+        # `extra` is written as a nested object, so it has to be read back from there.
+        # Unknown top-level keys are folded in as well, which keeps a hand-written or
+        # newer sidecar readable instead of discarding the fields it carries.
+        extra = dict(meta.get("extra") or {})
+        extra.update({k: v for k, v in meta.items() if k not in known})
         return LocalModel(
             id=meta.get("id", model_id),
             path=str(path),
@@ -108,7 +113,7 @@ class ModelStore:
             recipe=meta.get("recipe"),
             ready=(path / "genai_config.json").is_file(),
             note=meta.get("note"),
-            extra={k: v for k, v in meta.items() if k not in known},
+            extra=extra,
         )
 
     def write(self, model: LocalModel) -> LocalModel:

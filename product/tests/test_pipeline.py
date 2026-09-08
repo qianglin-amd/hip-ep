@@ -150,6 +150,88 @@ def test_a_ported_model_keeps_its_quantization_metadata(client: TestClient, fini
     assert "AWQ" in entry["quant_label"].upper() or "awq" in str(entry["quantization"])
 
 
+def test_a_gpu_host_without_stage_implementations_still_simulates(
+    client: TestClient, finished
+) -> None:
+    """The path a real GPU host takes, which no replay-engine test reaches.
+
+    `simulate` follows the engine, so a host running the real engine asks the toolkit
+    for the stage bodies. The toolkit is installed there but does not ship them yet,
+    and reaching through the package for the missing module raised instead of falling
+    back, failing every port job on exactly the machines meant to run them.
+    """
+    client.app.state.pipeline.simulate = False
+
+    job = client.post(
+        "/v1/port", json={"source": "org/no-toolchain", "name": "notoolchain:1b"}
+    ).json()["job"]
+    snapshot = finished(client, job["id"], timeout=60.0)
+
+    assert snapshot["state"] == "succeeded", snapshot.get("error")
+    assert [s["name"] for s in snapshot["stages"]] == PORT_STAGES
+    assert "has no attribute" not in (snapshot.get("error") or "")
+
+
+def test_a_simulated_port_on_a_gpu_host_is_still_declared_simulated(
+    client: TestClient, finished
+) -> None:
+    """The disclosure has to follow the work, not the host.
+
+    `simulate` records what the machine was expected to be able to do. A GPU host sets
+    it False and can still simulate every stage, because the porting toolchain installs
+    separately. Publishing that as a genuine import puts a model with no weights in the
+    zoo, labelled ready to serve, and the failure only surfaces when someone chats to
+    it.
+    """
+    client.app.state.pipeline.simulate = False
+
+    job = client.post(
+        "/v1/port", json={"source": "org/pretend", "name": "pretend:1b"}
+    ).json()["job"]
+    snapshot = finished(client, job["id"], timeout=60.0)
+    assert snapshot["state"] == "succeeded", snapshot.get("error")
+
+    assert snapshot["result"]["simulated"] is True, "a simulated port claimed to be real"
+    warnings = [line["text"] for line in snapshot["logs"] if line["level"] == "warning"]
+    assert warnings, "nothing warned that the stages were simulated"
+    assert any("product[quant]" in text for text in warnings), (
+        "the warning must name the install that would make the port real"
+    )
+
+    local = next(
+        m for m in client.get("/v1/local").json()["models"] if m["id"] == "pretend:1b"
+    )
+    assert local["note"] == "simulated port"
+    assert local["extra"]["simulated"] is True
+
+
+def test_local_metadata_survives_a_write_and_read(client: TestClient, finished) -> None:
+    """`extra` is written nested and was being read back from the top level only.
+
+    Everything the porting pipeline records about how a model was produced -- whether
+    it was simulated, and the quantization plan used -- travels in that field, so it
+    came back empty and the console had nothing to badge.
+    """
+    job = client.post(
+        "/v1/port",
+        json={"source": "org/meta", "name": "meta:1b", "quantization": "int4-awq-g128"},
+    ).json()["job"]
+    finished(client, job["id"], timeout=60.0)
+
+    local = next(m for m in client.get("/v1/local").json()["models"] if m["id"] == "meta:1b")
+    assert local["extra"], "the sidecar round trip dropped every recorded field"
+    assert local["extra"]["quantization"] == "int4-awq-g128"
+    assert local["extra"]["chunk_size"] == 512
+
+
+def test_missing_stage_implementations_are_reported_as_absent() -> None:
+    """Neither absence may raise: no toolkit, and no stages inside one."""
+    from hipep_server.pipeline import _toolkit_stages
+
+    stages = _toolkit_stages()
+    assert stages is None or hasattr(stages, "fetch")
+
+
 def test_cancelling_a_running_job_stops_it(client: TestClient, finished) -> None:
     job = client.post("/v1/port", json={"source": "org/g", "name": "g:1b"}).json()["job"]
     assert client.post(f"/v1/jobs/{job['id']}/cancel").json()["cancelled"] == job["id"]

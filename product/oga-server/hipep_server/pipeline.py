@@ -28,14 +28,20 @@ from .store import ModelStore
 log = logging.getLogger(__name__)
 
 
-def _toolkit():
-    """Import the toolkit lazily; it is optional at runtime."""
-    try:
-        import hipep_toolkit
+def _toolkit_stages():
+    """The toolkit's real stage implementations, if this install ships them.
 
-        return hipep_toolkit
+    Two separate things can be missing: the toolkit package, and the `stages` module
+    inside it that carries the export and quantization work. Both mean the same thing
+    here -- run the stage in simulation -- so both are reported as absent rather than
+    raising. Reaching through the package for an attribute that does not exist yet
+    failed the job on exactly the hosts that have the toolkit installed.
+    """
+    try:
+        from hipep_toolkit import stages
     except ImportError:
         return None
+    return stages
 
 
 PORT_STAGES = [
@@ -409,17 +415,30 @@ class Pipeline:
         return self.jobs.start(job, self._port_stages(job))
 
     def _port_stages(self, job: Job) -> dict[str, Any]:
-        toolkit = _toolkit()
+        toolkit = _toolkit_stages()
         params = job.params
+        # Which stages ended up pretending. `self.simulate` records what the host was
+        # expected to be capable of; this records what actually happened, and the two
+        # disagree on a GPU host whose porting toolchain is not installed.
+        simulated: set[str] = set()
 
         async def run(stage_name: str, ctx: JobContext) -> None:
             ctx.check_cancelled()
-            if toolkit is not None and not self.simulate:
-                fn = getattr(toolkit.stages, stage_name, None)
+            if not self.simulate:
+                # A host that was expected to do real work and cannot has to say so
+                # here, whether the toolkit is missing entirely or merely missing this
+                # stage. Only the replay-engine case is simulated without comment,
+                # because there the whole server already announces itself as a replay.
+                fn = getattr(toolkit, stage_name, None) if toolkit is not None else None
                 if fn is not None:
                     await fn(ctx, params, store=self.store)
                     return
-                ctx.log(f"toolkit has no '{stage_name}' stage; simulating", level="warning")
+                ctx.log(
+                    f"no '{stage_name}' implementation in the porting toolchain; "
+                    'simulating. Install it with: pip install -e "product[quant]"',
+                    level="warning",
+                )
+            simulated.add(stage_name)
             await _simulate_port_stage(ctx, stage_name, params, speed=self.sim_speed)
 
         def make(stage_name: str):
@@ -433,7 +452,12 @@ class Pipeline:
         async def publish(ctx: JobContext) -> None:
             await run("publish", ctx)
             model_id = params["name"]
-            if self.simulate:
+            # Disclosure follows the work, not the host. A GPU host runs with
+            # simulate=False and can still simulate every stage, because the toolchain
+            # that would do the real work installs separately; recording that port as
+            # genuine would publish a weightless model that looks ready to serve.
+            pretended = self.simulate or bool(simulated)
+            if pretended:
                 # A simulated port produces no artifact, but it still hands out a share
                 # URL. Without something on disk that URL would resolve to an empty
                 # manifest, and an import of it would succeed while installing nothing.
@@ -449,9 +473,9 @@ class Pipeline:
                 origin="imported",
                 source=params["source"],
                 recipe=params.get("quantization"),
-                note="simulated port" if self.simulate else None,
+                note="simulated port" if pretended else None,
                 extra={
-                    "simulated": self.simulate,
+                    "simulated": pretended,
                     "quantization": params.get("quantization"),
                     "chunk_size": params.get("chunk_size"),
                     "prune_logit": params.get("prune_logit"),
@@ -471,7 +495,7 @@ class Pipeline:
                 download_url=manifest_url,
                 share_command=f"hipep pull {model_id} --from {self.settings.base_url}",
                 openai_base_url=f"{self.settings.base_url}/v1",
-                simulated=self.simulate,
+                simulated=pretended,
             )
             ctx.log(f"published {model_id} as a {entry.status} model")
             ctx.log(f"share:    {share_url}")
