@@ -11,6 +11,7 @@ signal useless, and one that raises while diagnosing has nothing to report.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -160,24 +161,66 @@ def test_an_interpreter_too_new_for_quark_says_so(exporter, monkeypatch) -> None
 
 
 def test_the_remedy_names_a_script_that_exists(exporter, monkeypatch) -> None:
-    """A remedy pointing at a missing file is worse than no remedy."""
+    """A remedy pointing at a missing file is worse than no remedy.
+
+    Resolved against the working directory, because that is what the reader will do,
+    and because the script sits under `product/` in a checkout and at the top level of
+    a delivery bundle. A remedy with either prefix hardcoded is wrong in the other
+    layout, which is how a bundle came to advise running a path it did not contain.
+    """
     exporter(None)
     monkeypatch.setattr(doc.sys, "version_info", (3, 14, 7))
 
     report = doc.Report()
     doc._check_quantization(report)
-    named = report.checks[0].remedy.split()[1]
+    named = report.checks[0].remedy.split()[1].lstrip(".\\/")
 
-    assert (PRODUCT_DIR.parent / named).exists(), f"{named} is not in the repository"
+    assert (Path.cwd() / named).exists(), f"{named} does not exist from {Path.cwd()}"
+
+
+def test_the_remedy_is_found_from_a_bundle_layout(exporter, monkeypatch, tmp_path) -> None:
+    """In a bundle the installer is beside the package rather than under `product/`."""
+    exporter(None)
+    monkeypatch.setattr(doc.sys, "version_info", (3, 14, 7))
+    script = "install-port-toolchain.ps1" if os.name == "nt" else "install-port-toolchain.sh"
+    (tmp_path / script).write_text("", encoding="utf-8")
+    monkeypatch.chdir(tmp_path)
+
+    report = doc.Report()
+    doc._check_quantization(report)
+
+    assert script in report.checks[0].remedy
+
+
+def test_a_missing_installer_does_not_name_a_path(exporter, monkeypatch, tmp_path) -> None:
+    """Naming a file that is not there sends the reader looking for it."""
+    exporter(None)
+    monkeypatch.setattr(doc.sys, "version_info", (3, 14, 7))
+    monkeypatch.setattr(doc, "__file__", str(tmp_path / "toolkit" / "pkg" / "doctor.py"))
+    monkeypatch.chdir(tmp_path)
+
+    report = doc.Report()
+    doc._check_quantization(report)
+
+    assert "install directory" in report.checks[0].remedy
 
 
 def test_a_supported_interpreter_still_suggests_the_install(exporter, monkeypatch) -> None:
+    """Even on an interpreter Quark supports, the toolchain goes in its own environment.
+
+    This used to advise `pip install -e "product[quant]"`, which the installer stopped
+    doing: it puts torch and the Quark placeholder into the environment that serves
+    models, and on a supported interpreter it half-works, which is worse.
+    """
     exporter(None)
     monkeypatch.setattr(doc.sys, "version_info", (3, 12, 10))
 
     report = doc.Report()
     doc._check_quantization(report)
-    assert "pip install" in report.checks[0].remedy
+    remedy = report.checks[0].remedy
+
+    assert "install-port-toolchain" in remedy
+    assert "pip install" not in remedy
 
 
 def test_the_quant_extra_cannot_resolve_to_the_placeholder() -> None:

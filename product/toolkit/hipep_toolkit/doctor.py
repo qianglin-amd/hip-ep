@@ -37,6 +37,32 @@ GPU_STACK_REMEDY = "install the AMD GPU wheels: install.ps1 -GpuWheels <dir>"
 # this bounds the porting check alone.
 QUARK_MAX_PYTHON = (3, 14)
 
+
+def _toolchain_remedy() -> str:
+    """Name the toolchain installer at the path it is actually at.
+
+    The script sits under `product/` in a checkout and at the top level of a delivery
+    bundle, so a remedy with either prefix hardcoded is wrong for the other half of the
+    readers -- and a remedy naming a file that is not there is worse than none. This
+    looks for the script and reports where it found it.
+    """
+    name = "install-port-toolchain.ps1" if os.name == "nt" else "install-port-toolchain.sh"
+    # doctor.py lives at <root>/toolkit/hipep_toolkit/, so <root> is `product/` in a
+    # checkout and the bundle root in a bundle. The parent covers a caller sitting at
+    # the repository root, where the path is the `product/`-prefixed one.
+    root = Path(__file__).resolve().parents[2]
+    for base in (Path.cwd(), root, root.parent):
+        candidate = base / name
+        if candidate.is_file():
+            try:
+                shown = candidate.relative_to(Path.cwd())
+            except ValueError:
+                shown = candidate
+            prefix = "" if shown.is_absolute() or os.name != "nt" else ".\\"
+            return f"run {prefix}{shown}"
+    return f"run {name} from the install directory"
+
+
 # Free space below this cannot hold one mid-sized certified model plus the working copy
 # a conversion makes of it.
 LOW_DISK_GB = 20.0
@@ -226,7 +252,7 @@ def _check_quantization(report: Report) -> None:
             "porting toolchain",
             WARN,
             "stage implementations not installed; ports will run in simulation",
-            'pip install -e "product[quant]"',
+            _toolchain_remedy(),
         )
         return
 
@@ -235,6 +261,8 @@ def _check_quantization(report: Report) -> None:
         where = "this interpreter" if exporter == sys.executable else exporter
         report.add("porting toolchain", OK, f"ONNX model builder at {where}")
         return
+
+    remedy = _toolchain_remedy()
 
     # Every AMD Quark release so far caps the interpreter below 3.14. On a newer one
     # the install resolves to an unrelated 0.1.0 placeholder that ships no modules, so
@@ -247,8 +275,7 @@ def _check_quantization(report: Report) -> None:
             WARN,
             f"no exporter found, and Python {platform.python_version()} is too new for "
             "one; ports will run in simulation",
-            f"run product/install-port-toolchain.ps1 to build a 3.11-{major}.{minor - 1} "
-            "environment; serving is unaffected",
+            f"{remedy} to build a 3.11-{major}.{minor - 1} environment; serving is unaffected",
         )
         return
 
@@ -256,7 +283,7 @@ def _check_quantization(report: Report) -> None:
         "porting toolchain",
         WARN,
         "no ONNX model builder found; ports will run in simulation",
-        'pip install -e "product[quant]"',
+        remedy,
     )
 
 
