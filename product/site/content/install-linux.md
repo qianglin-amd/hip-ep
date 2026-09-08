@@ -33,7 +33,7 @@ sudo usermod -aG render,video "$USER"   # then log out and back in
 ## Install
 
 ```bash
-./product/install.sh          # add --dev for the test suite, --quant for porting
+./product/install.sh          # add --dev for the test suite
 ```
 
 Ubuntu 24.04 and Fedora 40 both refuse a pip install outside a virtualenv, so the script
@@ -42,6 +42,35 @@ by running the preflight below.
 
 There is no release on PyPI yet, so installing from a checkout is the only path today.
 When one is published this page will carry the `pip install` line instead.
+
+## Add the GPU stack
+
+The step above gives you a working server that *replays* published timings. To run models
+on the GPU it needs the AMD execution provider wheels, and those are not on PyPI: each is
+built for one ROCm version, one GPU architecture and one Python version, so `pip install
+onnxruntime-genai` reaches a CPU build instead. They ship as a bundle:
+
+```bash
+./product/install.sh --gpu-wheels <path-to-the-wheel-bundle>
+```
+
+The Python version in the wheel names has to match the virtualenv's. `hipep doctor` says
+`engine  onnxruntime-genai available` once this lands, and the server prints a real GPU
+name instead of `replay` at startup.
+
+## Add the porting toolchain, if you want to bring your own model
+
+Only needed to turn a Hugging Face checkpoint into a HIP EP artifact; serving certified
+models does not use it. The exporter needs Python 3.11–3.13 and pulls in torch, so it gets
+its own environment rather than being forced into the server's:
+
+```bash
+./product/install-port-toolchain.sh
+```
+
+It finds a suitable interpreter, builds the environment where the server looks for it by
+convention, and proves it can import the exporter before reporting success. Nothing needs
+configuring afterwards — `hipep doctor` will show `porting toolchain  ok`.
 
 ## Check the machine first
 

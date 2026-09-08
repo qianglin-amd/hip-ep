@@ -68,13 +68,14 @@ def build_parser() -> argparse.ArgumentParser:
         "serve",
         help="start oga-server and the web console",
         description=(
-            "Start the server. Remaining arguments are passed to oga-server, so "
-            "'hipep serve --help' after '--' shows its own options."
+            "Start the server. Every argument after 'serve' is passed to oga-server, "
+            "so 'hipep serve --port 8080' and 'hipep serve --help' reach it unchanged."
         ),
+        add_help=False,
     )
     p.add_argument(
         "server_args",
-        nargs=argparse.REMAINDER,
+        nargs="*",
         metavar="[server options]",
         help="forwarded to oga-server, e.g. --port 8080 --engine replay",
     )
@@ -292,10 +293,33 @@ def _use_utf8_output() -> None:
                 reconfigure(encoding="utf-8", errors="replace")
 
 
+def _split_serve(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Hold back the server's own flags so argparse never sees them.
+
+    ``serve`` forwards its arguments to another parser, and every way of expressing
+    that inside argparse leaks: REMAINDER still lets the top-level parser claim
+    ``--port`` first, and an explicit ``--`` gets forwarded literally. Splitting the
+    list before parsing keeps the promise that everything after ``serve`` is the
+    server's, including ``--help``.
+    """
+    if "serve" not in argv:
+        return argv, []
+    cut = argv.index("serve")
+    forwarded = argv[cut + 1 :]
+    if forwarded[:1] == ["--"]:
+        forwarded = forwarded[1:]
+    return argv[: cut + 1], forwarded
+
+
 def main(argv: list[str] | None = None) -> int:
     _use_utf8_output()
+    if argv is None:
+        argv = sys.argv[1:]
+    argv, forwarded = _split_serve(argv)
     parser = build_parser()
     args = parser.parse_args(argv)
+    if getattr(args, "command", None) == "serve":
+        args.server_args = forwarded
     if not getattr(args, "handler", None):
         parser.print_help()
         return 1

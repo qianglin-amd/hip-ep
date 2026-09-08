@@ -29,14 +29,51 @@ Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion
 ```
 
 That creates a virtualenv under `product\.venv`, installs the server and the CLI, builds
-this documentation and finishes by running the preflight below. Add `-Dev` to install and
-run the test suite, `-Quant` to add the porting toolchain.
+this documentation and finishes by running the preflight below.
 
 It installs the server, the console and the model zoo metadata. It does not pull model
 weights; you choose those next.
 
 There is no release on PyPI yet, so installing from a checkout is the only path today.
 When one is published this page will carry the `pip install` line instead.
+
+## Add the GPU stack
+
+The step above gives you a working server that *replays* published timings. To run models
+on the GPU it needs the AMD execution provider wheels, and those are not on PyPI: each is
+built for one ROCm version, one GPU architecture and one Python version, so `pip install
+onnxruntime-genai` reaches a CPU build instead. They ship as a bundle:
+
+```powershell
+.\product\install.ps1 -GpuWheels <path-to-the-wheel-bundle>
+```
+
+```text
+==> installing the GPU stack (4 wheels)
+  onnxruntime_ep_amdgpu-1.0.0-cp314-cp314-win_amd64.whl
+  onnxruntime_ep_hip-0.4.0-py3-none-win_amd64.whl
+  onnxruntime_genai_directml-0.14.0-cp314-cp314-win_amd64.whl
+  onnxruntime_directml-1.27.0-cp314-cp314-win_amd64.whl
+```
+
+The Python version in the wheel names has to match the virtualenv's. `hipep doctor` says
+`engine  onnxruntime-genai available` once this lands, and the server prints a real GPU
+name instead of `replay` at startup.
+
+## Add the porting toolchain, if you want to bring your own model
+
+Only needed to turn a Hugging Face checkpoint into a HIP EP artifact; serving certified
+models does not use it. The exporter needs Python 3.11–3.13 and pulls in torch, so it gets
+its own environment rather than being forced into the server's:
+
+```powershell
+.\product\install-port-toolchain.ps1
+```
+
+It finds a suitable interpreter, builds the environment where the server looks for it by
+convention, and proves it can import the exporter before reporting success. Nothing needs
+configuring afterwards — `hipep doctor` will show `porting toolchain  ok`. See
+[Bring your own model](recipes.html).
 
 ## Check the machine first
 

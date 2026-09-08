@@ -192,6 +192,32 @@ def test_quark_defaults_are_the_parser_defaults() -> None:
     assert args.prune_logit is True
 
 
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["serve", "--port", "8231"],
+        ["serve", "--", "--port", "8231"],
+    ],
+)
+def test_serve_forwards_the_servers_own_flags(argv) -> None:
+    """`hipep serve --port 8080` is the documented spelling, and argparse claims
+    `--port` for itself unless the list is split before parsing."""
+    kept, forwarded = cli._split_serve(argv)
+    assert kept == ["serve"]
+    assert forwarded == ["--port", "8231"]
+
+
+def test_serve_forwards_help_to_the_server() -> None:
+    """`hipep serve --help` documents the server's flags, so it must not be answered
+    by the toolkit's own parser."""
+    assert cli._split_serve(["serve", "--help"])[1] == ["--help"]
+
+
+def test_splitting_leaves_other_commands_alone() -> None:
+    argv = ["port", "org/model", "--recipe", "int4-rtn-g128"]
+    assert cli._split_serve(argv) == (argv, [])
+
+
 def test_run_accepts_repeated_images() -> None:
     args = cli.build_parser().parse_args(
         ["run", "qwen3.6-vl:27b", "describe", "--image", "a.png", "--image", "b.png"]

@@ -28,6 +28,11 @@ FAIL = "fail"
 
 MIN_PYTHON = (3, 10)
 
+# The GPU wheels are not on PyPI: each is built for one ROCm version, one GPU
+# architecture and one Python version, so `pip install onnxruntime-genai` reaches a CPU
+# build instead and the advice to run it sends the reader somewhere that cannot work.
+GPU_STACK_REMEDY = "install the AMD GPU wheels: install.ps1 -GpuWheels <dir>"
+
 # The first interpreter no AMD Quark release supports. Serving has no such ceiling, so
 # this bounds the porting check alone.
 QUARK_MAX_PYTHON = (3, 14)
@@ -193,14 +198,14 @@ def _check_engine(report: Report) -> None:
             "engine",
             FAIL,
             f"HIPEP_ENGINE=oga was requested but {why}",
-            "install onnxruntime-genai for your GPU, or unset HIPEP_ENGINE",
+            f"{GPU_STACK_REMEDY}, or unset HIPEP_ENGINE to replay instead",
         )
     else:
         report.add(
             "engine",
             WARN,
             f"{why}; the server will replay published timings instead of inferring",
-            "install onnxruntime-genai to run real models",
+            GPU_STACK_REMEDY,
         )
 
 
