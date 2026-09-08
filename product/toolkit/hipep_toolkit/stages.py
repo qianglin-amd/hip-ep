@@ -211,6 +211,18 @@ async def _inspect(ctx, params: dict[str, Any], *, store) -> None:
     ctx.log(f"vocabulary        {vocab}")
     ctx.log(f"trained context   {context}")
 
+    expected = params.get("expects_architectures") or []
+    if expected and architecture not in expected:
+        # Not fatal: a recipe is a set of quantization settings, and one tuned for a
+        # neighbouring architecture is usually still a reasonable starting point. It is
+        # worth saying, because a recipe chosen for the wrong family is the likeliest
+        # reason a port comes out worse than the one it was copied from.
+        ctx.log(
+            f"{params.get('recipe')} is written for {', '.join(expected)}, and this is "
+            f"{architecture}; porting anyway with its settings",
+            level="warning",
+        )
+
     ctx.result(
         architecture=architecture,
         num_hidden_layers=layers,
@@ -572,7 +584,15 @@ def _workdir(store, params: dict[str, Any]) -> Path:
 
 
 def _quantization_plan(params: dict[str, Any]) -> dict[str, Any]:
-    """Turn a recipe id such as `int4-rtn-g128` into builder options."""
+    """The builder options for this port.
+
+    A caller that picked a recipe has already had its quantization block read, and that
+    is authoritative. Otherwise the settings are parsed out of a scheme id such as
+    `int4-rtn-g128`, which is all a caller passing a bare string gives us.
+    """
+    if params.get("plan"):
+        return _plan_from_recipe(params["plan"], params)
+
     scheme = str(params.get("quantization") or "int4-rtn-g128").lower()
     parts = scheme.split("-")
     precision = parts[0] if parts and parts[0] in {"int4", "int8", "fp16"} else "int4"
@@ -620,6 +640,23 @@ def _fit_block_size(block: int, hidden: int | None) -> int:
         if candidate <= block and hidden % candidate == 0:
             return candidate
     return min(BUILDER_BLOCK_SIZES)
+
+
+def _plan_from_recipe(plan: dict[str, Any], params: dict[str, Any]) -> dict[str, Any]:
+    """Builder options from a recipe's already-read quantization block."""
+    algorithm = str(plan.get("algorithm") or "rtn")
+    if algorithm not in BUILDER_ALGORITHMS:
+        raise ValueError(
+            f"the recipe asks for {algorithm}, which the ONNX model builder cannot do"
+        )
+
+    group = int(plan.get("block_size") or params.get("chunk_size") or 128)
+    return {
+        "precision": str(plan.get("precision") or "int4"),
+        "algo_config": BUILDER_ALGORITHMS[algorithm],
+        "block_size": group if group in BUILDER_BLOCK_SIZES else 128,
+        "is_symmetric": bool(plan.get("symmetric", True)),
+    }
 
 
 def _scheme_with_block(scheme: str, block: int) -> str:

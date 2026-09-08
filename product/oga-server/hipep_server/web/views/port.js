@@ -37,11 +37,15 @@ export async function renderPort(root) {
   const recipeSelect = el("select", {},
     recipes.length
       ? recipes.map((r) =>
+          // A recipe needing a calibration pass this server cannot run stays listed and
+          // readable -- it documents how a certified artifact was made -- but it cannot
+          // be chosen, because choosing it could only ever fail.
           el("option", {
             value: r.id,
-            title: r.description || "",
+            title: r.unavailable_reason || r.description || "",
             selected: r.id === DEFAULT_RECIPE,
-          }, `${r.name || r.id}${r.recommended_for ? ` — ${r.recommended_for}` : ""}`),
+            disabled: r.buildable === false,
+          }, `${r.name || r.id}${r.buildable === false ? " (needs calibration — not portable here)" : r.recommended_for ? ` — ${r.recommended_for}` : ""}`),
         )
       : [el("option", { value: DEFAULT_RECIPE }, "INT4 RTN, group size 128 (built-in default)")],
   );
@@ -54,7 +58,7 @@ export async function renderPort(root) {
   const recipeNote = el("div", { class: "faint small" });
   function paintRecipeNote() {
     const recipe = recipes.find((r) => r.id === recipeSelect.value);
-    recipeNote.textContent = recipe?.description || "";
+    recipeNote.textContent = recipe?.unavailable_reason || recipe?.description || "";
   }
   recipeSelect.addEventListener("change", paintRecipeNote);
   paintRecipeNote();

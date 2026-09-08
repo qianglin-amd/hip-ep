@@ -410,6 +410,11 @@ class Pipeline:
                 "calibration_samples": spec.get("calibration_samples", 128),
                 "device": spec.get("device", "auto"),
                 "benchmark": spec.get("benchmark", True),
+                # Set when the caller picked a recipe: the settings read out of its
+                # quantization block, and the model classes it says it is for.
+                "recipe": spec.get("recipe"),
+                "plan": spec.get("plan"),
+                "expects_architectures": spec.get("expects_architectures") or [],
             },
         )
         return self.jobs.start(job, self._port_stages(job))

@@ -97,6 +97,8 @@ async def port(request: Request, body: dict[str, Any] = Body(...)):
     Quark defaults apply when the caller does not override them: chunk_size 512 and
     logit pruning on.
     """
+    from ..recipes import RecipeError, find_recipe, recipe_architectures, recipe_plan
+
     source = (body.get("source") or "").strip()
     if not source:
         raise HTTPException(
@@ -113,6 +115,28 @@ async def port(request: Request, body: dict[str, Any] = Body(...)):
         "device": body.get("device", "auto"),
         "benchmark": bool(body.get("benchmark", True)),
     }
+
+    # The console sends the chosen recipe's id as the scheme, so a recipe is identified
+    # by whichever of the two fields names one. Reading its quantization block is what
+    # makes the choice mean anything: parsing settings out of the id instead lost the
+    # block size that several of these recipes exist to change.
+    chosen = body.get("recipe") or spec["quantization"]
+    recipe = find_recipe(request.app.state.settings.recipes_dir, str(chosen))
+    if recipe:
+        try:
+            plan = recipe_plan(recipe)
+        except RecipeError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        spec["quantization"] = recipe["id"]
+        spec["recipe"] = recipe["id"]
+        spec["plan"] = plan
+        spec["expects_architectures"] = recipe_architectures(recipe)
+        if "chunk_size" in plan and "chunk_size" not in body:
+            spec["chunk_size"] = plan["chunk_size"]
+        if "prune_logit" not in body:
+            spec["prune_logit"] = plan["prune_logit"]
+    elif body.get("recipe"):
+        raise HTTPException(status_code=404, detail=f"no recipe named {chosen!r}")
     job = request.app.state.pipeline.start_port(spec)
     return {"job": job.to_dict(include_logs=False)}
 

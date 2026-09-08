@@ -108,7 +108,7 @@ def test_port_honours_an_explicit_quantization_plan(client: TestClient, finished
         json={
             "source": "org/model",
             "name": "e:1b",
-            "quantization": "int4-awq-g128",
+            "quantization": "int4-rtn-g32",
             "chunk_size": 1024,
             "prune_logit": False,
             "calibration_samples": 64,
@@ -116,7 +116,7 @@ def test_port_honours_an_explicit_quantization_plan(client: TestClient, finished
     ).json()["job"]
     params = finished(client, job["id"], timeout=60.0)["params"]
 
-    assert params["quantization"] == "int4-awq-g128"
+    assert params["quantization"] == "int4-rtn-g32"
     assert params["chunk_size"] == 1024
     assert params["prune_logit"] is False
     assert params["calibration_samples"] == 64
@@ -141,14 +141,14 @@ def test_a_ported_model_is_usable_without_a_restart(client: TestClient, finished
 def test_a_ported_model_keeps_its_quantization_metadata(client: TestClient, finished) -> None:
     job = client.post(
         "/v1/port",
-        json={"source": "org/f", "name": "f:1b", "quantization": "int4-awq-g128"},
+        json={"source": "org/f", "name": "f:1b", "quantization": "int4-rtn-g32"},
     ).json()["job"]
     finished(client, job["id"], timeout=60.0)
 
     entry = client.get("/v1/catalog/f:1b").json()
     assert entry["status"] == "imported"
     assert entry["installed"] is True
-    assert "AWQ" in entry["quant_label"].upper() or "awq" in str(entry["quantization"])
+    assert "g32" in f"{entry['quant_label']} {entry['quantization']}".lower()
 
 
 @pytest.fixture
@@ -226,13 +226,13 @@ def test_local_metadata_survives_a_write_and_read(client: TestClient, finished) 
     """
     job = client.post(
         "/v1/port",
-        json={"source": "org/meta", "name": "meta:1b", "quantization": "int4-awq-g128"},
+        json={"source": "org/meta", "name": "meta:1b", "quantization": "int4-rtn-g32"},
     ).json()["job"]
     finished(client, job["id"], timeout=60.0)
 
     local = next(m for m in client.get("/v1/local").json()["models"] if m["id"] == "meta:1b")
     assert local["extra"], "the sidecar round trip dropped every recorded field"
-    assert local["extra"]["quantization"] == "int4-awq-g128"
+    assert local["extra"]["quantization"] == "int4-rtn-g32"
     assert local["extra"]["chunk_size"] == 512
 
 

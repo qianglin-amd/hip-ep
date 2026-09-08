@@ -27,7 +27,7 @@ def shared(peer, finished) -> tuple[str, str]:
     url, peer_client = peer
     job = peer_client.post(
         "/v1/port",
-        json={"source": "org/shareme", "name": "shareme:7b", "quantization": "int4-awq-g128"},
+        json={"source": "org/shareme", "name": "shareme:7b", "quantization": "int4-rtn-g32"},
     ).json()["job"]
     assert finished(peer_client, job["id"], timeout=60.0)["state"] == "succeeded"
     return url, "shareme:7b"
@@ -121,7 +121,7 @@ def test_an_imported_model_keeps_the_peers_metadata(
     entry = client.get(f"/v1/catalog/{model_id}").json()
     assert entry["status"] == "imported"
     assert entry["quantization"], "quantization schema did not survive the import"
-    assert "awq" in str(entry["quantization"]).lower() or "AWQ" in entry["quant_label"]
+    assert "g32" in f"{entry['quantization']} {entry['quant_label']}".lower()
 
 
 def test_an_imported_model_can_be_chatted_with(
