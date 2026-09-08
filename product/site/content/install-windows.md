@@ -25,22 +25,18 @@ Get-CimInstance Win32_VideoController | Select-Object Name, DriverVersion
 ## Install
 
 ```powershell
-python -m pip install --upgrade pip
-python -m pip install hipep-server
-```
-
-That pulls the server, the console and the model zoo metadata. It does not pull model
-weights; you choose those next.
-
-To install from this repository instead:
-
-```powershell
 .\product\install.ps1
 ```
 
 That creates a virtualenv under `product\.venv`, installs the server and the CLI, builds
 this documentation and finishes by running the preflight below. Add `-Dev` to install and
 run the test suite, `-Quant` to add the porting toolchain.
+
+It installs the server, the console and the model zoo metadata. It does not pull model
+weights; you choose those next.
+
+There is no release on PyPI yet, so installing from a checkout is the only path today.
+When one is published this page will carry the `pip install` line instead.
 
 ## Check the machine first
 
@@ -78,7 +74,7 @@ hip-ep oga-server 0.1.0
   host    WINAMD-2QAMU6OE
   gpu     AMD Radeon(TM) 8060S Graphics (gfx1151)
   engine  hip-ep on gfx1151
-  catalog 37 models (release_0.4)
+  catalog 23 models (release_0.4)
   models  C:\Users\you\.hipep\models
   listen  http://127.0.0.1:11434
 ```
@@ -113,10 +109,14 @@ From an application, change one line:
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:11434/v1", api_key="not-needed")
-print(client.chat.completions.create(
-    model="llama3.1:8b",
-    messages=[{"role": "user", "content": "Hello"}],
-).choices[0].message.content)
+print(
+    client.chat.completions.create(
+        model="llama3.1:8b",
+        messages=[{"role": "user", "content": "Hello"}],
+    )
+    .choices[0]
+    .message.content
+)
 ```
 
 More, including C++ and C#, in [API and client usage](api.html).

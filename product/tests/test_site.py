@@ -12,9 +12,14 @@ from __future__ import annotations
 
 import re
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+from fastapi.testclient import TestClient
+from hipep_server.app import create_app
+from hipep_server.catalog import load_catalog
+from hipep_server.config import Settings
 
 PRODUCT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PRODUCT_DIR / "site"))
@@ -30,6 +35,29 @@ def site_dir(tmp_path_factory) -> Path:
     out = tmp_path_factory.mktemp("site")
     assert site.build(out) > 0
     return out
+
+
+@pytest.fixture
+def every_model(catalog):
+    """The catalog including the tiers that have not shipped.
+
+    The `catalog` fixture is already filtered to what ships, which is what the site
+    documents. This unfiltered view is what lets a test check the boundary itself,
+    rather than only checking that the two filtered things agree.
+    """
+    return load_catalog(
+        PRODUCT_DIR / "modelzoo" / "catalog",
+        PRODUCT_DIR / "modelzoo" / "benchmarks",
+        shipped_only=False,
+    )
+
+
+@pytest.fixture
+def served(site_dir: Path, tmp_path: Path) -> Iterator[TestClient]:
+    """A running server with this build of the site mounted, as an install would have."""
+    settings = Settings(data_dir=tmp_path / "home", engine="replay", site_dir=site_dir)
+    with TestClient(create_app(settings)) as client:
+        yield client
 
 
 def pages(site_dir: Path) -> dict[str, str]:
@@ -82,10 +110,93 @@ def test_no_internal_link_is_broken(site_dir: Path) -> None:
     assert site.check_links(site_dir) == []
 
 
+def test_the_site_never_advertises_an_install_that_does_not_exist(site_dir: Path) -> None:
+    """The landing page and both install guides offered `pip install hipep-server`.
+
+    Nothing is published under that name -- nor under `hipep-product`, which is what
+    the package is actually called -- so the very first command a new user ran failed,
+    on the page whose entire job is getting them to a first token. Until a release
+    exists, the documented path has to be the one that works from a checkout.
+    """
+    unpublished = ("hipep-server", "hipep-product")
+    for name, text in pages(site_dir).items():
+        for package in unpublished:
+            assert f"pip install {package}" not in text, (
+                f"{name} tells the reader to install {package}, which is not published"
+            )
+
+
+def test_the_server_serves_the_built_site(served: TestClient) -> None:
+    assert served.get("/docs/").status_code == 200
+    assert served.get("/landing").status_code == 200
+    assert served.get("/assets/site.css").status_code == 200
+
+
+def test_the_bare_docs_path_reaches_the_docs(served: TestClient) -> None:
+    """A mount answers at "/docs/" only. The console's own Docs link points at the bare
+    "/docs", which is also what a reader types, so the redirect is load-bearing."""
+    redirect = served.get("/docs", follow_redirects=False)
+    assert redirect.status_code in (301, 302, 307, 308)
+    assert redirect.headers["location"] == "/docs/"
+    assert served.get("/docs", follow_redirects=True).status_code == 200
+
+
+def test_the_console_links_to_something_that_exists(served: TestClient) -> None:
+    """The console is hand-written, so its links to the generated site are the pair most
+    able to drift apart."""
+    console = served.get("/").text
+    targets = set(re.findall(r'href="(/[^"#]*)"', console))
+    assert "/docs" in targets, "the console no longer links to the docs"
+    for target in targets:
+        assert served.get(target, follow_redirects=True).status_code == 200, target
+
+
+def test_the_docs_offer_the_console_only_where_one_is_running(site_dir: Path) -> None:
+    """The same build is published to a static host and served by the server, so the
+    link back to the console cannot be decided at build time. It ships hidden and is
+    revealed only once a server answers, which is why every page must load the script
+    that asks."""
+    script = (site_dir / "assets" / "site.js").read_text(encoding="utf-8")
+    assert "/v1/status" in script, "nothing checks whether a server is there"
+
+    for name, text in pages(site_dir).items():
+        assert 'class="to-studio"' in text, f"{name} cannot offer the console"
+        assert re.search(r'<a class="to-studio"[^>]*\shidden', text), (
+            f"{name} shows the console link before knowing a server exists"
+        )
+        assert "site.js" in text, f"{name} never runs the check that reveals the link"
+
+
 def test_every_model_gets_a_card(site_dir: Path, catalog) -> None:
     written = " ".join(pages(site_dir).values())
     for model in catalog.models:
         assert model.id in written, f"{model.id} has no page anywhere on the site"
+
+
+def test_the_site_publishes_only_the_shipped_tiers(
+    site_dir: Path, catalog, every_model
+) -> None:
+    written = " ".join(pages(site_dir).values())
+    shipped = {m.id for m in catalog.models}
+    withheld = [m for m in every_model.models if m.id not in shipped]
+    assert withheld, "this test is vacuous if the catalog has nothing to hold back"
+    for model in withheld:
+        assert model.id not in written, f"{model.id} is not shipped but the site lists it"
+
+
+def test_the_site_does_not_publish_the_release_gate(site_dir: Path, catalog) -> None:
+    """The per-suite pass/fail summary grades a release against the previous one, so a
+    "fail" there is a few percent of regression in a model that works. It is an
+    internal gate; on a public page it reads as a broken product."""
+    written = " ".join(pages(site_dir).values()).lower()
+    assert "pass rate" not in written
+    assert "pass_rate" not in written
+    assert "procyon" not in written
+
+    # The suite names themselves are not searched for: "vision" is a substring of
+    # "vision-language", so a page that correctly describes a VLM would fail such a
+    # check. Which models reach the site is covered by the tier test above.
+    assert catalog.benchmark_meta.get("summary"), "the gate should still exist internally"
 
 
 def test_a_family_page_carries_the_specification(site_dir: Path, catalog) -> None:

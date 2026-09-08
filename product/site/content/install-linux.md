@@ -33,19 +33,15 @@ sudo usermod -aG render,video "$USER"   # then log out and back in
 ## Install
 
 ```bash
-python3 -m pip install --upgrade pip
-python3 -m pip install hipep-server
-```
-
-Or from this repository:
-
-```bash
 ./product/install.sh          # add --dev for the test suite, --quant for porting
 ```
 
 Ubuntu 24.04 and Fedora 40 both refuse a pip install outside a virtualenv, so the script
 creates one at `product/.venv`, installs into it, builds this documentation and finishes
 by running the preflight below.
+
+There is no release on PyPI yet, so installing from a checkout is the only path today.
+When one is published this page will carry the `pip install` line instead.
 
 ## Check the machine first
 
