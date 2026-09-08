@@ -44,6 +44,17 @@ log = logging.getLogger(__name__)
 
 _SENTINEL = object()
 
+
+def _drain(out: queue.Queue) -> list[Any]:
+    """Wait for one item from the worker, then take whatever else is already queued."""
+    items = [out.get()]
+    try:
+        while True:
+            items.append(out.get_nowait())
+    except queue.Empty:
+        pass
+    return items
+
 _ep_ready = False
 
 
@@ -183,6 +194,12 @@ class OgaEngine(Engine):
         cancel = threading.Event()
         loop = asyncio.get_running_loop()
 
+        # Started before the worker thread, not after. onnxruntime-genai holds the GIL
+        # through prefill, so a `Thread.start()` that returns only once the worker
+        # yields it lands the clock at roughly the first token: TTFT collapses to
+        # microseconds and prefill disappears from the total instead of being reported.
+        watch = Stopwatch()
+
         thread = threading.Thread(
             target=self._generate_blocking,
             args=(loaded, request, out, cancel),
@@ -190,25 +207,29 @@ class OgaEngine(Engine):
             daemon=True,
         )
         thread.start()
-
-        watch = Stopwatch()
         completion_tokens = 0
         prompt_tokens = estimate_tokens(request.prompt_text)
+        finished = False
         try:
-            while True:
-                item = await loop.run_in_executor(None, out.get)
-                if item is _SENTINEL:
-                    break
-                if isinstance(item, Exception):
-                    raise EngineError(str(item)) from item
-                if isinstance(item, dict):  # metadata from the worker
-                    prompt_tokens = item.get("prompt_tokens", prompt_tokens)
-                    if "first_token_at" in item:
-                        watch.mark_first_token_at(item["first_token_at"])
-                    continue
-                watch.mark_first_token()
-                completion_tokens += 1
-                yield Delta(text=item)
+            while not finished:
+                # One thread hand-off per burst rather than per token. The worker holds
+                # the GIL between decodes, so a round trip for every token leaves the
+                # consumer waiting on the interpreter switch interval each time and the
+                # stream falls steadily further behind the generation it is reporting.
+                for item in await loop.run_in_executor(None, _drain, out):
+                    if item is _SENTINEL:
+                        finished = True
+                        break
+                    if isinstance(item, Exception):
+                        raise EngineError(str(item)) from item
+                    if isinstance(item, dict):  # metadata from the worker
+                        prompt_tokens = item.get("prompt_tokens", prompt_tokens)
+                        if "first_token_at" in item:
+                            watch.mark_first_token_at(item["first_token_at"])
+                        continue
+                    watch.mark_first_token()
+                    completion_tokens += 1
+                    yield Delta(text=item)
         finally:
             cancel.set()
 
@@ -301,11 +322,14 @@ class OgaEngine(Engine):
                             if head:
                                 out.put(head)
                             break
-                        # Hold back only as much as the longest stop string needs.
-                        keep = max(len(s) for s in stops) - 1
+                        # Hold back only a tail that could still grow into a stop
+                        # marker. Reserving the longest marker's width unconditionally
+                        # delays every chunk by several tokens, which on the console
+                        # reads as the model pausing before it answers.
+                        keep = _stop_prefix_len(buffered, stops)
                         if len(buffered) > keep:
-                            out.put(buffered[:-keep] if keep else buffered)
-                            buffered = buffered[-keep:] if keep else ""
+                            out.put(buffered[: len(buffered) - keep])
+                            buffered = buffered[len(buffered) - keep :]
                     else:
                         out.put(piece)
                 if stops and buffered and not cancel.is_set():
@@ -449,6 +473,24 @@ def chat_format(model_type: str | None) -> ChatFormat:
         if name.startswith(prefix):
             return fmt
     return _CHATML
+
+
+def _stop_prefix_len(text: str, stops: list[str]) -> int:
+    """Length of the shortest tail of `text` that must be withheld from the client.
+
+    A stop marker that lies wholly inside `text` is detected by the caller. The only
+    other way one can appear is by straddling the boundary, so the sole text that
+    cannot be released yet is a suffix which is also a proper prefix of some marker --
+    usually nothing at all, which is what lets tokens stream out as they are decoded.
+    """
+    longest = 0
+    for stop in stops:
+        # A full match is the caller's case; only shorter overlaps are undecided.
+        for size in range(min(len(stop) - 1, len(text)), longest, -1):
+            if text.endswith(stop[:size]):
+                longest = size
+                break
+    return longest
 
 
 def _model_type(path: Path) -> str | None:
