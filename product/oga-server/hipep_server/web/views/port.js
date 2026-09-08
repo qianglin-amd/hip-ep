@@ -63,17 +63,57 @@ export async function renderPort(root) {
   recipeSelect.addEventListener("change", paintRecipeNote);
   paintRecipeNote();
 
+  // A port downloads tens of gigabytes before it can tell you anything. Preflight reads
+  // the model's config alone -- a few kilobytes -- so the answer arrives while the user
+  // is still filling the form.
+  const preflight = el("div", { class: "faint small" });
+  let preflightFor = "";
+  async function runPreflight() {
+    const source = sourceInput.value.trim();
+    if (!source || source === preflightFor) return;
+    preflightFor = source;
+    preflight.textContent = "Checking the model…";
+    preflight.className = "faint small";
+    try {
+      const v = await api.portPreflight(source);
+      if (sourceInput.value.trim() !== source) return;
+      const lines = [
+        `${v.architecture}${v.hidden_size ? `, hidden size ${v.hidden_size}` : ""}` +
+          `${v.context ? `, ${v.context.toLocaleString()} token context` : ""}`,
+        `Suggested recipe: ${v.recipe} at block size ${v.block_size}.`,
+        ...(v.verified
+          ? [`Ported and checked here on ${v.verified.gpu} using ${v.verified.checkpoint}.`]
+          : []),
+        ...v.warnings,
+        ...v.notes,
+      ];
+      // Warnings and notes are written as fragments so they can be read on their own;
+      // strung together into a paragraph they have to start like sentences.
+      preflight.textContent = lines
+        .map((line) => line.charAt(0).toUpperCase() + line.slice(1))
+        .join(" ");
+      preflight.className = v.warnings.length ? "notice" : "faint small";
+    } catch (error) {
+      if (sourceInput.value.trim() !== source) return;
+      preflight.textContent = error.message;
+      preflight.className = "notice bad";
+      preflightFor = "";
+    }
+  }
+  sourceInput.addEventListener("change", runPreflight);
+  sourceInput.addEventListener("blur", runPreflight);
+
   const submit = el("button", { class: "btn btn-primary", text: "Start porting" });
 
   const form = el("div", { class: "card" }, [
     el("h3", { text: "Source" }),
-    el("label", { class: "field" }, ["Model", sourceInput]),
+    el("label", { class: "field" }, ["Model", sourceInput, preflight]),
     el("div", { class: "row wrap", style: "gap:6px" },
       EXAMPLES.map((example) =>
         el("button", {
           class: "btn btn-ghost btn-sm",
           text: example,
-          onclick: () => { sourceInput.value = example; },
+          onclick: () => { sourceInput.value = example; runPreflight(); },
         }),
       ),
     ),

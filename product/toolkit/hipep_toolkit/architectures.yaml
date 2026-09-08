@@ -1,0 +1,115 @@
+# Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+# Licensed under the MIT License.
+#
+# What is known about porting each model architecture.
+#
+# Scope: only what cannot be read from somewhere else. Which recipe suits an
+# architecture is already written in the recipe's own `applies_to` block, and a model's
+# family is already in the catalog, so neither is repeated here -- they are joined in at
+# load time instead, because a fact stored twice is a fact that will disagree with
+# itself.
+#
+# `verified` means someone ported the named checkpoint on the named GPU and read what it
+# generated. Anything without it is drawn from the recipe collection and the certified
+# release rather than from a port run here, and says so.
+
+rules:
+  # These hold regardless of architecture and are applied by the port pipeline itself.
+  # They are recorded here because each one cost a broken artifact to find, and each
+  # produces a model that loads, runs at full speed and does not produce language.
+
+  - id: block-size-divides-hidden-size
+    summary: A quantization block that does not divide the hidden size corrupts the weights.
+    detail: >-
+      Quantizing in blocks of N splits each row of a weight matrix into groups of N. When
+      N does not divide the row length the final group is short, and the weights that
+      land in it come back wrong. SmolLM2-360M has a hidden size of 960, which is not a
+      multiple of 128, and at group 128 it produced word salad; at 64 and at 32 it is
+      fine. The export stage now reduces the block to the largest supported size that
+      divides the hidden size and says so in the job log.
+    verified: SmolLM2-360M-Instruct on gfx1151
+
+  - id: chat-markup-is-not-implied-by-architecture
+    summary: Read the chat template the artifact ships, not the architecture name.
+    detail: >-
+      SmolLM2 is `LlamaForCausalLM` and speaks ChatML. Choosing markup from the
+      architecture wrapped it in Llama 3 headers, which the model read as ordinary text:
+      it restated the question and emitted a stray `<|eot_id|>`. The server now prefers
+      the template in `chat_template.jinja` or `tokenizer_config.json` and falls back to
+      the architecture only when neither is present.
+    verified: SmolLM2-360M-Instruct on gfx1151
+
+  - id: builder-target-decides-numeric-shape
+    summary: Do not export INT4 against the builder's CPU target.
+    detail: >-
+      The ONNX model builder has no HIP target, so one of its own targets stands in, and
+      the choice decides the shape of the graph rather than what it runs on. `int4` with
+      `cpu` is the single combination that yields an FP32 interface and an accuracy level
+      of 4, meaning int8 compute; on the AMD GPU that model emitted only punctuation.
+      Every non-CPU target gives the FP16 interface and unset accuracy level the
+      certified artifacts have.
+    verified: Qwen2.5-0.5B-Instruct on gfx1151
+
+architectures:
+  - id: Qwen2ForCausalLM
+    kind: decoder
+    chat_markup: chatml
+    verified:
+      checkpoint: Qwen/Qwen2.5-0.5B-Instruct
+      gpu: gfx1151
+      note: ported at group 128 and answers correctly; hidden size 896 divides 128.
+
+  - id: Qwen3ForCausalLM
+    kind: decoder
+    chat_markup: chatml
+
+  - id: LlamaForCausalLM
+    kind: decoder
+    # Llama 3 speaks its own header markup, but the class is also used by models that do
+    # not, so the artifact's own template has to decide.
+    chat_markup: from-artifact
+    verified:
+      checkpoint: HuggingFaceTB/SmolLM2-360M-Instruct
+      gpu: gfx1151
+      note: >-
+        hidden size 960 does not divide 128; the port reduces the block to 64. This
+        checkpoint speaks ChatML despite the Llama class.
+
+  - id: MistralForCausalLM
+    kind: decoder
+    chat_markup: mistral
+
+  - id: Phi3ForCausalLM
+    kind: decoder
+    chat_markup: phi
+
+  - id: PhiMoEForCausalLM
+    kind: decoder-moe
+    chat_markup: phi
+
+  - id: Gemma3ForConditionalGeneration
+    kind: vlm
+    chat_markup: gemma
+
+  - id: Gemma4ForConditionalGeneration
+    kind: vlm
+    chat_markup: gemma
+
+  - id: Gemma4MoeForConditionalGeneration
+    kind: vlm-moe
+    chat_markup: gemma
+
+  - id: Qwen3VLForConditionalGeneration
+    kind: vlm
+    chat_markup: chatml
+
+  - id: Qwen3VLMoeForConditionalGeneration
+    kind: vlm-moe
+    chat_markup: chatml
+
+  - id: WhisperForConditionalGeneration
+    kind: speech
+    chat_markup: none
+    note: >-
+      Encoder-decoder speech model, exported at FP16 rather than quantized. It does not
+      go through the INT4 path at all.

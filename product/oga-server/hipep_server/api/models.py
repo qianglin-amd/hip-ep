@@ -9,6 +9,8 @@ the published benchmark numbers, and with whether the model fits on this machine
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Body, HTTPException, Request
@@ -147,3 +149,68 @@ async def recipes(request: Request):
     from ..recipes import list_recipes
 
     return {"recipes": list_recipes(request.app.state.settings.recipes_dir)}
+
+
+@router.get("/architectures")
+async def architectures(request: Request):
+    """What is known about porting each model architecture."""
+    from .. import architectures as kb
+
+    recipes_dir = request.app.state.settings.recipes_dir
+    return {"architectures": kb.architectures(recipes_dir), "rules": kb.rules()}
+
+
+@router.post("/port/preflight")
+async def port_preflight(request: Request, body: dict[str, Any] = Body(...)):
+    """Say what porting a model would do, before fetching any weights.
+
+    Reads the model's `config.json` and nothing else, which is a few kilobytes against
+    the tens of gigabytes a port downloads. Answering "this will not work, and here is
+    why" after that download is a far worse answer than answering it now.
+    """
+    from .. import architectures as kb
+
+    source = (body.get("source") or "").strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="source is required")
+
+    try:
+        config = await _read_model_config(source)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - reported to the caller as-is
+        raise HTTPException(
+            status_code=502, detail=f"could not read the model's config: {exc}"
+        ) from exc
+
+    verdict = kb.assess(config, request.app.state.settings.recipes_dir)
+    verdict["source"] = source
+    return verdict
+
+
+async def _read_model_config(source: str) -> dict[str, Any]:
+    """The `config.json` of a local directory or a Hugging Face repository."""
+    import asyncio
+
+    local = Path(source) / "config.json"
+    if local.is_file():
+        return json.loads(local.read_text(encoding="utf-8"))
+
+    def fetch() -> dict[str, Any]:
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import RepositoryNotFoundError
+
+        try:
+            path = hf_hub_download(source, "config.json")
+        except RepositoryNotFoundError as exc:
+            # Hugging Face answers 404 for a repository that does not exist and for one
+            # that exists behind a licence the caller has not accepted, so this cannot
+            # tell them apart and must not claim to.
+            raise FileNotFoundError(
+                f"could not read {source!r}: it does not exist, or it is gated and this "
+                "machine is not authenticated. If it is gated, accept the licence on "
+                "the model page and run `huggingface-cli login`."
+            ) from exc
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    return await asyncio.to_thread(fetch)

@@ -34,7 +34,10 @@ export const api = {
   deleteLocal: (id) => request(`/v1/local/${encodeURIComponent(id)}`, { method: "DELETE" }),
   pull: (model) => request("/v1/pull", { method: "POST", body: JSON.stringify({ model }) }),
   port: (spec) => request("/v1/port", { method: "POST", body: JSON.stringify(spec) }),
+  portPreflight: (source) =>
+    request("/v1/port/preflight", { method: "POST", body: JSON.stringify({ source }) }),
   recipes: () => request("/v1/recipes"),
+  architectures: () => request("/v1/architectures"),
   jobs: (kind) => request(`/v1/jobs${kind ? "?kind=" + kind : ""}`),
   job: (id) => request(`/v1/jobs/${id}`),
   cancelJob: (id) => request(`/v1/jobs/${id}/cancel`, { method: "POST" }),

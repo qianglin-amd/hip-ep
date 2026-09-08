@@ -249,6 +249,20 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         # downloaded; a real port fetches this, so it has to exist and stay small.
         ported = "console-test-port"
         page.fill("input[placeholder^='org/model']", "HuggingFaceTB/SmolLM2-135M-Instruct")
+
+        # Preflight reads the model's config alone, so the verdict has to arrive while
+        # the form is still being filled rather than after the download.
+        page.locator("input[placeholder^='org/model']").blur()
+        try:
+            page.wait_for_function(
+                "() => document.querySelector('.card .field div')?.textContent"
+                "?.includes('LlamaForCausalLM')",
+                timeout=30_000,
+            )
+            preflighted = True
+        except PlaywrightTimeout:
+            preflighted = False
+        checks.ok("preflight reports the architecture before any download", preflighted)
         page.fill("input[placeholder='Optional display name']", ported)
         page.click("text=Start porting")
         page.wait_for_selector(".job-panel", timeout=10_000)
