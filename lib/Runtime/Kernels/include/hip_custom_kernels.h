@@ -26,6 +26,9 @@
 // (JIT dlopen, or native import). Pre-dual-format the kernels were linked into
 // model.dll, so no export was needed -- hence this is new. EXPORTS is defined
 // only when building that library (hip_utils.cmake); consumers leave it empty.
+// Guarded so this coexists with gqa_autotune.h, which defines the same macro
+// (identically) to stay independent of this header in the mock build.
+#ifndef HIP_KERNEL_API
 #if defined(_WIN32)
   #if defined(HIP_CUSTOM_KERNELS_EXPORTS)
     #define HIP_KERNEL_API __declspec(dllexport)
@@ -37,6 +40,7 @@
 #else
   #define HIP_KERNEL_API
 #endif
+#endif // HIP_KERNEL_API
 
 #ifdef __cplusplus
 extern "C" {
@@ -63,6 +67,7 @@ typedef enum {
     HIP_DTYPE_INT16    = 6,
     HIP_DTYPE_UINT8    = 7,
     HIP_DTYPE_INT8     = 8,
+    HIP_DTYPE_UINT16   = 9,
 } hip_dtype_t;
 
 /* =========================================================================
@@ -135,6 +140,130 @@ HIP_KERNEL_API int hip_elementwise_where(
     int hip_dtype);
 
 /* =========================================================================
+ * Quantized elementwise (Q(DQ(A) [OP] DQ(B))), OP belongs to {+,-,*,/}
+ * =========================================================================
+ *
+ * lhs/rhs/output are integer quantized buffers of the same hip_dtype.
+ * Operand shapes are left-padded with 1s to out_rank (NumPy broadcast).
+ * Rank must be <= HIP_QELEMENTWISE_MAX_RANK (8).
+ *
+ * kind: 0 = add (HIPDNN_EP_QELEMENTWISE_ADD),
+ *       1 = mul (HIPDNN_EP_QELEMENTWISE_MUL).
+ *
+ * Scales are folded by lowering, and how they collapse depends on kind
+ * because multiplying the dequantized operands also multiplies their scales:
+ *
+ *   add: M_a = s_a / s_out, M_b = s_b / s_out
+ *        OUT = saturate(round(M_a * (A - z_a) + M_b * (B - z_b)) + z_out)
+ *   mul: M_a = s_a * s_b / s_out, M_b unused
+ *        OUT = saturate(round(M_a * (A - z_a) * (B - z_b)) + z_out)
+ *
+ * Supported hip_dtype: HIP_DTYPE_INT8, HIP_DTYPE_UINT8, HIP_DTYPE_INT16,
+ * HIP_DTYPE_UINT16, HIP_DTYPE_INT32.
+ */
+HIP_KERNEL_API int hip_qelementwise(
+    void* stream,
+    const void* lhs,
+    const void* rhs,
+    void* output,
+    int64_t kind,
+    const int64_t* lhs_shape, int64_t lhs_rank,
+    const int64_t* rhs_shape, int64_t rhs_rank,
+    const int64_t* out_shape, int64_t out_rank,
+    int hip_dtype,
+    float M_a, int64_t lhs_zp,
+    float M_b, int64_t rhs_zp,
+    int64_t output_zp);
+
+/* =========================================================================
+ * Quantized batched matmul (Q(DQ(A) @ DQ(B)))
+ * =========================================================================
+ *
+ * A: [batch_count x M x K], B: [K x N] when b_batch_stride == 0 or
+ * [batch_count x K x N] when b_batch_stride == K*N, Y: [batch_count x M x N].
+ * All row-major and contiguous.
+ *
+ * trans_a / trans_b swap the trailing two extents of the corresponding operand
+ * in memory -- A stored as [batch_count x K x M], B as [N x K] -- while M, N, K
+ * stay the logical extents and b_batch_stride stays K*N. Only the load stride
+ * changes; Y is never transposed.
+ *
+ * Supported hip_dtype, independently per edge:
+ *   a: HIP_DTYPE_INT8, HIP_DTYPE_UINT8, HIP_DTYPE_INT16, HIP_DTYPE_UINT16
+ *   b: HIP_DTYPE_INT8, HIP_DTYPE_UINT8
+ *   y: HIP_DTYPE_INT8, HIP_DTYPE_UINT8, HIP_DTYPE_INT16, HIP_DTYPE_UINT16
+ *
+ */
+HIP_KERNEL_API int hip_qmatmul(
+    void* stream,
+    const void* A,
+    const void* B,
+    void* Y,
+    int64_t M, int64_t N, int64_t K,
+    int64_t batch_count,
+    int64_t b_batch_stride,
+    int trans_a, int trans_b,
+    int a_dtype, int b_dtype, int y_dtype,
+    float M_scale,
+    int64_t a_zp, int64_t b_zp, int64_t y_zp);
+
+/* =========================================================================
+ * Quantized 1x1 convolution, W4A16 (Q(Conv(DQ(x), DQ(w))))
+ * =========================================================================
+ *
+ * A 1x1 kernel with unit stride, unit dilation and no padding is one dot
+ * product per output position down the channel axis, so this is a GEMM:
+ *
+ *   out[n, co, p] = sum over ci of  x[n, ci, p] * w[co, ci]
+ *
+ * with M = out_channels, K = in_channels, N = spatial_size (output positions).
+ * There is no im2col gather and no per-axis geometry: the caller has already
+ * established the degenerate form.
+ *
+ * Both scales come out of the sum because neither depends on ci:
+ *
+ *   acc[co, p] = sum over ci of (x - z_x) * (w[co, ci] - z_w[co])
+ *   out        = saturate(round(M[co] * acc + bias[co] / s_out) + z_out)
+ *   M[co]      = act_out_scale_ratio * weight_scales[co]
+ *
+ * act_out_scale_ratio (= s_x / s_out) and inv_output_scale (= 1 / s_out) are
+ * folded by the caller so the kernel never divides. The per-channel factor
+ * cannot be folded: weight_scales is a device array of one f32 per output
+ * channel, indexed by co.
+ *
+ * `weights` and `weight_zero_points` keep an 8-bit element type and their
+ * LOGICAL element counts (out_channels * in_channels and out_channels), but
+ * when weight_bits == 4 each byte holds TWO values, low nibble first over the
+ * flattened row-major sequence, so only ceil(numel/2) bytes back them.
+ * weight_dtype decides how a nibble widens: HIP_DTYPE_INT8 sign-extends from
+ * 4 bits, HIP_DTYPE_UINT8 zero-extends. Getting that wrong is silent.
+ *
+ * Supported act_dtype: HIP_DTYPE_UINT16.
+ * Supported weight_dtype: HIP_DTYPE_INT8, HIP_DTYPE_UINT8 (storage), with
+ * weight_bits 4 (packed) or 8 (full width).
+ * `bias` is nullable and, when present, float32 with one value per output
+ * channel.
+ * Returns: 0 on success, non-zero on unsupported combination / launch failure.
+ */
+HIP_KERNEL_API int hip_qconv(
+    void* stream,
+    const void* input,
+    const void* weights,
+    const void* weight_scales,
+    const void* weight_zero_points,
+    const void* bias,
+    void* output,
+    int64_t batch,
+    int64_t in_channels,
+    int64_t out_channels,
+    int64_t spatial_size,
+    int act_dtype,
+    int weight_dtype,
+    int weight_bits,
+    float act_out_scale_ratio, int64_t input_zp,
+    float inv_output_scale, int64_t output_zp);
+
+/* =========================================================================
  * Elementwise Unary (Neg / Sign / Cos / Sin / Not)
  * =========================================================================
  *
@@ -198,6 +327,10 @@ HIP_KERNEL_API int hip_elementwise_round(
     int hip_dtype);
 
 HIP_KERNEL_API int hip_elementwise_atan(
+    void *stream, const void *input, void *output, int64_t num_elements,
+    int hip_dtype);
+
+HIP_KERNEL_API int hip_elementwise_floor(
     void *stream, const void *input, void *output, int64_t num_elements,
     int hip_dtype);
 
@@ -490,30 +623,17 @@ HIP_KERNEL_API int hip_leaky_relu(
     double alpha);
 
 /* =========================================================================
- * Swish activation
+ * Swish Activation
  * =========================================================================
  *
- * Element-wise Swish: y = x * sigmoid(alpha * x) (ONNX opset 24).
- * At alpha == 1 this is SiLU.
+ * Applies Swish element-wise: y = x * sigmoid(alpha * x).
+ * Supports HIP_DTYPE_FLOAT16, HIP_DTYPE_FLOAT32, HIP_DTYPE_BFLOAT16, and
+ * HIP_DTYPE_FLOAT64.
  *
- * Parameters:
- *   stream       - HIP stream (cast to hipStream_t internally)
- *   input        - Device pointer to input tensor
- *   output       - Device pointer to output tensor
- *   num_elements - Total number of elements
- *   hip_dtype    - Data type enum (HIP_DTYPE_FLOAT32, HIP_DTYPE_FLOAT16,
- *                  HIP_DTYPE_FLOAT64)
- *   alpha        - Sigmoid gain (default 1.0 per ONNX spec)
- *
- * Returns: 0 on success (hipSuccess), non-zero hipError_t on failure
+ * Returns: 0 on success (hipSuccess), non-zero hipError_t on failure.
  */
-HIP_KERNEL_API int hip_swish(
-    void* stream,
-    const void* input,
-    void* output,
-    int64_t num_elements,
-    int hip_dtype,
-    double alpha);
+HIP_KERNEL_API int hip_swish(void *stream, const void *input, void *output,
+                             int64_t num_elements, int hip_dtype, double alpha);
 
 /* =========================================================================
  * Softplus activation
@@ -658,12 +778,19 @@ HIP_KERNEL_API int hip_gqa_kv_cache_append(
  * element_size_bytes: 2 = fp16, 4 = fp32 (used only by the FP16 copy path).
  * kv_dtype / scale select the storage format exactly as in
  * hip_gqa_kv_cache_append (HIP_KV_DTYPE_FP16 -> plain copy; HIP_KV_DTYPE_INT8 ->
- * INT8 quant of the new fp16 tokens, past then read as INT8, scale = [G,d]). */
+ * INT8 quant of the new fp16 tokens, past then read as INT8, scale = [G,d]).
+ * s_lo: first present position to write. Positions [0, s_lo) are LEFT UNWRITTEN
+ * -- not zeroed, not copied -- so present is only valid from s_lo onwards, and
+ * the caller must not read below it. Pass 0 for a full concat. The grid shrinks
+ * with s_lo, which is the point: a sliding-window layer at decode passes the
+ * same lower bound it reads from, so the bytes it skips writing are exactly the
+ * bytes it will not read. Clamped internally to [0, past_len] so the new tokens
+ * at [past_len, past_len+sq) are always written. */
 HIP_KERNEL_API int hip_gqa_kv_cache_concat(
     void* stream, const void* past, const void* current, void* present,
     int batch_size, int past_len, int sq, int G, int d,
     int past_seq, int present_seq, int element_size_bytes,
-    int kv_dtype, const void* scale);
+    int kv_dtype, const void* scale, int s_lo);
 
 /* INT8 KV cache (symmetric per-channel, kv_cache_bit_width=8) dequant.
  * dequant_kv_i8_to_fp16: rebuilds an fp16 BNSD view [B,G,dst_seq,d] of the first
@@ -726,19 +853,45 @@ HIP_KERNEL_API int hip_gqa_causal_mask_f32(
     int batch_stride, int past_len, int local_window_size);
 
 /* Add an attention bias onto the fp32 score matrix before softmax.
- * scores layout: [total_heads, sq, total_seq] row-major with batch_stride
- * = sq * total_seq per head.
- * bias layout: [bias_batch, bias_heads, bias_sq, total_seq], row-major.
+ * scores layout: [total_heads, sq, score_cols] row-major with batch_stride
+ * = sq * score_cols per head.
+ * bias layout: [bias_batch, bias_heads, bias_sq, bias_total_seq], row-major.
  * bias_batch / bias_heads may be 1 for ONNX-style broadcast.
- * sq is the number of query rows in `scores`, which is a chunk of the full
- * query range when the caller tiles the prefill; bias_sq is the bias tensor's
- * full query extent and bias_row_offset locates the chunk within it. Pass
- * bias_sq = sq (or 0) and bias_row_offset = 0 for the untiled case. */
+ * `scores` may be a sub-block of the full logical score matrix on either axis,
+ * so both axes carry a bias extent and an offset:
+ *   sq / bias_sq / bias_row_offset -- sq is the number of query rows present,
+ *     a chunk of the full range when the caller tiles the prefill.
+ *   score_cols / bias_total_seq / bias_col_offset -- score_cols is the number
+ *     of key columns present, just the sliding window when the caller narrowed
+ *     the decode key range.
+ * Pass bias_sq = sq (or 0) and bias_row_offset = 0, and bias_total_seq =
+ * score_cols (or 0) and bias_col_offset = 0, for the untiled/unnarrowed case. */
 HIP_KERNEL_API int hip_gqa_add_attention_bias_f32(
     void* stream, void* scores, const void* bias,
     int total_heads, int num_heads, int bias_batch, int bias_heads,
-    int sq, int total_seq, int score_batch_stride, int bias_element_size_bytes,
-    int bias_sq, int bias_row_offset);
+    int sq, int score_cols, int score_batch_stride, int bias_element_size_bytes,
+    int bias_sq, int bias_row_offset, int bias_total_seq, int bias_col_offset);
+
+/* Highest key position each query chunk can attend, recovered from the additive
+ * mask. Writes one int per chunk to out_chunk_hi (device), as an ABSOLUTE key
+ * position, so the caller's per-chunk key range is [lo, out_chunk_hi[j] + 1).
+ *
+ * For a bidirectional op (onnx.Attention is_causal=0) the attributes carry no
+ * upper bound and every chunk otherwise scores every key. An entry whose bias
+ * is at or below -65504 -- the fp16 lower bound, the "not attended" sentinel --
+ * contributes exactly zero to the softmax, so excluding it is bit-exact.
+ * Anything less negative counts as attended, which only narrows less.
+ *
+ * Chunks are the caller's uniform tiling: chunk j covers query rows
+ * [j*sq_chunk, min((j+1)*sq_chunk, sq)). bias layout and the bias_batch /
+ * bias_heads broadcast follow hip_gqa_add_attention_bias_f32 above. past_len
+ * places query row 0 of the call at its absolute position. Only the region
+ * above each chunk's last row is read; the rest is kept regardless. */
+HIP_KERNEL_API int hip_gqa_bias_key_extent(
+    void* stream, const void* bias, void* out_chunk_hi,
+    int bias_batch, int bias_heads, int bias_sq, int bias_total_seq,
+    int sq, int sq_chunk, int past_len, int num_chunks,
+    int bias_element_size_bytes);
 
 /* Column-wise softmax in-place. One threadblock per (head, query).
  * Smooth softmax is activated when head_sink is non-null OR use_smooth_softmax
@@ -752,17 +905,23 @@ HIP_KERNEL_API int hip_gqa_softmax_inplace(
     int batch_stride, const void* head_sink, int num_heads,
     int use_smooth_softmax);
 
-/* Row-wise softmax over a flattened [rows, cols] row-major fp16 buffer.
- * One block per row, softmaxes the `cols` elements of each row in-place
- * (data is overwritten with normalized probabilities). Matches ONNX
- * Softmax semantics for axis = -1 on the flattened input. Used by the
- * standalone `hip_miopen_softmax` runtime entry point. */
-HIP_KERNEL_API int hip_softmax_row_2d_inplace(void* stream, void* data, int rows, int cols);
+/* Row-wise softmax over a flattened [rows, cols] row-major fp16 buffer,
+ * reading `input` and writing normalized probabilities to `output`. Matches
+ * ONNX Softmax semantics for axis = -1 on the flattened input. `input` may
+ * equal `output`. Used by the standalone `hip_miopen_softmax` runtime entry
+ * point, which is destination-passing and would otherwise have to copy its
+ * input over its output before running an in-place kernel. */
+HIP_KERNEL_API int hip_softmax_row_2d(void* stream, const void* input, void* output, int rows, int cols);
 
 /* fp32 variant of the above — for models where Softmax input is fp32.
  * Qwen VLM vision encoder attention scores are fp32; using the fp16 kernel
  * there misinterprets the data and produces completely wrong outputs.
  * Called by hip_miopen_softmax when elem_size_bytes == 4. */
+HIP_KERNEL_API int hip_softmax_row_2d_fp32(void* stream, const void* input, void* output, int rows, int cols);
+
+/* Single-buffer forms of the two above, for callers that softmax a buffer
+ * in place. Equivalent to passing `data` as both source and destination. */
+HIP_KERNEL_API int hip_softmax_row_2d_inplace(void* stream, void* data, int rows, int cols);
 HIP_KERNEL_API int hip_softmax_row_2d_inplace_fp32(void* stream, void* data, int rows, int cols);
 
 /* Column-wise softmax: fp32 input -> fp16 output.
@@ -783,6 +942,29 @@ HIP_KERNEL_API int hip_gqa_softmax_f32_to_f32(
     int total_head_queries, int rows, int cols,
     int input_batch_stride, int output_batch_stride,
     const void* head_sink, int num_heads, int use_smooth_softmax);
+
+/* Same as hip_gqa_softmax_f32_to_f32 / _f16, with the external additive mask
+ * folded into the score read so a preceding hip_gqa_add_attention_bias_f32 pass
+ * over the same buffer is not needed. output_fp32 picks the probability dtype
+ * (0 = fp16, feeding the fp16 Value GEMM; 1 = fp32) and
+ * bias_element_size_bytes the mask dtype (2 = fp16, 4 = fp32). The bias is
+ * added before the column max is taken.
+ *
+ * The bias is indexed on its own full extents, exactly as
+ * hip_gqa_add_attention_bias_f32 does, because the score buffer can be a
+ * sub-block of the logical [bias_sq, bias_total_seq] matrix: `cols` query rows
+ * starting at bias_row_offset, and `rows` key columns starting at
+ * bias_col_offset. Mind the axis names -- this kernel reduces along `rows`, so
+ * its `rows` is the key extent and its `cols` the query count, which is the
+ * transpose of the naming hip_gqa_add_attention_bias_f32 uses. */
+HIP_KERNEL_API int hip_gqa_softmax_f32_to_out_biased(
+    void* stream, const void* input_f32, void* output,
+    int total_head_queries, int rows, int cols,
+    int input_batch_stride, int output_batch_stride,
+    const void* head_sink, int num_heads, int use_smooth_softmax,
+    const void* bias, int bias_batch, int bias_heads,
+    int bias_element_size_bytes, int output_fp32,
+    int bias_sq, int bias_row_offset, int bias_total_seq, int bias_col_offset);
 
 /* Legacy fast-path decode kernel (folded into gqa_kernel.hip with a legacy_*
  * device kernel). The production decode path uses hip_gqa_flash_decode above
@@ -1672,8 +1854,14 @@ HIP_KERNEL_API int hip_instance_norm(
  * Per-row reduction with FP32 accumulators, regardless of I/O dtype. Unlike
  * LayerNormalization there is no mean subtraction and no bias term.
  *
- * `outer` / `norm_size`: input viewed as [outer, norm_size], where norm_size
- *                        equals the scale element count.
+ * `outer` / `norm_size`: input viewed as [outer, norm_size], where norm_size is
+ *                        the ONNX reduction width (product of the input dims
+ *                        from `axis` on) -- NOT the scale element count.
+ * `scale_rows`         : number of gain vectors packed in `scale`
+ *                        (scale_num_elements / norm_size). Row r uses group
+ *                        r % scale_rows; 1 is the ordinary shared-gain case,
+ *                        >1 is a grouped norm such as scale [G, D] applied to
+ *                        input [N, G, D] with axis = -1.
  * `hip_dtype`          : I/O type for input/scale/output -- FLOAT16 or FLOAT32.
  *
  * FLOAT16 automatically uses a packed __half2 body when norm_size is even and
@@ -1686,6 +1874,7 @@ HIP_KERNEL_API int hip_rms_norm(
     void* output,
     int64_t outer,
     int64_t norm_size,
+    int64_t scale_rows,
     float epsilon,
     int hip_dtype);
 
@@ -1938,6 +2127,43 @@ HIP_KERNEL_API void hip_matmul_nbits_dequant_b_fp16(
     void* stream, const void* B_packed, const void* scales_fp16,
     const void* zeros_fp16, void* B_fp16_out, int N, int K, int group_size);
 
+/* -------------------------------------------------------------------------
+ * int4 row-stride padding and stride-aware WMMA dispatch.
+ *
+ * hip_matmul_nbits_u4_padrow_bytes: allocation size for the padded weight
+ *   buffer (N rows of K/2 + 128 bytes).
+ *
+ * hip_matmul_nbits_u4_prepack_padrow: copy B into dst with the padded stride.
+ *   Source row stride is K/2, so the caller must have established that
+ *   group_size divides K; dst needs padrow_bytes(N, K) bytes.
+ *
+ * hip_matmul_nbits_u4_wmma_stride: fused int4 WMMA prefill against a B whose
+ *   row stride may be padded. b_row_bytes == 0 means the arrival stride.
+ *   Non-zero restricts the autotune to fused configs (the separate-dequant
+ *   pass has no stride argument) and keys the cache with the stride, so the
+ *   winner reflects the layout actually in use. Returns -1 when no fused
+ *   config is eligible, leaving the caller to use the arrival-layout path.
+ * ------------------------------------------------------------------------- */
+HIP_KERNEL_API size_t hip_matmul_nbits_u4_padrow_bytes(int N, int K);
+
+HIP_KERNEL_API int hip_matmul_nbits_u4_prepack_padrow(
+    void* stream, const void* B, void* dst, int N, int K);
+
+HIP_KERNEL_API int hip_matmul_nbits_u4_wmma_stride(
+    void* stream, int cfg, int M, int N, int K, int group_size,
+    const void* A, int lda, const void* B, const void* scales,
+    const void* zeros, void* C, int ldc, int b_row_bytes);
+
+/* hip_matmul_nbits_u4_wmma_padrow: fused int4 WMMA prefill against a row-padded
+ *   B, repacking B into a single shared scratch on each call. Bounds padded-B
+ *   memory to the largest single layer instead of a persistent per-weight copy.
+ *   Takes the packed arrival-layout B directly; no caller-side buffer needed.
+ *   Returns -1 (use the arrival-layout path) on failure or no fused config. */
+HIP_KERNEL_API int hip_matmul_nbits_u4_wmma_padrow(
+    void* stream, int cfg, int M, int N, int K, int group_size,
+    const void* A, int lda, const void* B, const void* scales,
+    const void* zeros, void* C, int ldc);
+
 /* =========================================================================
  * GatherBlockQuantized (com.microsoft)
  * =========================================================================
@@ -1993,6 +2219,82 @@ HIP_KERNEL_API int hip_gather_block_quantized(
     int is_signed_data,          // 1 if int4 / int8, 0 if uint4 / uint8
     int indices_is_int64,        // 1 = i64, 0 = i32
     int out_dtype);              // hip_dtype_t (FLOAT16 / FLOAT32 / BFLOAT16)
+
+/* =========================================================================
+ * QuantizeLinear / DequantizeLinear
+ * =========================================================================
+ *
+ * quantize:   output = saturate(round(input / scale) + zero_point)
+ * dequantize: output = (input - zero_point) * scale
+ *
+ * output is elementwise the same shape as input, so only input_shape is
+ * passed. Granularity is derived from scale_shape together with axis and
+ * block_size:
+ *   scale_rank == 0, or a single element ..... per-tensor
+ *   scale_rank == 1 .......................... per-axis along `axis`
+ *   block_size > 0 ........................... blocked along `axis`
+ *
+ * zero_point is nullable; a null pointer means a zero point of 0 for every
+ * block. Its element type is out_dtype for quantize and in_dtype for
+ * dequantize.
+ *
+ * axis must be normalized to [0, input_rank) by the caller.
+ *
+ * out_dtype fully determines the quantized storage type, including its
+ * signedness: the compiler derives it from a MLIR element type that the
+ * ONNX importer maps one-to-one (UINT8 -> ui8, INT8 -> i8, UINT16 -> ui16,
+ * INT16 -> i16). The ONNX output_dtype attribute is therefore not passed
+ * down. A float8 output would break that one-to-one mapping.
+ *
+ * INT4 / UINT4 breaks it too, since both import as an 8-bit type. Each entry
+ * point therefore takes an explicit bit width for its quantized end:
+ * out_bits for quantize, in_bits for dequantize.
+ *
+ * precision exists only on QuantizeLinear per the ONNX spec. The ONNX
+ * `saturate` attribute is carried all the way to wrap_quantize_linear but
+ * stops there: it only affects float8 targets, and the range clamp for every
+ * integer target supported here is unconditional. It would have to be
+ * forwarded again if float8 support is added.
+ */
+HIP_KERNEL_API int hip_quantize_linear(
+    void* stream,
+    const void* input,           // high precision
+    const void* scale,
+    const void* zero_point,      // nullable, same type as output
+    void* output,                // quantized; packed when out_bits == 4
+    const int64_t* input_shape,  int input_rank,
+    const int64_t* scale_shape,  int scale_rank,
+    int axis,                    // normalized
+    int block_size,              // 0 = not blocked
+    int precision,               // TensorProto enum; only 0 (unset) or 1 (FLOAT)
+    int in_dtype,                // hip_dtype_t
+    int scale_dtype,
+    int out_dtype,
+    // Value width of output and zero_point: 8 or 16 to agree with out_dtype,
+    // or 4 for ONNX INT4/UINT4. At 4 out_dtype supplies only the signedness,
+    // zero_point is packed, and only the first ceil(numel/2) bytes of output
+    // are written -- two values per byte, low nibble first. input_shape stays
+    // logical.
+    int out_bits);
+
+HIP_KERNEL_API int hip_dequantize_linear(
+    void* stream,
+    const void* input,           // quantized; packed when in_bits == 4
+    const void* scale,
+    const void* zero_point,      // nullable, same type as input
+    void* output,                // high precision
+    const int64_t* input_shape,  int input_rank,
+    const int64_t* scale_shape,  int scale_rank,
+    int axis,                    // normalized
+    int block_size,              // 0 = not blocked
+    int in_dtype,                // hip_dtype_t
+    int scale_dtype,
+    int out_dtype,
+    // Value width of input and zero_point: 8 or 16 to agree with in_dtype, or
+    // 4 for ONNX INT4/UINT4. At 4 in_dtype supplies only the signedness and
+    // both buffers hold ceil(numel/2) bytes, two values per byte, low nibble
+    // first, over the flattened row-major sequence. input_shape stays logical.
+    int in_bits);
 
 /* =========================================================================
  * QMoE Sub-Kernels
@@ -2178,6 +2480,158 @@ HIP_KERNEL_API int hip_qmoe_decode_fused_dp4a(
     int64_t hidden_size, int64_t inter_size,
     int64_t k, int64_t block_size,
     float swiglu_alpha, float swiglu_beta, float swiglu_limit,
+    int64_t element_size_bytes);
+
+/* =========================================================================
+ * com.amd QMoE Sub-Kernels (LatentMoE)
+ * =========================================================================
+ *
+ * The two kernels genuinely new to this op: sigmoid + correction-bias
+ * routing (raw prob for weighting, biased score for top-k selection), and
+ * the relu2 activation. Everything else in the com.amd QMoE runtime path
+ * (lib/Runtime/real/qmoe_amd.cpp) reuses hip_matmul_nbits, the
+ * hip_qmoe_gather_tokens / hip_qmoe_bucket_tokens / hip_qmoe_scatter_add
+ * kernels declared above unmodified.
+ */
+
+/* com.amd QMoE routing (fp16 only):
+ *   logits = hidden_states @ router_weight   (dense, NOT quantized)
+ *   probs  = sigmoid(logits)
+ *   sel    = top_k(probs + correction_bias, k)   -- selection only
+ *   w      = probs[sel]                           -- raw prob for weighting
+ *   w      = (normalize) ? w / (sum(w) + eps) : w; w *= routed_scaling_factor
+ *
+ *   hidden_states   - GPU [num_tokens, hidden_size]
+ *   router_weight   - GPU [hidden_size, num_experts] (dense, unquantized)
+ *   correction_bias - GPU [num_experts] (nullable iff use_correction_bias==0)
+ *   expert_indices  - GPU [num_tokens, k] int32 (output)
+ *   expert_weights  - GPU [num_tokens, k] (output, same type as hidden_states)
+ */
+HIP_KERNEL_API int hip_qmoe_amd_route(
+    void* stream,
+    const void* hidden_states,
+    const void* router_weight,
+    const void* correction_bias,
+    void* expert_indices,
+    void* expert_weights,
+    int64_t num_tokens,
+    int64_t hidden_size,
+    int64_t num_experts,
+    int64_t k,
+    int64_t normalize,
+    int64_t use_correction_bias,
+    float routed_scaling_factor,
+    int64_t element_size_bytes);
+
+/* relu2 activation (fp16 only): output[i] = relu(input[i])^2, elementwise
+ * over n*width elements. Used by com.amd QMoE for both the per-expert and
+ * shared-expert branches. input == output is allowed (the callers activate in
+ * place), so neither pointer is declared __restrict__ in the kernel.
+ */
+HIP_KERNEL_API int hip_qmoe_amd_relu2(
+    void* stream,
+    const void* input,
+    void* output,
+    int64_t n,
+    int64_t width,
+    int64_t element_size_bytes);
+
+/* Expert bucketing for com.amd QMoE. Same inputs/outputs and the same
+ * token-major in-expert ordering as hip_qmoe_bucket_tokens, but parallelized
+ * over experts (one block each) instead of running one thread per expert in a
+ * single block. The shared kernel's serial-per-expert scan is tuned for the
+ * ~32 experts / k<=4 of com.microsoft::QMoE; this op runs a far larger
+ * (num_tokens * k) pair space, where that layout leaves all the work on one
+ * compute unit.
+ *
+ * The sorted_* layout is byte-identical to the serial version: each thread
+ * owns a contiguous slice of the pair space and a block-wide exclusive scan
+ * places its matches so that concatenating the threads' writes reproduces the
+ * ascending (token, slot) order exactly.
+ *
+ * Unlike hip_qmoe_bucket_tokens there is no num_experts <= 1024 limit, since
+ * experts map to blocks rather than to threads within one block.
+ *
+ *   expert_indices   - GPU [num_tokens, k] int32
+ *   expert_weights   - GPU [num_tokens, k] fp16
+ *   expert_counts    - GPU [num_experts] int32 (output)
+ *   expert_offsets   - GPU [num_experts + 1] int32 (output, exclusive scan)
+ *   sorted_token_ids - GPU [num_tokens * k] int32 (output)
+ *   sorted_weights   - GPU [num_tokens * k] fp16 (output)
+ */
+HIP_KERNEL_API int hip_qmoe_amd_bucket_tokens(
+    void* stream,
+    const void* expert_indices,
+    const void* expert_weights,
+    void* expert_counts,
+    void* expert_offsets,
+    void* sorted_token_ids,
+    void* sorted_weights,
+    int64_t num_tokens,
+    int64_t num_experts,
+    int64_t k,
+    int64_t element_size_bytes);
+
+/* Fully fused routed branch for com.amd QMoE decode (num_tokens == 1).
+ *
+ * A single token selects k distinct experts, so the k routing slots ARE the
+ * active expert set: no bucketing, no count readback, and no host-side
+ * dispatch loop are needed. This collapses the general path's
+ * (bucket + D2H + hipStreamSynchronize + 5 launches per active expert) into
+ * three launches that look the expert id up from expert_indices on the device.
+ *
+ *   latent [latent_size] -> per-slot fc1 -> relu2 -> per-slot fc2
+ *   -> weighted sum over slots -> acc [latent_size]
+ *
+ * acc is fully overwritten (no pre-zeroing needed) and the k slot
+ * contributions are summed in fp32 before the single fp16 store, where the
+ * general path's scatter_add rounds to fp16 after every expert.
+ *
+ * FP16 activations, 4-bit symmetric (zero-point 8) weights, no bias -- the
+ * only configuration com.amd QMoE has. Call
+ * hip_qmoe_amd_decode_fused_supported() first: the packed-nibble main loop
+ * needs 32-element K tiles and power-of-two quant blocks, so shapes outside
+ * that must keep using the general path.
+ *
+ *   latent           - GPU [latent_size] fp16 (fc1_latent_proj output)
+ *   expert_indices   - GPU [k] int32
+ *   expert_weights   - GPU [k] fp16
+ *   fc1_weights      - GPU [num_experts, moe_intermediate_size, latent/2]
+ *   fc1_scales       - GPU [num_experts, moe_intermediate_size, latent/block]
+ *   fc2_weights      - GPU [num_experts, latent_size, moe_inter/2]
+ *   fc2_scales       - GPU [num_experts, latent_size, moe_inter/block]
+ *   act_scratch      - GPU [k, moe_intermediate_size] fp16 (scratch)
+ *   slot_scratch     - GPU [k, latent_size] fp16 (scratch)
+ *   acc              - GPU [latent_size] fp16 (output)
+ */
+HIP_KERNEL_API int hip_qmoe_amd_decode_fused(
+    void* stream,
+    const void* latent,
+    const void* expert_indices,
+    const void* expert_weights,
+    const void* fc1_weights,
+    const void* fc1_scales,
+    const void* fc2_weights,
+    const void* fc2_scales,
+    void* act_scratch,
+    void* slot_scratch,
+    void* acc,
+    int64_t latent_size,
+    int64_t moe_intermediate_size,
+    int64_t k,
+    int64_t expert_weight_bits,
+    int64_t block_size,
+    int64_t element_size_bytes);
+
+/* Returns 1 if hip_qmoe_amd_decode_fused can handle this shape, 0 otherwise.
+ * Lets the caller fall back to the general path silently rather than failing
+ * the op on an unsupported geometry.
+ */
+HIP_KERNEL_API int hip_qmoe_amd_decode_fused_supported(
+    int64_t latent_size,
+    int64_t moe_intermediate_size,
+    int64_t block_size,
+    int64_t expert_weight_bits,
     int64_t element_size_bytes);
 
 /* =========================================================================

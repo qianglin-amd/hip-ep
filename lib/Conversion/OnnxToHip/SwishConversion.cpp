@@ -2,22 +2,15 @@
  * Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
  * Licensed under the MIT License.
  */
-//===- SwishConversion.cpp - onnx.Swish -> hip.swish --------------------===//
+//===- SwishConversion.cpp - onnx.Swish -> hip.swish ---------------------===//
 //
-// Converts onnx.Swish (opset 24) to a single hip.swish op backed by a
-// dedicated HIP kernel.
+// Lowers ONNX Swish to one fused HIP operation:
 //
-//   Before:
-//     %y = "onnx.Swish"(%x) {alpha = 1.0 : f32}
-//          : (tensor<...xT>) -> tensor<...xT>
+//   y = x * sigmoid(alpha * x)
 //
-//   After:
-//     %init = tensor.empty(...) : tensor<...xT>
-//     %y    = hip.swish(%ctx) ins(%x : tensor<...xT>)
-//                             outs(%init : tensor<...xT>)
-//                             {alpha = 1.0 : f64}
-//
-// Type T is one of f16/f32/f64 per the ONNX spec.
+// Keeping this fused avoids two or three kernel launches from decomposing the
+// ONNX function body into Mul/Sigmoid/Mul. It also preserves the full ONNX
+// type set: f16, f32, bf16, and f64.
 //
 //===----------------------------------------------------------------------===//
 
@@ -38,32 +31,37 @@ struct SwishToHip : public mlir::RewritePattern {
       return rewriter.notifyMatchFailure(
           op, "onnx.Swish expects 1 operand and 1 result");
 
-    mlir::Location loc = op->getLoc();
-    mlir::Value x = op->getOperand(0);
-    auto xType = mlir::dyn_cast<mlir::RankedTensorType>(x.getType());
-    if (!xType)
-      return rewriter.notifyMatchFailure(op, "ranked tensor required");
-    auto ft = mlir::dyn_cast<mlir::FloatType>(xType.getElementType());
-    if (!ft)
-      return rewriter.notifyMatchFailure(op, "float element type required");
+    mlir::Value input = op->getOperand(0);
+    auto inputType = mlir::dyn_cast<mlir::RankedTensorType>(input.getType());
+    auto resultType =
+        mlir::dyn_cast<mlir::RankedTensorType>(op->getResult(0).getType());
+    if (!inputType || !resultType)
+      return rewriter.notifyMatchFailure(
+          op, "onnx.Swish requires ranked tensor input and result");
+
+    mlir::Type elemType = inputType.getElementType();
+    if (!elemType.isF16() && !elemType.isF32() && !elemType.isBF16() &&
+        !elemType.isF64())
+      return rewriter.notifyMatchFailure(
+          op, "onnx.Swish supports only f16, f32, bf16, and f64");
+    if (inputType != resultType)
+      return rewriter.notifyMatchFailure(
+          op, "onnx.Swish input and result types must match");
 
     auto ctxOrFailure = getContextArg(op, rewriter);
     if (mlir::failed(ctxOrFailure))
       return mlir::failure();
-    mlir::Value context = *ctxOrFailure;
 
-    double alphaVal = 1.0;
+    double alpha = 1.0;
     if (auto attr = op->getAttrOfType<mlir::FloatAttr>("alpha"))
-      alphaVal = attr.getValueAsDouble();
+      alpha = attr.getValueAsDouble();
 
-    auto resultType =
-        mlir::cast<mlir::RankedTensorType>(op->getResult(0).getType());
-    mlir::Value init = createEmptyTensor(rewriter, loc, resultType, x);
-
-    auto alphaAttr = rewriter.getF64FloatAttr(alphaVal);
-    auto hipOp = mlir::hip::SwishOp::create(rewriter, loc, resultType, context,
-                                            x, init, alphaAttr);
-    rewriter.replaceOp(op, hipOp->getResult(0));
+    mlir::Location loc = op->getLoc();
+    mlir::Value init = createEmptyTensor(rewriter, loc, resultType, input);
+    auto swish = mlir::hip::SwishOp::create(rewriter, loc, resultType,
+                                            *ctxOrFailure, input, init,
+                                            rewriter.getF64FloatAttr(alpha));
+    rewriter.replaceOp(op, swish->getResult(0));
     return mlir::success();
   }
 };

@@ -51,10 +51,11 @@ int hipdnn_ep_state_init_with_fs(RuntimeState **out_state, void *fs,
 
   auto *fileSystem = static_cast<morphizen::FileSystem *>(fs);
 #if defined(HIPDNN_EP_REAL_RUNTIME)
-  // LUT loading is independent of constants metadata. Keep it before the
-  // metadata early returns so constant-free models still get lookup-only GQA.
-  (*out_state)->gqa_autotune_policy =
-      hipdnn_ep::gqa_autotune_create(fileSystem);
+  // The GQA autotune table is embedded in custom_kernels_<arch> now, so the
+  // policy is created by an exported DLL shim and no longer needs a FileSystem.
+  // Kept before the metadata early returns so constant-free models still get
+  // lookup-only GQA.
+  (*out_state)->gqa_autotune_policy = hip_gqa_autotune_create();
 #endif
 
   if (!metadata_blob || blob_size == 0) {
@@ -131,8 +132,8 @@ int hipdnn_ep_state_init_with_fs(RuntimeState **out_state, void *fs,
   return 0;
 }
 
-// Shared initialization that brings up HIP device, stream, MIOpen and
-// hipBLASLt handles in a fresh RuntimeState. On any failure the partially
+// Shared initialization that brings up HIP device, stream, and hipBLASLt
+// handles in a fresh RuntimeState. On any failure the partially
 // initialized state is released and a non-zero error code (matching the
 // historical exit codes 1-9) is returned. On success *out_state holds the
 // RuntimeState ready for constants_blob allocation; no constant memory has
@@ -147,7 +148,6 @@ static int initialize_state_handles(RuntimeState **out_state) {
   }
 
   state->stream = nullptr;
-  state->miopen_handle = nullptr;
   state->hipblas_handle = nullptr;
   state->gpu_constants_blob = nullptr;
   state->gpu_constants = nullptr;
@@ -171,6 +171,10 @@ static int initialize_state_handles(RuntimeState **out_state) {
   state->qmoe_scratch_size = 0;
   state->qmoe_host_scratch = nullptr;
   state->qmoe_host_scratch_size = 0;
+  state->qmoe_amd_scratch = nullptr;
+  state->qmoe_amd_scratch_size = 0;
+  state->qmoe_amd_host_scratch = nullptr;
+  state->qmoe_amd_host_scratch_size = 0;
   state->conv_scratch = nullptr;
   state->conv_scratch_size = 0;
   state->matmul_dp4a_scratch = nullptr;
@@ -218,34 +222,13 @@ static int initialize_state_handles(RuntimeState **out_state) {
 
   TIMING_LOG("[Session] hipStreamCreate: %.3fs\n", record_elapsed(t_prev));
 
-  // Skip vendor-handle creation when the vendor BLAS/DNN backends are disabled:
-  // the stubbed miopenCreate/hipblasLtCreate would fail and abort session
-  // creation even for a model that never dispatches a vendor op. Handles stay
-  // null; cleanup is already null-guarded.
+  // Skip vendor-handle creation when hipBLASLt is disabled: the stubbed
+  // hipblasLtCreate would fail and abort session creation even for a model
+  // that never dispatches a vendor GEMM. Handle stays null; cleanup is
+  // already null-guarded.
 #ifndef HIPDNN_EP_DISABLE_VENDOR_BLAS
-  if (miopenCreate(&state->miopen_handle) != miopenStatusSuccess) {
-    fprintf(stderr, "Failed to create MIOpen handle\n");
-    if (state->stream)
-      HIP_CLEANUP(hipStreamDestroy(state->stream));
-    free(state);
-    return 7;
-  }
-
-  if (miopenSetStream(state->miopen_handle, state->stream) !=
-      miopenStatusSuccess) {
-    fprintf(stderr, "Failed to set MIOpen stream\n");
-    miopenDestroy(state->miopen_handle);
-    if (state->stream)
-      HIP_CLEANUP(hipStreamDestroy(state->stream));
-    free(state);
-    return 8;
-  }
-
-  TIMING_LOG("[Session] MIOpen init: %.3fs\n", record_elapsed(t_prev));
-
   if (hipblasLtCreate(&state->hipblas_handle) != HIPBLAS_STATUS_SUCCESS) {
     fprintf(stderr, "Failed to create hipBLASLt handle\n");
-    miopenDestroy(state->miopen_handle);
     if (state->stream)
       HIP_CLEANUP(hipStreamDestroy(state->stream));
     free(state);
@@ -260,8 +243,8 @@ static int initialize_state_handles(RuntimeState **out_state) {
   if (hipMalloc((void **)&state->device_error_flag, sizeof(int)) !=
       hipSuccess) {
     fprintf(stderr, "Failed to allocate device error flag\n");
-    hipblasLtDestroy(state->hipblas_handle);
-    miopenDestroy(state->miopen_handle);
+    if (state->hipblas_handle)
+      hipblasLtDestroy(state->hipblas_handle);
     if (state->stream)
       HIP_CLEANUP(hipStreamDestroy(state->stream));
     free(state);
@@ -272,8 +255,8 @@ static int initialize_state_handles(RuntimeState **out_state) {
     fprintf(stderr, "Failed to initialize device error flag\n");
     HIP_CLEANUP(hipFree(state->device_error_flag));
     state->device_error_flag = nullptr;
-    hipblasLtDestroy(state->hipblas_handle);
-    miopenDestroy(state->miopen_handle);
+    if (state->hipblas_handle)
+      hipblasLtDestroy(state->hipblas_handle);
     if (state->stream)
       HIP_CLEANUP(hipStreamDestroy(state->stream));
     free(state);
@@ -706,7 +689,7 @@ int hipdnn_ep_state_cleanup(RuntimeState *state) {
   // Cleanup in reverse order of initialization (LIFO)
 
 #if defined(HIPDNN_EP_REAL_RUNTIME)
-  hipdnn_ep::gqa_autotune_destroy(state->gqa_autotune_policy);
+  hip_gqa_autotune_destroy(state->gqa_autotune_policy);
   state->gqa_autotune_policy = nullptr;
 #endif
 
@@ -728,7 +711,15 @@ int hipdnn_ep_state_cleanup(RuntimeState *state) {
     HIP_CLEANUP(hipHostFree(state->qmoe_host_scratch));
   }
 
-  // Free the MIOpen convolution workspace pool (if allocated). The stream
+  // Free com.amd qmoe device scratch + pinned host mirror (if allocated)
+  if (state->qmoe_amd_scratch) {
+    HIP_CLEANUP(hipFree(state->qmoe_amd_scratch));
+  }
+  if (state->qmoe_amd_host_scratch) {
+    HIP_CLEANUP(hipHostFree(state->qmoe_amd_host_scratch));
+  }
+
+  // Free the convolution workspace pool (if allocated). The stream
   // sync above has drained any in-flight conv that may still be reading it.
   if (state->conv_scratch) {
     HIP_CLEANUP(hipFree(state->conv_scratch));
@@ -843,11 +834,6 @@ int hipdnn_ep_state_cleanup(RuntimeState *state) {
     hipblasLtDestroy(state->hipblas_handle);
   }
 
-  // Destroy MIOpen handle
-  if (state->miopen_handle) {
-    miopenDestroy(state->miopen_handle);
-  }
-
   // Destroy HIP stream
   if (state->stream) {
     // Stop ABI-fixed helpers (memrefCopy) from reading this stream after it is
@@ -877,10 +863,6 @@ void *hipdnn_ep_constant_get(RuntimeState *state, int64_t index) {
 
 void *hipdnn_ep_state_get_stream(RuntimeState *state) {
   return state ? static_cast<void *>(state->stream) : nullptr;
-}
-
-void *hipdnn_ep_state_get_miopen_handle(RuntimeState *state) {
-  return state ? static_cast<void *>(state->miopen_handle) : nullptr;
 }
 
 void *hipdnn_ep_state_get_hipblas_handle(RuntimeState *state) {
@@ -1346,10 +1328,99 @@ int hipdnn_ep_state_ensure_qmoe_host_scratch(RuntimeState *state,
   return 0;
 }
 
-// MIOpen convolution workspace pool. Same grow-on-demand policy as qmoe_scratch
-// above. Single-buffer reuse is safe because the stream is serialised: the
-// next conv only launches after the previous miopenConvolutionForward (+ bias
-// add) has consumed the workspace.
+//===----------------------------------------------------------------------===//
+// com.amd QMoE (LatentMoE) scratch -- independent from qmoe_scratch
+// above (see runtime_state_internal.h for the rationale). Same grow-on-
+// demand, never-shrink policy and same sync-before-free-on-grow discipline.
+//===----------------------------------------------------------------------===//
+
+void *hipdnn_ep_state_get_qmoe_amd_scratch(RuntimeState *state) {
+  return state ? state->qmoe_amd_scratch : nullptr;
+}
+
+int hipdnn_ep_state_ensure_qmoe_amd_scratch(RuntimeState *state,
+                                            size_t needed_size) {
+  if (!state)
+    return -1;
+  if (needed_size == 0)
+    return 0;
+  if (state->qmoe_amd_scratch_size >= needed_size)
+    return 0;
+
+  size_t alloc_size = needed_size;
+  if (state->qmoe_amd_scratch_size > 0) {
+    size_t grown =
+        state->qmoe_amd_scratch_size + state->qmoe_amd_scratch_size / 2;
+    if (grown > alloc_size)
+      alloc_size = grown;
+  }
+
+  if (state->qmoe_amd_scratch) {
+    if (state->stream) {
+      HIP_CLEANUP(hipStreamSynchronize(state->stream));
+    }
+    HIP_CLEANUP(hipFree(state->qmoe_amd_scratch));
+    state->qmoe_amd_scratch = nullptr;
+    state->qmoe_amd_scratch_size = 0;
+  }
+
+  if (hipMalloc(&state->qmoe_amd_scratch, alloc_size) != hipSuccess) {
+    fprintf(stderr,
+            "hipdnn_ep_state_ensure_qmoe_amd_scratch: hipMalloc failed for "
+            "%zu bytes\n",
+            alloc_size);
+    return -1;
+  }
+  state->qmoe_amd_scratch_size = alloc_size;
+  return 0;
+}
+
+void *hipdnn_ep_state_get_qmoe_amd_host_scratch(RuntimeState *state) {
+  return state ? state->qmoe_amd_host_scratch : nullptr;
+}
+
+int hipdnn_ep_state_ensure_qmoe_amd_host_scratch(RuntimeState *state,
+                                                 size_t needed_size) {
+  if (!state)
+    return -1;
+  if (needed_size == 0)
+    return 0;
+  if (state->qmoe_amd_host_scratch_size >= needed_size)
+    return 0;
+
+  size_t alloc_size = needed_size;
+  if (state->qmoe_amd_host_scratch_size > 0) {
+    size_t grown = state->qmoe_amd_host_scratch_size +
+                   state->qmoe_amd_host_scratch_size / 2;
+    if (grown > alloc_size)
+      alloc_size = grown;
+  }
+
+  if (state->qmoe_amd_host_scratch) {
+    if (state->stream) {
+      HIP_CLEANUP(hipStreamSynchronize(state->stream));
+    }
+    HIP_CLEANUP(hipHostFree(state->qmoe_amd_host_scratch));
+    state->qmoe_amd_host_scratch = nullptr;
+    state->qmoe_amd_host_scratch_size = 0;
+  }
+
+  if (hipHostMalloc(&state->qmoe_amd_host_scratch, alloc_size,
+                    hipHostMallocDefault) != hipSuccess) {
+    fprintf(stderr,
+            "hipdnn_ep_state_ensure_qmoe_amd_host_scratch: hipHostMalloc "
+            "failed for %zu bytes\n",
+            alloc_size);
+    return -1;
+  }
+  state->qmoe_amd_host_scratch_size = alloc_size;
+  return 0;
+}
+
+// Convolution workspace pool. Same grow-on-demand policy as qmoe_scratch
+// above. Currently unused: both convolution directions run on in-tree kernels
+// that need no workspace. Single-buffer reuse is safe because the stream is
+// serialised.
 void *hipdnn_ep_state_get_conv_scratch(RuntimeState *state) {
   return state ? state->conv_scratch : nullptr;
 }

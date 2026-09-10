@@ -14,7 +14,7 @@
 // CHECK-NOT: onnx.Swish
 module {
   func.func @main_graph(%arg0: tensor<3x4xf32> {onnx.name = "x"}) -> (tensor<3x4xf32> {onnx.name = "y"}) {
-    %0 = "onnx.Swish"(%arg0) {alpha = 1.0 : f32, onnx_node_name = "swish_node"} : (tensor<3x4xf32>) -> tensor<3x4xf32>
+    %0 = "onnx.Swish"(%arg0) {alpha = 0.5 : f32, onnx_node_name = "swish_node"} : (tensor<3x4xf32>) -> tensor<3x4xf32>
     "onnx.Return"(%0) : (tensor<3x4xf32>) -> ()
   }
   "onnx.EntryPoint"() {func = @main_graph} : () -> ()

@@ -28,16 +28,45 @@ project(
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
-if(MSVC)
-  if(NOT DEFINED CMAKE_MSVC_RUNTIME_LIBRARY)
-    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
-  elseif(CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL")
-    message(FATAL_ERROR
-      "CMAKE_MSVC_RUNTIME_LIBRARY=${CMAKE_MSVC_RUNTIME_LIBRARY} selects the dynamic "
-      "MSVC runtime; released binaries must link it statically.")
+if(WIN32)
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_C_COMPILER_ID STREQUAL "Clang" )
+    add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:-fms-extensions;-fms-compatibility;-fdelayed-template-parsing>")
   endif()
-  add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/guard:cf>)
+
+  option(USE_BINSKIM_COMPLIANT_COMPILE_FLAGS "Prepare HIP EP for BinSkim Binary Analyzer" ON)
+  option(USE_SPECTRE_MITIGATED_LIBRARIES "Use Spectre-mitigated libraries" OFF)
+
+  if(MSVC AND MSVC_VERSION GREATER_EQUAL 1900)
+    if(USE_BINSKIM_COMPLIANT_COMPILE_FLAGS)
+      message(STATUS "Control Flow Guard enabled")
+      add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/guard:cf>)
+      add_link_options(/guard:cf /DYNAMICBASE)
+    endif()
+    if(USE_SPECTRE_MITIGATED_LIBRARIES)
+      message(STATUS "Using Spectre-mitigated libraries")
+      add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:/Qspectre>)
+    endif()
+  elseif(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    if(USE_BINSKIM_COMPLIANT_COMPILE_FLAGS)
+      message(STATUS "Control Flow Guard enabled (Clang)")
+      add_compile_options("$<$<COMPILE_LANGUAGE:C,CXX>:SHELL:-Xclang -cfguard>")
+      add_link_options(-Wl,-guard:cf)
+    endif()
+    if(USE_SPECTRE_MITIGATED_LIBRARIES)
+      message(WARNING "Spectre mitigated libraries are not yet available for Clang in this project.")
+    endif()
+  endif()
+
+  option(USE_MSVC_STATIC_RUNTIME "Link MSVC runtime library statically" ON)
+
+  if(NOT USE_MSVC_STATIC_RUNTIME)
+    set(MSVC_RUNTIME_SUFFIX "DLL")
+  endif()
+  if(NOT CMAKE_MSVC_RUNTIME_LIBRARY)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>${MSVC_RUNTIME_SUFFIX}")
+  endif()
 endif()
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/VersionInfo.cmake)
@@ -57,15 +86,15 @@ if(MSVC)
 endif()
 
 option(BUILD_MOCK_RUNTIME "Build mock runtime (no GPU required)" ON)
-# Build the REAL runtime without the vendor BLAS/DNN backends (MIOpen + hipBLASLt).
-# The MIOpen/hipBLASLt-backed op wrappers compile to error-returning stubs that
-# preserve their ABI, and the model link + package discovery drop those libraries.
-# For targets whose ROCm distribution lacks a usable MIOpen/hipBLASLt (e.g. a
+# Build the REAL runtime without the vendor BLAS backend (hipBLASLt).
+# The hipBLASLt-backed op wrappers compile to error-returning stubs that
+# preserve their ABI, and the model link + package discovery drop that library.
+# For targets whose ROCm distribution lacks a usable hipBLASLt (e.g. a
 # pre-silicon functional model, or a stripped SDK): the compiler still links and
-# runs; only conv/gemm/hipBLASLt/MIOpen-elementwise ops are unavailable (they
-# fail at runtime with a clear message unless a plugin supplies replacements).
+# runs; only gemm/hipBLASLt ops are unavailable (they fail at runtime with a
+# clear message unless a plugin supplies replacements).
 option(HIPDNN_EP_DISABLE_VENDOR_BLAS
-  "Build the real runtime without MIOpen/hipBLASLt (stub the vendor op wrappers)" OFF)
+  "Build the real runtime without hipBLASLt (stub the vendor op wrappers)" OFF)
 option(BUILD_HIP_UNIT_TESTS "Build and register LIT and E2E tests with CTest" ON)
 option(BUILD_PYTHON_WHEEL "Configure the 'wheel' target that packages the EP as a Python wheel" OFF)
 
@@ -79,13 +108,6 @@ option(BUILD_PYTHON_WHEEL "Configure the 'wheel' target that packages the EP as 
 # Centralized dependency resolution (LLVM/MLIR/LLD, flatbuffers, cpptrace,
 # TheRock, morphizen, ONNX Runtime, protobuf).
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/deps.cmake)
-
-# Which config source GQA sessions take by default. OFF is the offline LUT; ON
-# makes them benchmark on the GPU instead (the pre-LUT behaviour). Both paths are
-# always compiled in and HIPDNN_GQA_AUTOTUNE_MODE overrides per process -- this
-# only moves the default, for harnesses that cannot set an environment variable.
-option(HIPDNN_EP_GQA_AUTOTUNE_ONLINE_DEFAULT
-       "Default GQA sessions to online GPU autotuning instead of the offline LUT" OFF)
 
 option(HIPDNN_EP_LINK_HIP_HOST
        "Link hip::host into the EP DLL (enables HIP host APIs in EP code)" ON)
@@ -102,6 +124,15 @@ if(HIPDNN_EP_LOAD_KERNEL_DLLS AND NOT HIPDNN_EP_LINK_HIP_HOST)
     "HIPDNN_EP_LOAD_KERNEL_DLLS=ON requires HIPDNN_EP_LINK_HIP_HOST=ON "
     "(LlvmIrJit::detectCustomKernelArch needs hipGetDeviceProperties).")
 endif()
+
+# FlatBuffers schemas (HipSchemas). Added here rather than with the other
+# subdirectories below because lib/Runtime/Kernels (next) consumes it:
+# custom_kernels_<arch> compiles the matmul_nbits and gqa autotune resolvers,
+# which include the generated *_autotune_generated.h headers and depend on the
+# HipSchemas target. schemas/ needs only the flatbuffers/flatc that
+# cmake/deps.cmake already resolved above -- no LLVM/MLIR -- so it is safe this
+# early.
+add_subdirectory(schemas)
 
 # Add the GPU kernels subdirectory (lib/Runtime/Kernels) here -- driven from
 # the top-level lists, NOT from lib/Runtime/CMakeLists.txt -- so the per-arch
@@ -153,8 +184,8 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/HipEpPlugins.cmake)
 
 llvm_map_components_to_libnames(llvm_libs Support Core)
 
-# FlatBuffers schemas (GenerateInterface pass metadata)
-add_subdirectory(schemas)
+# (schemas is added earlier, before lib/Runtime/Kernels, which consumes the
+#  matmul_nbits and GQA autotune generated headers.)
 
 # TableGen targets
 add_subdirectory(include/hip)

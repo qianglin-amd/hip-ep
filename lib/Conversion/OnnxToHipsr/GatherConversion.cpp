@@ -39,9 +39,10 @@
 //       : (tensor<2xi64, #hipsr.mem<host>>, tensor<i64>) -> tensor<i64>
 //
 // After, with the region types left out:
-//   %init = hipsr.placeholder(%ctx)
+//   %init = hipsr.placeholder(%ctx) ins(%shape)
 //       {placeholder_type = #hipsr.placeholder_type<normal>}
 //       : tensor<i64, #hipsr.mem<host>> shape_region {
+//   ^bb0(%shape_shape):
 //     %s = shape.const_shape []
 //     hipsr.shape_yield %s
 //   }
@@ -49,7 +50,7 @@
 //   ^bb0(%body_ctx, %in, %dest):
 //     %p = arith.constant 0 : index
 //     %e = tensor.extract %in[%p]
-//     %out = tensor.from_elements %e
+//     %out = tensor.insert %e into %dest[]
 //     hipsr.compute_yield %out
 //   } : tensor<i64, #hipsr.mem<host>>
 //
@@ -155,7 +156,7 @@ void populateHostBody(OpBuilder &builder, ComputeOp computeOp,
   builder.setInsertionPointToStart(body);
 
   // Neighbouring positions share most of their subscripts, and no CSE follows
-  // the hipsr pipeline, so each value gets one constant.
+  // the hipsr pipeline, so reuse one constant per value.
   DenseMap<int64_t, Value> indexConstants;
   auto indexConstant = [&](int64_t index) -> Value {
     Value &constant = indexConstants[index];
@@ -165,15 +166,23 @@ void populateHostBody(OpBuilder &builder, ComputeOp computeOp,
     return constant;
   };
 
+  // `positions` is in row-major order, so the element read for position i goes
+  // to the subscript i delinearizes to. For a 2x2 result:
+  //   %r0 = tensor.insert %e0 into %dest[%c0, %c0]
+  //   %r1 = tensor.insert %e1 into %r0[%c0, %c1]
+  //   %r2 = tensor.insert %e2 into %r1[%c1, %c0]
+  //   %r3 = tensor.insert %e3 into %r2[%c1, %c1]
   Value data = body->getArgument(1);
-  SmallVector<Value> elements =
-      llvm::map_to_vector(positions, [&](ArrayRef<int64_t> position) -> Value {
-        SmallVector<Value> subscript =
-            llvm::map_to_vector(position, indexConstant);
-        return tensor::ExtractOp::create(builder, loc, data, subscript);
-      });
-  Value result =
-      tensor::FromElementsOp::create(builder, loc, resultType, elements);
+  Value result = body->getArguments().back();
+  SmallVector<int64_t> strides = computeSuffixProduct(resultType.getShape());
+  for (auto [linearIndex, position] : llvm::enumerate(positions)) {
+    Value element = tensor::ExtractOp::create(
+        builder, loc, data, llvm::map_to_vector(position, indexConstant));
+    SmallVector<Value> destination = llvm::map_to_vector(
+        delinearize(static_cast<int64_t>(linearIndex), strides), indexConstant);
+    result =
+        tensor::InsertOp::create(builder, loc, element, result, destination);
+  }
   ComputeYieldOp::create(builder, loc, ValueRange{result});
 }
 
@@ -209,9 +218,10 @@ LogicalResult replaceWithHostCompute(onnx::GatherOp op, Value data,
                                        "expected every index within the axis");
   }
 
+  // Constant indices fix the shape; the data is there to match the compute.
   Location loc = op.getLoc();
   auto init = PlaceholderOp::create(rewriter, loc, TypeRange{resultType}, ctx,
-                                    ValueRange{}, PlaceholderType::Normal);
+                                    ValueRange{data}, PlaceholderType::Normal);
   populateHostShapeRegion(rewriter, init, resultType.getShape());
 
   auto computeOp =

@@ -177,6 +177,13 @@ else()
   set(LLVM_ENABLE_RTTI ON CACHE BOOL "" FORCE)
   set(LLVM_ENABLE_ZLIB OFF CACHE BOOL "" FORCE)
   set(LLVM_ENABLE_ZSTD OFF CACHE BOOL "" FORCE)
+  # LLVM auto-enables DIA once it finds the DIA SDK, and DIASupport.h then pulls
+  # atlbase.h from the ATL headers. ATL reaches cl.exe differently per generator:
+  # MSBuild puts atlmfc/include on IncludePath itself, while Ninja takes it from
+  # INCLUDE in the invoking shell -- so the same machine builds from source under
+  # the Visual Studio generator and fails under Ninja. Nothing here reads PDBs,
+  # so drop the dependency rather than constrain how the build is launched.
+  set(LLVM_ENABLE_DIA_SDK OFF CACHE BOOL "" FORCE)
   set(LLVM_INCLUDE_TESTS OFF CACHE BOOL "" FORCE)
   set(LLVM_INCLUDE_EXAMPLES OFF CACHE BOOL "" FORCE)
   set(LLVM_INCLUDE_BENCHMARKS OFF CACHE BOOL "" FORCE)
@@ -306,8 +313,12 @@ set(GLOG_BUILD_SHARED OFF CACHE BOOL "Build glog shared library" FORCE)
 
 # MorphiZen EP build settings, forced before add_subdirectory consumes them.
 set(morphizen_ENABLE_RYZENAI_BIN_METADATA OFF CACHE BOOL "Disable ryzenai_bin_metadata" FORCE)
-set(morphizen_OUTPUT_NAME "hipgpu" CACHE STRING "Set output name" FORCE)
-set(MORPHIZEN_EP_REGISTRATION_NAME "hipgpu" CACHE STRING "EP registration name for ORT" FORCE)
+if(NOT morphizen_OUTPUT_NAME)
+  set(morphizen_OUTPUT_NAME "hipgpu" CACHE STRING "Set output name" FORCE)
+endif()
+if(NOT MORPHIZEN_EP_REGISTRATION_NAME)
+  set(MORPHIZEN_EP_REGISTRATION_NAME "hipgpu" CACHE STRING "EP registration name for ORT" FORCE)
+endif()
 set(MORPHIZEN_JSON_CONFIG_FILE "${CMAKE_CURRENT_SOURCE_DIR}/etc/morphizen_config.json")
 
 # ONNX Runtime resolution (find_package first, official release zip fallback).

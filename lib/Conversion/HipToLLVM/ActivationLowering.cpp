@@ -247,9 +247,7 @@ struct LeakyReluOpLowering : public ConvertOpToLLVMPattern<LeakyReluOp> {
 
 // hip.swish(ctx, input, output)
 //   -> wrap_swish(state, input, output, num_elements, data_type, alpha)
-// Uses custom HIP kernel (hip_swish).
-// Supports static and dynamic shapes (computes num_elements at runtime).
-// Supports data types: f32, f16, f64.
+// Supports static and dynamic shapes and the complete ONNX Swish type set.
 struct SwishOpLowering : public ConvertOpToLLVMPattern<SwishOp> {
   using ConvertOpToLLVMPattern::ConvertOpToLLVMPattern;
 
@@ -275,52 +273,39 @@ struct SwishOpLowering : public ConvertOpToLLVMPattern<SwishOp> {
         extractContiguousMemRefPtr(adaptor.getOutput(), rewriter, loc);
 
     auto outputType = cast<MemRefType>(op.getOutput().getType());
-
-    // Compute num_elements (supports dynamic shapes)
     Value numElements = createI64Const(1);
     MemRefDescriptor outputDesc(adaptor.getOutput());
-
     for (auto dimIdx : llvm::seq<int64_t>(outputType.getRank())) {
-      Value dimSize;
-      if (outputType.isDynamicDim(dimIdx)) {
-        dimSize = outputDesc.size(rewriter, loc, dimIdx);
-      } else {
-        dimSize = createI64Const(outputType.getDimSize(dimIdx));
-      }
+      Value dimSize = outputType.isDynamicDim(dimIdx)
+                          ? outputDesc.size(rewriter, loc, dimIdx)
+                          : createI64Const(outputType.getDimSize(dimIdx));
       numElements = LLVM::MulOp::create(rewriter, loc, numElements, dimSize);
     }
 
     Type elemType = outputType.getElementType();
     int64_t dataType = getHipdnnDataType(elemType);
-
-    if (dataType != 0 && dataType != 1 && dataType != 6) {
+    if (dataType < 0 || (dataType > 2 && dataType != 6)) {
       std::string errorMsg;
       llvm::raw_string_ostream os(errorMsg);
       os << "unsupported element type '" << elemType
-         << "' for Swish. Only f32, f16, and f64 are supported";
+         << "' for Swish. Only f32, f16, bf16, and f64 are supported";
       return rewriter.notifyMatchFailure(op, os.str());
     }
 
     Value dataTypeVal = createI64Const(dataType);
-
-    double alphaVal = op.getAlpha().convertToDouble();
     Value alphaConst = LLVM::ConstantOp::create(
-        rewriter, loc, f64Type, rewriter.getF64FloatAttr(alphaVal));
+        rewriter, loc, f64Type,
+        rewriter.getF64FloatAttr(op.getAlpha().convertToDouble()));
 
-    // int wrap_swish(RuntimeState* state, void* input, void* output,
-    //                int64_t num_elements, int64_t data_type, double alpha)
     SmallVector<Type, 6> paramTypes = {ptrType, ptrType, ptrType,
                                        i64Type, i64Type, f64Type};
-
-    FailureOr<LLVM::LLVMFuncOp> funcOp =
-        LLVM::lookupOrCreateFn(rewriter, module, kWrapSwish, paramTypes,
-                               i32Type);
+    FailureOr<LLVM::LLVMFuncOp> funcOp = LLVM::lookupOrCreateFn(
+        rewriter, module, kWrapSwish, paramTypes, i32Type);
     if (failed(funcOp))
       return failure();
 
     SmallVector<Value, 6> args = {statePtr,    inputPtr,    outputPtr,
                                   numElements, dataTypeVal, alphaConst};
-
     LLVM::CallOp::create(rewriter, loc, *funcOp, args);
     rewriter.eraseOp(op);
     return success();

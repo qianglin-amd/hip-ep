@@ -31,7 +31,6 @@
 // This struct is opaque to generated code (passed as void*)
 struct RuntimeState {
   hipStream_t stream;
-  miopenHandle_t miopen_handle;
   hipblasLtHandle_t hipblas_handle;
 
   // Single allocation holding all constants as one blob.
@@ -117,10 +116,22 @@ struct RuntimeState {
   void *qmoe_host_scratch; // pinned host mirror for D2H of expert idx/weights
   size_t qmoe_host_scratch_size;
 
+  // Per-session scratch for wrap_qmoe_amd (com.amd QMoE / LatentMoE)
+  // transient buffers. Deliberately a SEPARATE field from
+  // qmoe_scratch above -- the two ops are independent pipelines (see
+  // lib/Runtime/real/qmoe_amd.cpp) and must not share a buffer, so growing
+  // one never invalidates offsets computed for the other. Same grow-on-
+  // demand, never-shrink policy as qmoe_scratch; freed in
+  // hipdnn_ep_state_cleanup.
+  void *qmoe_amd_scratch;
+  size_t qmoe_amd_scratch_size;
+  void *qmoe_amd_host_scratch; // pinned host mirror for D2H of expert counts
+  size_t qmoe_amd_host_scratch_size;
+
   // Per-session convolution workspace. Currently allocated by nobody: both
   // convolution directions now run on in-tree kernels (hip_conv,
-  // hip_conv_transpose) that need no workspace at all, and the MIOpen solution
-  // cache that briefly owned one is gone. Kept only because the accessors are
+  // hip_conv_transpose) that need no workspace at all. Kept only because the
+  // accessors are
   // part of the runtime's exported surface. Same grow-on-demand policy as
   // qmoe_scratch above if it is ever wired up again: lazily allocated on first
   // use, never shrinks, freed in hipdnn_ep_state_cleanup.
@@ -164,11 +175,11 @@ struct RuntimeState {
   // multi_head_attention instance owns one in its MhaState op-state slot (see
   // op_states below and docs/design/op-state-slots-design.md).
 
-  // NOTE: the CausalConvWithState MIOpen descriptor + algorithm cache
+  // NOTE: the CausalConvWithState descriptor + algorithm cache
   // (CausalConvCache) formerly lived here as causal_conv_cache, then moved to
   // a per-op-instance CausalConvState op-state slot. It no longer exists at
-  // all: the op runs entirely on custom kernels, so there are no MIOpen
-  // descriptors to cache. See docs/design/op-state-slots-design.md.
+  // all: the op runs entirely on custom kernels. See
+  // docs/design/op-state-slots-design.md.
 
   // Asym zero_points unpack cache (ZpUnpackCache*) used by wrap_qmoe.
   //

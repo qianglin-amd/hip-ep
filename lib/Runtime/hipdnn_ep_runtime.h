@@ -5,6 +5,7 @@
 #ifndef HIP_EP_RUNTIME_H
 #define HIP_EP_RUNTIME_H
 
+#include "hip/datatype_abi.h"
 #include "hipdnn_ep_errors.h"
 #include <stdbool.h>
 #include <stddef.h>
@@ -14,44 +15,26 @@
 extern "C" {
 #endif
 
-//===----------------------------------------------------------------------===//
-// Backend-Independent Data Type Identifiers
-//===----------------------------------------------------------------------===//
-//
-// These are our own values -- do NOT assume they match MIOpen, cuDNN, or any
-// other library's enum. Each backend provides an explicit mapping function
-// (e.g. hipdnn_ep_to_miopen_type in real/elementwise.cpp) to convert these
-// to library-specific types.
-//
-// To add a new type:
-//   1. Add #define here
-//   2. Update hipdnn_ep_datatype_size() and hipdnn_ep_datatype_name()
-//   3. Update compiler mapping getHipdnnDataType() in HipToLLVM.cpp
-//   4. Update each backend mapping function
-//===----------------------------------------------------------------------===//
-
-#define HIPDNN_EP_DATATYPE_FLOAT 0    // f32, 4 bytes
-#define HIPDNN_EP_DATATYPE_HALF 1     // f16, 2 bytes
-#define HIPDNN_EP_DATATYPE_BFLOAT16 2 // bf16, 2 bytes
-#define HIPDNN_EP_DATATYPE_INT32 3    // i32, 4 bytes
-#define HIPDNN_EP_DATATYPE_INT64 4    // i64, 8 bytes
-#define HIPDNN_EP_DATATYPE_INT8 5     // i8, 1 byte
-#define HIPDNN_EP_DATATYPE_DOUBLE 6   // f64, 8 bytes
-#define HIPDNN_EP_DATATYPE_UINT8 7    // ui8, 1 byte
-#define HIPDNN_EP_DATATYPE_INT16 8    // i16, 2 byte
+// The HIPDNN_EP_DATATYPE_* identifiers come from hip/datatype_abi.h, which the
+// compiler includes as well so neither side can redefine a value on its own.
 
 //===----------------------------------------------------------------------===//
 // Backend-Independent Tensor Operation Identifiers
 //===----------------------------------------------------------------------===//
 //
 // Same design as data types above -- our own values, mapped explicitly to
-// library-specific ops in each backend (e.g. miopenTensorOpMul).
+// library-specific ops in each backend.
 //===----------------------------------------------------------------------===//
 
 #define HIPDNN_EP_TENSOR_OP_MUL 0 // element-wise multiply
 #define HIPDNN_EP_TENSOR_OP_ADD 1 // element-wise add
 #define HIPDNN_EP_TENSOR_OP_MIN 2 // element-wise min
 #define HIPDNN_EP_TENSOR_OP_MAX 3 // element-wise max
+
+// Must match HipdnnQElementwiseKind in
+// lib/Conversion/HipToLLVM/HipToLLVMUtils.h
+#define HIPDNN_EP_QELEMENTWISE_ADD 0
+#define HIPDNN_EP_QELEMENTWISE_MUL 1
 
 static inline const char *hipdnn_ep_tensor_op_name(int64_t op) {
   switch (op) {
@@ -65,6 +48,17 @@ static inline const char *hipdnn_ep_tensor_op_name(int64_t op) {
     return "max";
   default:
     return "unknown";
+  }
+}
+
+static inline const char *hipdnn_ep_qelementwise_kind_name(int64_t kind) {
+  switch (kind) {
+  case HIPDNN_EP_QELEMENTWISE_ADD:
+    return "qadd";
+  case HIPDNN_EP_QELEMENTWISE_MUL:
+    return "qmul";
+  default:
+    return "qelementwise_unknown";
   }
 }
 
@@ -87,6 +81,8 @@ static inline int64_t hipdnn_ep_datatype_size(int64_t data_type) {
   case HIPDNN_EP_DATATYPE_DOUBLE:
     return 8;
   case HIPDNN_EP_DATATYPE_INT16:
+    return 2;
+  case HIPDNN_EP_DATATYPE_UINT16:
     return 2;
   default:
     return -1;
@@ -113,6 +109,8 @@ static inline const char *hipdnn_ep_datatype_name(int64_t data_type) {
     return "f64";
   case HIPDNN_EP_DATATYPE_INT16:
     return "i16";
+  case HIPDNN_EP_DATATYPE_UINT16:
+    return "ui16";
   default:
     return "unknown";
   }
@@ -286,11 +284,6 @@ HIPDNN_EP_RT_EXPORT void *hipdnn_ep_get_current_stream(void);
 // tls_stream.cpp alongside the getter.
 HIPDNN_EP_RT_EXPORT void hipdnn_ep_set_current_stream(void *stream);
 
-// Get MIOpen handle from state (for MIOpen operations)
-// Returns: miopenHandle_t cast to void* (NULL on error)
-// Ownership: Caller does NOT own handle (destroyed in cleanup)
-void *hipdnn_ep_state_get_miopen_handle(RuntimeState *state);
-
 // Get hipBLASLt handle from state (for GEMM operations)
 // Returns: hipblasLtHandle_t cast to void* (NULL on error)
 // Ownership: Caller does NOT own handle (destroyed in cleanup)
@@ -353,6 +346,17 @@ int hipdnn_ep_state_ensure_qmoe_scratch(RuntimeState *state,
 void *hipdnn_ep_state_get_qmoe_host_scratch(RuntimeState *state);
 int hipdnn_ep_state_ensure_qmoe_host_scratch(RuntimeState *state,
                                              size_t needed_size);
+
+// Per-session scratch for wrap_qmoe_amd (com.amd QMoE / LatentMoE)
+// transient buffers. Independent from the qmoe_scratch pair
+// above -- see runtime_state_internal.h for why the two ops do not share a
+// buffer. Same grow-on-demand, never-shrink policy.
+void *hipdnn_ep_state_get_qmoe_amd_scratch(RuntimeState *state);
+int hipdnn_ep_state_ensure_qmoe_amd_scratch(RuntimeState *state,
+                                            size_t needed_size);
+void *hipdnn_ep_state_get_qmoe_amd_host_scratch(RuntimeState *state);
+int hipdnn_ep_state_ensure_qmoe_amd_host_scratch(RuntimeState *state,
+                                                 size_t needed_size);
 
 // Per-session convolution workspace pool. No wrapper allocates from it today
 // -- MIOpen's Find API owns its own per-problem workspace, and forward Conv
@@ -842,7 +846,15 @@ int wrap_group_query_attention(
     // Shape values (6)
     int64_t batch_size, int64_t seq_len_q, int64_t seq_len_kv,
     int64_t past_buf_seq, int64_t head_dim, int64_t element_size_bytes,
-    int64_t attn_bias_batch, int64_t attn_bias_num_heads);
+    int64_t attn_bias_batch, int64_t attn_bias_num_heads,
+    // Layout of the key/value operands: 0 = rank-3 BSHD [B, S, G*d] (the
+    // onnx.Attention and GroupQueryAttention lowerings), 1 = rank-4 BNSD
+    // [B, G, S, d] (the MultiHeadAttention cross-attn lowering, which forwards
+    // the encoder KV untouched). Only consulted on the bidirectional no-past
+    // path, where key/value are the full Skv-length KV and must be staged into
+    // the BNSD present cache: BSHD and BNSD coincide only at G == 1, so the
+    // layout cannot be inferred from the shapes.
+    int64_t kv_bnsd);
 
 // MultiHeadAttention operation wrapper (com.microsoft.MultiHeadAttention v1).
 // Called by generated IR for onnx.Custom(MultiHeadAttention) lowering.
@@ -909,6 +921,77 @@ int wrap_elementwise_sub(RuntimeState *state, void *lhs, void *rhs,
                          int64_t out_n, int64_t out_c, int64_t out_h,
                          int64_t out_w, int64_t data_type);
 
+// Quantized element-wise wrapper (NumPy-style multidirectional broadcasting,
+// arbitrary rank). `kind` selects the operation (HIPDNN_EP_QELEMENTWISE_*).
+//
+// Each operand carries its own (shape, rank) pair: the shape array holds
+// `rank` i64 dims in row-major order. Operand shapes are left-padded with 1s
+// up to `out_rank`, and dims of 1 broadcast against the output dim.
+//
+// lhs/rhs/output are quantized buffers of `data_type`.
+//
+// The coefficients are folded by lowering and their meaning depends on `kind`,
+// because a product of dequantized operands also multiplies their scales:
+//   ADD: M_a = s_a / s_out, M_b = s_b / s_out
+//   MUL: M_a = s_a * s_b / s_out, M_b unused (lowering passes 1.0f)
+int wrap_qelementwise(RuntimeState *state, void *lhs, void *rhs, void *output,
+                      int64_t kind, const int64_t *lhs_shape, int64_t lhs_rank,
+                      const int64_t *rhs_shape, int64_t rhs_rank,
+                      const int64_t *out_shape, int64_t out_rank,
+                      int64_t data_type, float M_a, int64_t lhs_zp, float M_b,
+                      int64_t rhs_zp, int64_t output_zp);
+
+// Quantized batched matmul wrapper: the integer-domain form of the fused
+// DequantizeLinear x2 -> MatMul -> QuantizeLinear chain.
+//
+//   A: [batch_count x M x K], B: [K x N] (broadcast when b_batch_stride == 0)
+//      or [batch_count x K x N], Y: [batch_count x M x N], all row-major.
+//
+// With acc[m,n] = sum_k A[m,k]*B[k,n], rowA[m] = sum_k A[m,k] and
+// colB[n] = sum_k B[k,n], all exact in int32:
+//
+//   Y = saturate(round(M_scale * (acc - B_zp*rowA - A_zp*colB + K*A_zp*B_zp))
+//                + Y_zp)
+int wrap_qmatmul(RuntimeState *state, const void *A, const void *B, void *Y,
+                 int64_t M, int64_t N, int64_t K, int64_t batch_count,
+                 int64_t b_batch_stride, int64_t trans_a, int64_t trans_b,
+                 int64_t a_data_type, int64_t b_data_type, int64_t y_data_type,
+                 float M_scale, int64_t A_zero_point, int64_t B_zero_point,
+                 int64_t Y_zero_point);
+
+// Fused quantized 1x1 convolution: Q(Conv(DQ(input), DQ(weights))) with the
+// weights never leaving their packed 4-bit form. See QConvLowering.cpp.
+//
+// The geometry is fixed by construction -- 1x1 kernel, unit stride, unit
+// dilation, no padding, no grouping -- which makes the convolution one dot
+// product per output position down the channel axis, i.e. a GEMM with
+// M = out_channels, K = in_channels, N = spatial_size. That is why no per-axis
+// extents appear here the way they do in wrap_conv: every one of them would be
+// a constant 1 or 0. `spatial_size` is the product of the output spatial dims,
+// and unit stride with no padding makes the input's identical.
+//
+// Activation quantization is per-tensor, so input_scale/zp and output_scale/zp
+// are scalars. Weight quantization is per OUTPUT CHANNEL, so weight_scales and
+// weight_zero_points are device arrays of one value each per output channel --
+// they cannot fold into scalars, and on a real model they arrive as external
+// constants whose values are not even known at compile time.
+//
+// weights and weight_zero_points carry their LOGICAL element counts with an
+// 8-bit element type; weight_bits == 4 means each byte holds two values, low
+// nibble first. weight_dtype's signedness decides how a nibble widens.
+//
+// activation_dtype: HIPDNN_EP_DATATYPE_UINT16 (input and output).
+// weight_dtype: HIPDNN_EP_DATATYPE_INT8 / UINT8 (storage of both weight
+// arrays). bias is nullable; bias_dtype is meaningful only when it is non-null
+// and is HIPDNN_EP_DATATYPE_UNSUPPORTED otherwise, meaning "no bias type".
+int wrap_qconv(RuntimeState *state, const void *input, const void *weights,
+               const void *weight_scales, const void *weight_zero_points,
+               const void *bias, void *output, int64_t batch,
+               int64_t in_channels, int64_t out_channels, int64_t spatial_size,
+               int64_t activation_dtype, int64_t weight_dtype,
+               int64_t weight_bits, int64_t bias_dtype, float input_scale,
+               int64_t input_zp, float output_scale, int64_t output_zp);
+
 // Element-wise Where wrapper (NumPy-style multidirectional broadcasting,
 // arbitrary rank). Computes output[i] = condition[i] ? x[i] : y[i] with
 // per-operand broadcasting.
@@ -928,14 +1011,11 @@ int wrap_where(RuntimeState *state, void *condition, void *x, void *y,
                int64_t data_type);
 
 // Unified power entry: output = f(input; alpha, beta, gamma).
-// alpha, beta, gamma match the MIOpen POWER activation tuple where the
-// MIOpen path is used. data_type is HIPDNN_EP_DATATYPE_* (FLOAT=0, HALF=1,
-// BFLOAT16=2).
+// data_type is HIPDNN_EP_DATATYPE_* (FLOAT=0, HALF=1, BFLOAT16=2).
 //
 // LLVM lowering always calls this symbol. For (0, 1, -1) and (0, 1, 0.5) the
 // runtime uses HIP elementwise reciprocal and sqrt kernels (ONNX semantics).
-// Other (alpha, beta, gamma) tuples use miopenActivationPOWER /
-// miopenActivationForward.
+// Other (alpha, beta, gamma) tuples are unsupported.
 int wrap_power(RuntimeState *state, void *input, void *output,
                int64_t num_elements, int64_t data_type, double alpha,
                double beta, double gamma);
@@ -1090,8 +1170,8 @@ int wrap_leaky_relu(RuntimeState *state, void *input, void *output,
                     int64_t num_elements, int64_t data_type, double alpha);
 
 // Swish activation wrapper (uses custom HIP kernel).
-// data_type: HIPDNN_EP_DATATYPE_* (supports FLOAT, HALF, DOUBLE)
-// alpha: sigmoid gain (default 1.0 per ONNX spec, which makes this SiLU)
+// data_type: HIPDNN_EP_DATATYPE_* (supports FLOAT, HALF, BFLOAT16, DOUBLE)
+// alpha: sigmoid input scale (default 1.0 per ONNX spec)
 int wrap_swish(RuntimeState *state, void *input, void *output,
                int64_t num_elements, int64_t data_type, double alpha);
 
@@ -1173,10 +1253,13 @@ int wrap_rotary_embedding(RuntimeState *state, void *input, void *position_ids,
                           int64_t element_size_bytes, int64_t is_bnsh);
 
 // SimplifiedLayerNormalization / RMSNormalization operation wrapper
+// norm_num_elements is the reduction width the lowering derived from `axis`
+// (the product of the input dims from `axis` on). It is independent of
+// scale_num_elements, which may cover several rows for a grouped norm.
 int wrap_rms_norm(RuntimeState *state, void *input, void *scale, void *output,
                   int64_t input_num_elements, int64_t scale_num_elements,
-                  int64_t element_size_bytes, int64_t axis, float epsilon,
-                  int64_t stash_type);
+                  int64_t norm_num_elements, int64_t element_size_bytes,
+                  int64_t axis, float epsilon, int64_t stash_type);
 
 // LayerNormalization operation wrapper (standard ONNX opset 17+)
 // bias, mean, inv_std may be nullptr when optional inputs/outputs are absent
@@ -1257,6 +1340,78 @@ int wrap_gather_block_quantized(
     int64_t indices_dtype, // INT32 / INT64
     int64_t scales_dtype); // FLOAT / HALF / BFLOAT16
 
+// QuantizeLinear / DequantizeLinear wrappers (ONNX opset 23).
+//
+//   quantize:   output = saturate((input / scale) + zero_point)
+//   dequantize: output = (input - zero_point) * scale
+//
+// Output is elementwise the same shape as input, so only `input_shape` is
+// passed. `scale_shape` plus `axis` / `block_size` select the granularity:
+//   scale_rank == 0 (or a single element) .... per-tensor
+//   scale_rank == 1 .......................... per-axis along `axis`
+//   block_size > 0 ........................... blocked along `axis`
+// `zero_point` is nullable; when null the zero point is 0 (symmetric).
+// Its element type matches `output` for quantize and `input` for
+// dequantize, so it needs no dtype parameter of its own.
+//
+// The ONNX `output_dtype` attribute is not forwarded. The importer maps each
+// ONNX element type to a distinct MLIR type (UINT8 -> ui8, INT8 -> i8,
+// UINT16 -> ui16, INT16 -> i16), so `output_dtype` below -- derived from the
+// output memref -- already carries it. That equivalence only holds for the
+// 8/16-bit integer types; a float8 output would need the attribute back.
+//
+// INT4 / UINT4 breaks it in the other direction: both import as i8 / ui8, so
+// the dtype keeps the signedness but loses the width. Each side therefore
+// takes an explicit bit width for its quantized end -- `output_bits` for
+// quantize, `input_bits` for dequantize.
+//
+// `saturate` is carried across this boundary but goes no further: the
+// custom-kernel entry point does not take it, because it only applies to
+// float8 targets and the range clamp for every supported integer target is
+// unconditional. Keeping it here preserves the attribute for a future float8
+// path without letting the kernel branch on something inert.
+//
+// `precision` and `saturate` only exist on QuantizeLinear per the ONNX spec,
+// so both are absent from the dequantize signature.
+int wrap_quantize_linear(
+    RuntimeState *state,
+    const void *input,      // high precision (T1)
+    const void *scale,      // T2
+    const void *zero_point, // (nullable) same type as output
+    void *output,           // quantized (T3); packed when output_bits == 4
+    const int64_t *input_shape, int64_t input_rank, const int64_t *scale_shape,
+    int64_t scale_rank,
+    int64_t axis,       // may be negative; normalized by the wrapper
+    int64_t block_size, // 0 = not blocked
+    int64_t precision,  // 0 = take the scale's precision
+    int64_t saturate,   // float8 only; not forwarded to the kernel
+    int64_t input_dtype, int64_t scale_dtype, int64_t output_dtype,
+    // Value width of `output` and `zero_point`: 8 or 16 to match
+    // output_dtype, or 4 for ONNX INT4/UINT4. At 4 the dtype supplies only
+    // the signedness, `zero_point` is packed, and only the first
+    // ceil(numel/2) bytes of `output` are written -- two values per byte, low
+    // nibble first. The caller still sizes that buffer by the logical element
+    // count, so its upper half is left untouched. `input_shape` stays logical.
+    int64_t output_bits);
+
+int wrap_dequantize_linear(
+    RuntimeState *state,
+    const void *input,      // quantized (T1); packed when input_bits == 4
+    const void *scale,      // T2
+    const void *zero_point, // (nullable) same type as input
+    void *output,           // high precision (T3)
+    const int64_t *input_shape, int64_t input_rank, const int64_t *scale_shape,
+    int64_t scale_rank,
+    int64_t axis,       // may be negative; normalized by the wrapper
+    int64_t block_size, // 0 = not blocked
+    int64_t input_dtype, int64_t scale_dtype, int64_t output_dtype,
+    // Value width of `input` and `zero_point`: 8 or 16 to match input_dtype,
+    // or 4 for ONNX INT4/UINT4. At 4 the dtype supplies only the signedness
+    // and both buffers hold ceil(numel/2) bytes, two values per byte, low
+    // nibble first, over the flattened row-major sequence. `input_shape`
+    // stays logical either way.
+    int64_t input_bits);
+
 // QMoE operation wrapper (quantized Mixture-of-Experts)
 // Routes tokens to top-k experts, performs quantized MLP per expert,
 // applies activation (e.g. SwiGLU), and combines results.
@@ -1285,6 +1440,53 @@ int wrap_qmoe(
     int64_t activation_type, // 0=relu,1=gelu,2=silu,3=swiglu,4=identity
     float activation_alpha, float activation_beta, float swiglu_limit,
     int64_t normalize_routing_weights, int64_t elem_size);
+
+// com.amd QMoE operation wrapper (LatentMoE).
+//
+// Independent pipeline from wrap_qmoe above (com.microsoft QMoE): sigmoid +
+// correction-bias routing (vs softmax), relu2 activation (vs SwiGLU), and a
+// mandatory latent projection + shared-expert branch. Shares only the
+// generic int4 GEMM / gather / bucket / scatter sub-kernels, not any code
+// path in lib/Runtime/real/qmoe.cpp. Hip_QMoEAmdOp in
+// include/hip/Dialect/IR/HipOps.td carries the full op semantics.
+//
+// activation_type / routing_type use the HIPDNN_EP_QMOE_AMD_* identifiers
+// below. Only relu2 and sigmoid are implemented; any other value is rejected
+// rather than silently computed as relu2/sigmoid.
+//
+// All 15 inputs are required (no optional operands, unlike wrap_qmoe).
+// Weight packing matches MatMulNBits convention: uint8 packed int4,
+// dequantized = (quantized - 8) * scale, always symmetric (no zero_points
+// input for this op).
+#define HIPDNN_EP_QMOE_AMD_ACTIVATION_RELU2 0
+#define HIPDNN_EP_QMOE_AMD_ROUTING_SIGMOID 0
+
+int wrap_qmoe_amd(
+    RuntimeState *state,
+    const void *hidden_states,       // [num_tokens, hidden_size]
+    const void *fc1_experts_weights, // [num_experts, moe_inter, latent/pack]
+    const void *fc1_experts_scales,  // [num_experts, moe_inter, latent/bs]
+    const void *fc2_experts_weights, // [num_experts, latent, moe_inter/pack]
+    const void *fc2_experts_scales,  // [num_experts, latent, moe_inter/bs]
+    const void *fc1_latent_weights,  // [latent, hidden/pack]
+    const void *fc1_latent_scales,   // [latent, hidden/bs]
+    const void *fc2_latent_weights,  // [hidden, latent/pack]
+    const void *fc2_latent_scales,   // [hidden, latent/bs]
+    const void *shared_fc1_weights,  // [shared_inter, hidden/pack]
+    const void *shared_fc1_scales,   // [shared_inter, hidden/bs]
+    const void *shared_fc2_weights,  // [hidden, shared_inter/pack]
+    const void *shared_fc2_scales,   // [hidden, shared_inter/bs]
+    const void *router_weight,       // [hidden, num_experts], dense/unquantized
+    const void *correction_bias,     // [num_experts]
+    void *output,                    // [num_tokens, hidden_size]
+    int64_t num_tokens, int64_t hidden_size, int64_t latent_size,
+    int64_t moe_intermediate_size, int64_t shared_intermediate_size,
+    int64_t num_experts, int64_t k, int64_t expert_weight_bits,
+    int64_t block_size, int64_t normalize_routing_weights,
+    int64_t use_correction_bias, float routed_scaling_factor,
+    int64_t activation_type, // HIPDNN_EP_QMOE_AMD_ACTIVATION_*
+    int64_t routing_type,    // HIPDNN_EP_QMOE_AMD_ROUTING_*
+    int64_t elem_size);
 
 // CausalConvWithState operation wrapper (stateful causal depthwise convolution)
 // Used by Gated DeltaNet (Qwen3.5) and Mamba models.
@@ -1466,6 +1668,8 @@ int wrap_round(RuntimeState *state, void *input, void *output,
                int64_t num_elements, int64_t data_type);
 int wrap_atan(RuntimeState *state, void *input, void *output,
               int64_t num_elements, int64_t data_type);
+int wrap_floor(RuntimeState *state, void *input, void *output,
+               int64_t num_elements, int64_t data_type);
 int wrap_exp(RuntimeState *state, void *input, void *output,
              int64_t num_elements, int64_t data_type);
 int wrap_sigmoid(RuntimeState *state, void *input, void *output,

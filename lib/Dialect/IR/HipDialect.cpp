@@ -200,7 +200,12 @@ LogicalResult ConstantOp::verify() {
   int64_t size = getSizeAttr().getInt();
   if (size <= 0)
     return emitOpError("external source `size` must be positive");
-  if (size != expectedBytes)
+  // A 4-bit initializer with no MLIR element type is carried as an 8-bit result
+  // of the logical element count while its buffer holds only ceil(n/2) packed
+  // bytes (two values per byte); accept that half-size external source.
+  int64_t packedBytes = (numElements + 1) / 2;
+  bool isPacked4Bit = elementBits == 8 && size == packedBytes;
+  if (size != expectedBytes && !isPacked4Bit)
     return emitOpError("external source byte size ")
            << size << " does not match result byte size " << expectedBytes;
 
@@ -638,6 +643,45 @@ void ConvTransposeOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// QAddOp: ins(lhs, rhs), outs(output)
+// Quantized elementwise add with integrated QDQ scales and zero points
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange QAddOp::getDpsInitsMutable() { return getOutputMutable(); }
+
+void QAddOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+//===----------------------------------------------------------------------===//
+// QMulOp: ins(lhs, rhs), outs(output)
+// Quantized elementwise mul with integrated QDQ scales and zero points
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange QMulOp::getDpsInitsMutable() { return getOutputMutable(); }
+
+void QMulOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+//===----------------------------------------------------------------------===//
+// QConvOp: quantized ins(input, weights, scales, zero-points, [bias]),
+// outs(output)
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange QConvOp::getDpsInitsMutable() { return getOutputMutable(); }
+
+void QConvOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+//===----------------------------------------------------------------------===//
 // HipblasltMatmulOp: ins(A, B), outs(C)
 //===----------------------------------------------------------------------===//
 
@@ -692,6 +736,38 @@ LogicalResult MatmulOp::verify() {
 // `MatmulOp::reifyResultShapes` lives in
 // `lib/Dialect/IR/HipReifyResultShapesImpl.cpp`. See the header banner in
 // that file and `docs/design/hip-shape-inference.md` for the rationale.
+
+//===----------------------------------------------------------------------===//
+// QMatMulOp: ins(A, B), outs(Y)
+// Quantized matrix multiplication with integrated QDQ scales and zero points
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange QMatMulOp::getDpsInitsMutable() { return getYMutable(); }
+
+void QMatMulOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+LogicalResult QMatMulOp::verify() {
+  if (failed(verifyDpsComputeOp(*this, {getA(), getB(), getY()},
+                                /*numInits=*/1)))
+    return failure();
+
+  return mlir::hip::verifyHipOpShape(
+      *this, [&]() -> SmallVector<SmallVector<int64_t>> {
+        SmallVector<int64_t> outShape = mlir::hip::inferMatmulShape(
+            getShapeOf(getA()), getShapeOf(getB()),
+            [&]() { return this->emitOpError(); }, getTransA(), getTransB());
+        if (outShape.empty())
+          return {};
+        return {std::move(outShape)};
+      });
+}
+
+// `QMatMulOp::reifyResultShapes` lives in
+// `lib/Dialect/IR/HipReifyResultShapesImpl.cpp`.
 
 //===----------------------------------------------------------------------===//
 // RmsNormOp: ins(input, scale), outs(output)
@@ -1474,6 +1550,20 @@ void QMoEOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// QMoEAmdOp
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange QMoEAmdOp::getDpsInitsMutable() {
+  return getOutputMutable();
+}
+
+void QMoEAmdOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+//===----------------------------------------------------------------------===//
 // GatherBlockQuantizedOp: ins(data, indices, scales, [zero_points])
 //                          outs(output)
 //===----------------------------------------------------------------------===//
@@ -1911,6 +2001,18 @@ void AtanOp::getEffects(
 }
 
 //===----------------------------------------------------------------------===//
+// FloorOp: ins(x), outs(y)
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange FloorOp::getDpsInitsMutable() { return getYMutable(); }
+
+void FloorOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+//===----------------------------------------------------------------------===//
 // ExpOp: ins(x), outs(y)
 //===----------------------------------------------------------------------===//
 
@@ -2126,6 +2228,34 @@ void ReadbackScalarOp::getEffects(
 MutableOperandRange SizeOp::getDpsInitsMutable() { return getYMutable(); }
 
 void SizeOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+//===----------------------------------------------------------------------===//
+// QuantizeLinearOp: ins(x, scale, zero_point), outs(y)
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange QuantizeLinearOp::getDpsInitsMutable() {
+  return getOutputMutable();
+}
+
+void QuantizeLinearOp::getEffects(
+    SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
+        &effects) {
+  emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);
+}
+
+//===----------------------------------------------------------------------===//
+// DequantizeLinearOp: ins(x, scale, zero_point), outs(y)
+//===----------------------------------------------------------------------===//
+
+MutableOperandRange DequantizeLinearOp::getDpsInitsMutable() {
+  return getOutputMutable();
+}
+
+void DequantizeLinearOp::getEffects(
     SmallVectorImpl<SideEffects::EffectInstance<MemoryEffects::Effect>>
         &effects) {
   emitDpsMemoryEffects(getDpsInputOperands(), getDpsInitsMutable(), effects);

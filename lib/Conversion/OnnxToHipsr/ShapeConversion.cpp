@@ -24,8 +24,10 @@
 //
 // After:
 //   %init = hipsr.placeholder(%ctx)
+//       ins(%x : tensor<?x128xf16, #hipsr.mem<device>>)
 //       {placeholder_type = #hipsr.placeholder_type<normal>}
 //       : tensor<2xi64, #hipsr.mem<host>> shape_region {
+//   ^bb0(%x_shape: !shape.shape):
 //     %c2 = arith.constant 2 : index
 //     %shape = shape.from_extents %c2 : index
 //     hipsr.shape_yield %shape : !shape.shape
@@ -37,9 +39,12 @@
 //     %c0 = arith.constant 0 : index
 //     %d0 = tensor.dim %in, %c0 : tensor<?x128xf16, #hipsr.mem<device>>
 //     %e0 = arith.index_cast %d0 : index to i64
+//     %p0 = arith.constant 0 : index
+//     %s0 = tensor.insert %e0 into %dest[%p0] : tensor<2xi64, #hipsr.mem<host>>
 //     %e1 = arith.constant 128 : i64
-//     %shape = tensor.from_elements %e0, %e1 : tensor<2xi64, #hipsr.mem<host>>
-//     hipsr.compute_yield %shape : tensor<2xi64, #hipsr.mem<host>>
+//     %c1 = arith.constant 1 : index
+//     %s1 = tensor.insert %e1 into %s0[%c1] : tensor<2xi64, #hipsr.mem<host>>
+//     hipsr.compute_yield %s1 : tensor<2xi64, #hipsr.mem<host>>
 //   } : tensor<2xi64, #hipsr.mem<host>>
 //
 //===----------------------------------------------------------------------===//
@@ -106,9 +111,10 @@ void populateShapeRegion(OpBuilder &builder, PlaceholderOp placeholder,
 }
 
 // A static axis becomes a constant, so only a dynamic one needs a tensor.dim.
+// The extents go into %dest so that the result and the init end up as one
+// buffer; yielding a fresh tensor would leave the init holding nothing.
 void populateComputeBody(OpBuilder &builder, ComputeOp computeOp,
-                         RankedTensorType inputType,
-                         RankedTensorType extentsType, int64_t start,
+                         RankedTensorType inputType, int64_t start,
                          int64_t end) {
   OpBuilder::InsertionGuard guard(builder);
   Location loc = computeOp.getLoc();
@@ -130,11 +136,14 @@ void populateComputeBody(OpBuilder &builder, ComputeOp computeOp,
     Value dim = tensor::DimOp::create(builder, loc, input, axis);
     return arith::IndexCastOp::create(builder, loc, builder.getI64Type(), dim);
   };
-  SmallVector<Value> extents =
-      llvm::map_to_vector(llvm::seq(start, end), extentOf);
 
-  Value shape =
-      tensor::FromElementsOp::create(builder, loc, extentsType, extents);
+  Value shape = body->getArguments().back();
+  for (int64_t axis : llvm::seq(start, end)) {
+    Value extent = extentOf(axis);
+    Value subscript =
+        arith::ConstantIndexOp::create(builder, loc, axis - start);
+    shape = tensor::InsertOp::create(builder, loc, extent, shape, subscript);
+  }
   ComputeYieldOp::create(builder, loc, ValueRange{shape});
 }
 
@@ -185,17 +194,18 @@ struct ShapeToHipsr : public OpConversionPattern<onnx::ShapeOp> {
       return failure();
     }
 
+    // The extent count fixes the shape; the input is there to match the
+    // compute.
     Location loc = op.getLoc();
     auto init =
         PlaceholderOp::create(rewriter, loc, TypeRange{extentsType}, *ctx,
-                              ValueRange{}, PlaceholderType::Normal);
+                              ValueRange{input}, PlaceholderType::Normal);
     populateShapeRegion(rewriter, init, extentsType.getDimSize(0));
 
     auto computeOp =
         ComputeOp::create(rewriter, loc, TypeRange{extentsType}, *ctx,
                           ValueRange{input}, ValueRange{init.getResult(0)});
-    populateComputeBody(rewriter, computeOp, inputType, extentsType, start,
-                        end);
+    populateComputeBody(rewriter, computeOp, inputType, start, end);
 
     rewriter.replaceOp(op, computeOp.getResult(0));
     return success();

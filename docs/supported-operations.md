@@ -24,6 +24,7 @@ The conversion registrations in `lib/Conversion/OnnxToHip/OnnxToHip.cpp` and the
 | Tanh | Custom HIP kernel |
 | Softplus | Custom HIP kernel (f32/f16) |
 | Gelu | Custom HIP kernel |
+| Swish | Custom HIP kernel |
 | BiasGelu (`com.microsoft`) | Custom HIP kernel |
 | FastGelu (`com.microsoft`) | Custom HIP kernel |
 | Reciprocal | Custom HIP kernel |
@@ -36,6 +37,7 @@ The conversion registrations in `lib/Conversion/OnnxToHip/OnnxToHip.cpp` and the
 | CastLike | Simplified to Cast |
 | Ceil | Custom HIP kernel |
 | Round | Custom HIP kernel |
+| Floor | Custom HIP kernel |
 | Neg | Custom HIP kernel |
 | Equal | Custom HIP kernel |
 | Not | Custom HIP kernel |
@@ -92,6 +94,8 @@ The conversion registrations in `lib/Conversion/OnnxToHip/OnnxToHip.cpp` and the
 | MatMulNBits (`com.microsoft`) | Custom HIP kernel. Zero-points must be packed uint8 or float16; float32 zero-points are rejected during conversion. `bits` 3 and 8 additionally require packed uint8. `bits` 2 and 4 accept either, which is what exports with a fractional zero-point (symmetric codebooks such as `{-1.5, -0.5, +0.5, +1.5}`) need; on `bits=2` a float16 zero-point uses the dequant-then-GEMM path because the fused WMMA decode reads uint8 zero-points directly |
 | QMoE (`com.microsoft`) | Custom HIP kernel. Requires `swiglu_fusion=1`; the unfused `fc3_*` operands are rejected. The optional `router_weights` input is honoured: expert selection then reads `router_probs` while the mixing weights are gathered from `router_weights` at the selected indices |
 | GatherBlockQuantized (`com.microsoft`) | Custom HIP kernel |
+| QuantizeLinear | Custom HIP kernel |
+| DequantizeLinear | Custom HIP kernel |
 | LinearAttention (`com.microsoft`) | Custom HIP kernel |
 | CausalConvWithState (`com.microsoft`) | Custom HIP kernel |
 | Relu | Decomposed to Max |

@@ -7,8 +7,9 @@
 // GQA runtime wrapper (self-contained: optimized fused fast path + legacy
 // decomposed hipBLASLt fallback).
 //
-// The generated IR calls `wrap_group_query_attention` (39-arg ABI, unchanged so
-// the HipToLLVM lowering keeps resolving). Path selection:
+// The generated IR calls `wrap_group_query_attention` (42-arg ABI, kept in
+// lockstep with the HipToLLVM lowering so the symbol keeps resolving). Path
+// selection:
 //
 //   * Common fp16 causal GQA (head_dim in {64,128,256}, templated decode
 //     geometry) -> optimized fused custom kernels:
@@ -217,8 +218,10 @@ static inline int kv_dtype_abi(KvCacheFormat f) {
 // past_buf_seq is the buffer dim of past_key (may exceed past_len for
 // pre-allocated caches). seqlens_k_ptr: when non-null on the append path the
 // kernel reads past_len from device memory (zero D2H). The fused path calls
-// this with the default no_causal=false / skv=-1; the decomposed pipeline
-// passes them for the Whisper no_causal cases. Returns 0 on success.
+// this with the default no_causal=false / skv=-1 / kv_bnsd=false; the
+// decomposed pipeline passes them for the no_causal cases, where kv_bnsd states
+// whether new_key/new_value are rank-4 BNSD (MultiHeadAttention cross-attn) or
+// rank-3 BSHD (onnx.Attention / GQA). Returns 0 on success.
 //
 // kv_format: for any quantized format (Int8PerChannel today, INT4/FP8 later)
 // the (causal) concat/append quantizes the incoming fp16 K/V with the static
@@ -226,28 +229,48 @@ static inline int kv_dtype_abi(KvCacheFormat f) {
 // plain copy. Only the causal concat/append tail honours it (the no_causal
 // Whisper branches are fp16/fp32-only), so the format decision lives here
 // rather than in a separate helper or at each call site.
+//
+// copy_lo bounds the separate-buffer concat from below: past positions
+// [0, copy_lo) are not copied into present and are left whatever the allocator
+// held. It exists for the one caller that can prove it will not read them back
+// -- a sliding-window layer at decode passes the same lower bound it scores
+// from -- and must be 0 for everyone else. It is required rather than defaulted
+// so that a new call site has to say which it is. The append branches ignore
+// it: they only ever write the new tokens, and an in-place cache has no prefix
+// to copy in the first place.
 static int update_kv_cache(hipStream_t stream, const void *past_key,
                            const void *past_value, const void *new_key,
                            const void *new_value, void *present_key,
                            void *present_value, int B, int past_len, int sq,
                            int G, int d, int past_buf_seq, int present_seq,
-                           const void *seqlens_k_ptr, int elem_sz,
+                           const void *seqlens_k_ptr, int elem_sz, int copy_lo,
                            bool no_causal = false, int skv = -1,
                            KvCacheFormat kv_format = KvCacheFormat::Fp16,
                            const void *k_scale = nullptr,
-                           const void *v_scale = nullptr) {
-  // no_causal (Whisper encoder / cross-attn): bidirectional, no past KV.
-  // The KV to attend over is the FULL `new_key`/`new_value` (Skv tokens), not
-  // `sq` newly-appended tokens. Two sub-cases distinguished by sq vs Skv:
-  //   * Cross-attn (sq != Skv): `key`/`value` arrive as rank-4 BNSD
-  //     [B, G, Skv, d] -- already in the present_key layout. A straight
-  //     device-to-device copy of all Skv tokens populates present_*.
-  //   * Encoder self-attn (sq == Skv): `key`/`value` are BSHD [B, Skv, G, d];
-  //     fall through to the append kernel below with past_len forced to 0 and
-  //     seqlens_k=nullptr so it transposes all Skv tokens to offset 0 WITHOUT
-  //     the +1 PAST-token convention.
-  if (no_causal && skv >= 0 && skv != sq) {
-    // Cross-attn: key/value arrive rank-4 BNSD [B,G,skv,d]; straight D2D copy.
+                           const void *v_scale = nullptr,
+                           bool kv_bnsd = false) {
+  // no_causal: bidirectional attention with no past KV (Whisper encoder /
+  // cross-attn, and Gemma-3n-style KV-cache-sharing decoder layers). The KV to
+  // attend over is the FULL `new_key`/`new_value` (Skv tokens), not `sq`
+  // newly-appended ones, and it must be staged into the BNSD present cache the
+  // GEMMs read. Which staging is correct depends on the SOURCE LAYOUT, not on
+  // sq vs Skv:
+  //   * kv_bnsd (MultiHeadAttention cross-attn): `key`/`value` are rank-4 BNSD
+  //     [B, G, Skv, d], already in the present_key layout, so a straight D2D
+  //     copy of all Skv tokens populates present_*.
+  //   * otherwise (onnx.Attention / GQA lowerings): `key`/`value` are BSHD
+  //     [B, Skv, G, d], so the append kernel transposes all Skv tokens to
+  //     offset 0 -- past_len forced to 0 and seqlens_k=nullptr so it does NOT
+  //     apply the +1 PAST-token convention.
+  //
+  // This used to key on sq != Skv, which held only by coincidence: the BNSD
+  // producer happened to be the one with sq != Skv. A KV-sharing decode (sq=1,
+  // Skv=history) is BSHD but took the copy, and since BSHD and BNSD are
+  // byte-identical only at G == 1 that silently interleaved the KV heads across
+  // the sequence for any G > 1 (Gemma 4 E4B, kv_num_heads=2), time-warping the
+  // history each head saw.
+  if (no_causal && skv >= 0 && kv_bnsd) {
+    // Rank-4 BNSD source: layouts already match; straight D2D copy.
     // elem_sz is 2 (fp16) or 4 (fp32); the decomposed pipeline supports both.
     size_t bytes = static_cast<size_t>(B) * G * static_cast<size_t>(skv) * d *
                    static_cast<size_t>(elem_sz);
@@ -260,16 +283,18 @@ static int update_kv_cache(hipStream_t stream, const void *past_key,
     return 0;
   }
   if (no_causal) {
-    // Encoder self-attn: append all Skv (== sq) tokens at offset 0, bypassing
-    // the seqlens_k +1 convention (pass nullptr so the kernel uses past_len=0).
+    // BSHD source: transpose all the KV to offset 0. `src_tokens` is Skv when
+    // the caller supplied it (KV-sharing decode hands us the full history with
+    // Skv != sq) and sq otherwise (encoder self-attn, where they are equal).
     // no_causal is fp16/fp32 only (decomposed pipeline), never quantized.
-    if (hip_gqa_kv_cache_append(stream, new_key, present_key, B, sq, G, d,
-                                present_seq, /*past_len=*/0,
+    const int src_tokens = (skv >= 0) ? skv : sq;
+    if (hip_gqa_kv_cache_append(stream, new_key, present_key, B, src_tokens, G,
+                                d, present_seq, /*past_len=*/0,
                                 /*seqlens_k_ptr=*/nullptr, elem_sz,
                                 HIP_KV_DTYPE_FP16, /*scale=*/nullptr) != 0)
       return -1;
-    if (hip_gqa_kv_cache_append(stream, new_value, present_value, B, sq, G, d,
-                                present_seq, /*past_len=*/0,
+    if (hip_gqa_kv_cache_append(stream, new_value, present_value, B, src_tokens,
+                                G, d, present_seq, /*past_len=*/0,
                                 /*seqlens_k_ptr=*/nullptr, elem_sz,
                                 HIP_KV_DTYPE_FP16, /*scale=*/nullptr) != 0)
       return -1;
@@ -286,11 +311,11 @@ static int update_kv_cache(hipStream_t stream, const void *past_key,
     // Separate-buffer concat: needs host-side past_len for stride computation.
     if (hip_gqa_kv_cache_concat(stream, past_key, new_key, present_key, B,
                                 past_len, sq, G, d, past_buf_seq, present_seq,
-                                elem_sz, kv_dtype, k_sc) != 0)
+                                elem_sz, kv_dtype, k_sc, copy_lo) != 0)
       return -1;
     if (hip_gqa_kv_cache_concat(stream, past_value, new_value, present_value, B,
                                 past_len, sq, G, d, past_buf_seq, present_seq,
-                                elem_sz, kv_dtype, v_sc) != 0)
+                                elem_sz, kv_dtype, v_sc, copy_lo) != 0)
       return -1;
   } else {
     // In-place append: kernel can read past_len from device via seqlens_k_ptr.
@@ -456,13 +481,22 @@ static int gqa_forward_fused(
     // Append the new token to the KV cache. Quantized cache:
     // quantize-and-append with the static per-channel scale; fp16 cache: plain
     // append. update_kv_cache dispatches on kv_format internally.
+    //
+    // copy_lo stays 0 here even though this path knows its window. Narrowing
+    // the concat needs a separate growing present buffer, and this path never
+    // gets one: seq_len_kv reaches the runtime as the present_key memref's
+    // sequence dim, which for a GroupQueryAttention export with a growing cache
+    // arrives one short of the declared present, and the seqlens_k check above
+    // then rejects the call before it can reach the concat. When the cache is
+    // instead in-place there is no prefix to copy and update_kv_cache appends.
+    // So a bound here would be unreachable, and therefore untestable, code.
     if (update_kv_cache(
             stream, past_key, past_value, kSrc, vSrc, present_key,
             present_value, static_cast<int>(B), static_cast<int>(past_len),
             static_cast<int>(sq), static_cast<int>(G), static_cast<int>(d),
             static_cast<int>(past_buf_seq), static_cast<int>(present_seq),
-            seqlens_k_ptr, static_cast<int>(elem_sz), /*no_causal=*/false,
-            /*skv=*/-1, kv_format, k_scale, v_scale) != 0)
+            seqlens_k_ptr, static_cast<int>(elem_sz), /*copy_lo=*/0,
+            /*no_causal=*/false, /*skv=*/-1, kv_format, k_scale, v_scale) != 0)
       return -1;
 
     {
@@ -477,8 +511,8 @@ static int gqa_forward_fused(
       // scan and therefore the split count that wins.
       const int kv_dtype = kv_dtype_abi(kv_format);
       int drc;
-      if (hipdnn_ep::gqa_autotune_mode(state->gqa_autotune_policy) ==
-          hipdnn_ep::GqaAutotuneMode::Online) {
+      if (hip_gqa_autotune_mode(state->gqa_autotune_policy) ==
+          static_cast<int>(hipdnn_ep::GqaAutotuneMode::Online)) {
         drc = hip_gqa_flash_decode(
             stream, qSrc, present_key, present_value, output, partials,
             static_cast<int>(B), static_cast<int>(H), static_cast<int>(G),
@@ -491,7 +525,8 @@ static int gqa_forward_fused(
         // B==1 already paid (and caches) the seqlens_k read above, so the LUT
         // sees the length the kernel will actually scan without adding a sync.
         // For B>1 this is the host-known shape length, which is the upper
-        // bound; it rounds up to the same bucket or the next one.
+        // bound; the nearest-neighbour lookup answers it from the closest
+        // measured length either way.
         int effective_skv = static_cast<int>(skv);
         if (seqlens_k_pre != kSeqlensKNotRead && seqlens_k_pre >= 0)
           effective_skv = seqlens_k_pre + 1;
@@ -504,9 +539,9 @@ static int gqa_forward_fused(
             effective_skv,
             kFlashDecodeMaxSplits,
             static_cast<int>(local_window_size)};
-        const hipdnn_ep::GqaDecodeResult selected =
-            hipdnn_ep::gqa_autotune_resolve_decode(state->gqa_autotune_policy,
-                                                   request);
+        hipdnn_ep::GqaDecodeResult selected;
+        hip_gqa_autotune_resolve_decode(state->gqa_autotune_policy, &request,
+                                        &selected);
         drc = hip_gqa_flash_decode_configured(
             stream, qSrc, present_key, present_value, output, partials,
             static_cast<int>(B), static_cast<int>(H), static_cast<int>(G),
@@ -661,8 +696,8 @@ static int gqa_forward_fused(
             present_value, static_cast<int>(B), static_cast<int>(past_len),
             static_cast<int>(sq), static_cast<int>(G), static_cast<int>(d),
             static_cast<int>(past_buf_seq), static_cast<int>(present_seq),
-            seqlens_k_ptr, static_cast<int>(elem_sz), /*no_causal=*/false,
-            /*skv=*/-1, kv_format, k_scale, v_scale) != 0)
+            seqlens_k_ptr, static_cast<int>(elem_sz), /*copy_lo=*/0,
+            /*no_causal=*/false, /*skv=*/-1, kv_format, k_scale, v_scale) != 0)
       return -1;
   }
 
@@ -699,8 +734,8 @@ static int gqa_forward_fused(
   }
 
   int fp_rc;
-  if (hipdnn_ep::gqa_autotune_mode(state->gqa_autotune_policy) ==
-      hipdnn_ep::GqaAutotuneMode::Online) {
+  if (hip_gqa_autotune_mode(state->gqa_autotune_policy) ==
+      static_cast<int>(hipdnn_ep::GqaAutotuneMode::Online)) {
     fp_rc = hip_gqa_flash_prefill(
         stream, qSrc, kAttn, vAttn, output, static_cast<int>(B),
         static_cast<int>(H), static_cast<int>(G), static_cast<int>(sq),
@@ -720,9 +755,9 @@ static int gqa_forward_fused(
                                                static_cast<int>(sq),
                                                static_cast<int>(total_seq),
                                                local_window_size};
-    hipdnn_ep::GqaPrefillResult selected =
-        hipdnn_ep::gqa_autotune_resolve_prefill(state->gqa_autotune_policy,
-                                                request);
+    hipdnn_ep::GqaPrefillResult selected;
+    hip_gqa_autotune_resolve_prefill(state->gqa_autotune_policy, &request,
+                                     &selected);
     auto launch_configured = [&](const hipdnn_ep::GqaPrefillConfig &config) {
       return hip_gqa_flash_prefill_v3_configured(
           stream, qSrc, kAttn, vAttn, output, static_cast<int>(B),
@@ -734,13 +769,15 @@ static int gqa_forward_fused(
     };
     fp_rc = launch_configured(selected.config);
     if (fp_rc != 0 && selected.source != hipdnn_ep::GqaTuneSource::Heuristic) {
-      // Ask for tier 3 explicitly. Re-running resolve_* would walk the same
-      // tiers that just produced the rejected config.
+      // Ask for the compiled-in heuristic directly. Re-running resolve_* would
+      // just hand back the same neighbourhood's nearest point that was already
+      // rejected.
       RUNTIME_DEBUG_LOG(
           "[REAL] rejected GQA prefill config (source=%s); using heuristic\n",
           hipdnn_ep::gqa_tune_source_name(selected.source));
-      selected = {hipdnn_ep::gqa_autotune_fallback_prefill(request),
-                  hipdnn_ep::GqaTuneSource::Heuristic};
+      hipdnn_ep::GqaPrefillConfig heuristic;
+      hip_gqa_autotune_fallback_prefill(&request, &heuristic);
+      selected = {heuristic, hipdnn_ep::GqaTuneSource::Heuristic, 0.0f};
       fp_rc = launch_configured(selected.config);
     }
     RUNTIME_DEBUG_LOG("[REAL] GQA prefill config source=%s v%d "
@@ -1124,12 +1161,19 @@ static int gqa_forward_hipblaslt(
     void *present_value, int64_t B, int64_t sq, int64_t skv,
     int64_t past_buf_seq, int64_t H, int64_t G, int64_t d, float scale,
     int64_t do_rotary, int64_t local_window_size, bool no_causal,
-    int64_t element_size_bytes, int op_state_slot) {
+    int64_t element_size_bytes, int op_state_slot, bool kv_bnsd) {
 
-  // Whisper bidirectional no-past path only when no_causal AND no external
-  // attention_bias. ONNX Attention with is_causal=0 still carries past KV and
-  // uses the standard decode seqlens_k convention.
-  const bool bidirectional_no_past = no_causal && (attention_bias == nullptr);
+  // Bidirectional no-past path. The discriminator is the ABSENCE of a past KV
+  // operand, not the absence of an external mask: an additive mask is
+  // orthogonal (Step 8b adds it on either path). With a past cache, is_causal=0
+  // still follows the ORT decode convention (total_seq = seqlens_k+1). With no
+  // past cache, `key`/`value` ARE the full Skv-length KV -- Whisper encoder /
+  // cross-attn, and Gemma-3n-style KV-cache-sharing layers, which re-read an
+  // earlier layer's complete cache behind an external mask -- so total_seq is
+  // exactly skv and past_len is 0. Gating this on the mask instead sent those
+  // sharing layers down the decode path, where seqlens_k+1 (the full history)
+  // exceeds present_seq and the call was rejected outright.
+  const bool bidirectional_no_past = no_causal && (past_key == nullptr);
 
   int64_t HPG = H / G;
   int64_t present_seq = skv;
@@ -1358,7 +1402,7 @@ static int gqa_forward_hipblaslt(
             present_value, static_cast<int>(B), static_cast<int>(past_len),
             static_cast<int>(sq), static_cast<int>(G), static_cast<int>(d),
             static_cast<int>(past_buf_seq), static_cast<int>(present_seq),
-            seqlens_k_ptr, static_cast<int>(elem_sz)) != 0)
+            seqlens_k_ptr, static_cast<int>(elem_sz), /*copy_lo=*/0) != 0)
       return -1;
 
     // hip_gqa_flash_decode owns every geometry it templates; this fallback
@@ -1415,8 +1459,8 @@ static int gqa_forward_hipblaslt(
   // give total_seq = skv+1 > present_seq = skv -> rc=-1 -> zeroed output, and
   // past_len = total_seq - sq is invalid when sq != skv (cross-attn has sq=1,
   // skv=1500 => bogus past_len=1499). Gated on bidirectional_no_past (not raw
-  // no_causal): an onnx.Attention with an external mask still carries past KV,
-  // so it keeps the standard seqlens_k path below. For the no-past case
+  // no_causal): an onnx.Attention that DOES carry a past KV cache keeps the
+  // standard seqlens_k path below regardless of is_causal. For the no-past case
   // total_seq = skv (== present_seq) and past_len = 0; skip the readback.
   if (bidirectional_no_past) {
     total_seq = skv;
@@ -1448,11 +1492,27 @@ static int gqa_forward_hipblaslt(
       // Defensive fallback for B == 1 when the pre-dispatch helper bailed out
       // (D2H or sync failure). Rare path; not cached because the same failure
       // mode would have prevented the helper from caching too.
-      if (hipMemcpyAsync(&seqlens_k_val, seqlens_k_ptr, sizeof(int32_t),
-                         hipMemcpyDeviceToHost, stream) != hipSuccess)
+      //
+      // Both failures are reported rather than returned bare: this is the one
+      // place the decomposed path can fail before it has done any work, and a
+      // silent -1 here surfaces only as a zero-filled attention output, which
+      // looks like a kernel bug rather than a seqlens_k that could not be read.
+      hipError_t cp =
+          hipMemcpyAsync(&seqlens_k_val, seqlens_k_ptr, sizeof(int32_t),
+                         hipMemcpyDeviceToHost, stream);
+      if (cp != hipSuccess) {
+        fprintf(stderr,
+                "gqa_forward_hipblaslt: could not read seqlens_k from %p: %s\n",
+                seqlens_k_ptr, hipGetErrorString(cp));
         return -1;
-      if (hipStreamSynchronize(stream) != hipSuccess)
+      }
+      hipError_t sy = hipStreamSynchronize(stream);
+      if (sy != hipSuccess) {
+        fprintf(stderr,
+                "gqa_forward_hipblaslt: sync after seqlens_k read failed: %s\n",
+                hipGetErrorString(sy));
         return -1;
+      }
     }
 
     // ORT prefill sentinel: when there is no past KV yet, the producer
@@ -1517,6 +1577,180 @@ static int gqa_forward_hipblaslt(
   bool need_transpose = (sq > 1);
 
   //===--------------------------------------------------------------------===//
+  // Sliding-window narrowing of the decode key range
+  //
+  // A windowed layer can only attend to the last `window` key positions, but
+  // this path scored all of them and then had hip_gqa_causal_mask_f32 write
+  // -inf over everything older. On Gemma-4 at 16K that is 16x the KV traffic
+  // the layer needs: 25 of its 30 layers have a 1024-token window, and their
+  // measured gqa time scaled 7.3x from 2K to 16K as if the window did not
+  // exist.
+  //
+  // Dropping the out-of-window keys is exact rather than an approximation. The
+  // entries being dropped are -INFINITY: the softmax takes a max then
+  // exp2f(x - max), so they never win the max and add exactly 0 to the
+  // denominator, and the Value GEMM runs alpha=1/beta=0 so they contribute
+  // exactly 0 to the output. What is left is a difference in GEMM tile
+  // reassociation, the same standard as use_no_expand.
+  //
+  // The KV cache is BNSD [B, G, present_seq, d] with d fastest, so a run of key
+  // positions is contiguous at + kv_lo * d and the batch stride stays
+  // present_seq * d whatever the offset. The A pointer is a hipblasLtMatmul
+  // call argument rather than part of the descriptor, so the offset costs
+  // nothing.
+  //
+  // The bound is one global lower bound per call rather than a band per query
+  // row. A call's query rows occupy absolute positions
+  // [past_len, past_len + sq), so the oldest key any row of it may attend to is
+  // past_len - local_window_size + 1, and that single value serves the whole
+  // call: rows above the first simply have keys they do not use left in range,
+  // where the mask below drops them exactly as it did before. A true band would
+  // save more on a long windowed prefill, but it needs a per-row score offset
+  // and is a separate effort; this bound needs no per-row state at all.
+  //
+  // At sq == 1 this reduces to total_seq - local_window_size, since past_len is
+  // then total_seq - 1. At a first prefill past_len is 0, the bound is
+  // non-positive, and nothing narrows -- so initial prefill and TTFT are
+  // bit-identical by construction and only continuation prefill changes.
+  //
+  // Applying it to prefill as well as decode is what closes the invariant
+  // rather than just widening the optimisation. The KV copy below skips writing
+  // [0, kv_lo), so some prefix of `present` is never written on a narrowed
+  // step. Every subsequent call reads from its own kv_lo, and because
+  // past_len' == total_seq > past_len, its kv_lo is strictly greater than this
+  // call's: each read range is a strict subset of the previous write range, for
+  // decode and prefill alike. Leaving prefill unnarrowed would break exactly
+  // that -- a continuation prefill would read from 0 into memory a narrowed
+  // decode never wrote, and unwritten memory can hold a non-finite bit pattern
+  // that no finite mask suppresses (the softmax's first pass reduces with
+  // fmaxf, which ignores NaN, but the second pass accumulates it, so one such
+  // key poisons its whole output row).
+  //
+  // Restrictions:
+  //  - Not under bidirectional_no_past, which is the one branch where
+  //    total_seq != past_len + sq (there total_seq == skv and past_len == 0, a
+  //    Whisper encoder / cross-attention shape with no past at all). The bound
+  //    above is derived from that identity, so without it kv_lo would be
+  //    computed against the wrong absolute query position.
+  //
+  //    This pairing is reachable, and on the shape that matters most: #882
+  //    redefined bidirectional_no_past as no_causal && !past_key, so a windowed
+  //    Gemma-4 PREFILL now sets it (no_causal, and no past cache on the first
+  //    call) where the older no_causal && !attention_bias did not. It stays a
+  //    correct guard for the op-level bound below, which is taken at past_len
+  //    and is inert at a prefill anyway, but it is the wrong question to ask of
+  //    the per-chunk bound -- see chunk_narrow_ok below, which tests the
+  //    identity this restriction is really about instead of a flag that now
+  //    happens to imply more than it did.
+  //  - Only with a present cache. kv_lo indexes key positions by their absolute
+  //    position in a BNSD cache page; without present_key / present_value the
+  //    GEMMs read the raw key / value operands, where a past_len derived from
+  //    skv - sq does not describe an offset into anything.
+  //
+  // A positive local_window_size is a promise that the window is ENFORCED
+  // somewhere, and narrowing is exact only because of that. Both of the ways it
+  // can reach us keep that promise, by different mechanisms:
+  //
+  //  - !no_causal: the ONNX attribute, forwarded from
+  //    com.microsoft.GroupQueryAttention. hip_gqa_causal_mask_f32 below applies
+  //    the window itself, so narrowing is provably the same arithmetic.
+  //
+  //  - no_causal: recovered from the additive mask by the converter's
+  //    AttentionWindowFold, which matched `And(q >= k, q - k < W)` in the
+  //    mask's own keep-condition. The mask is then the enforcer -- the entries
+  //    being dropped are exactly the ones it already set to its large-negative
+  //    value. This is the shape that needs it: onnx.Attention gained a window
+  //    attribute only in opset 25, so a windowed export below that arrives with
+  //    is_causal=0 and the window in the mask (Gemma-4's 25 local layers are
+  //    exactly this).
+  //
+  // So no_causal is deliberately NOT a gate here. It was one while the window
+  // could only arrive as an attribute, because a bidirectional op's window was
+  // being ignored rather than applied; now that a window can also come from the
+  // mask, gating on no_causal would reject the only case that needs narrowing.
+  // What no_causal does still gate is bidirectional_no_past below, which is the
+  // shape whose sequence lengths the bound cannot be derived from.
+
+  // Number of key positions actually scored, and the first one. kv_span ==
+  // total_seq and kv_lo == 0 whenever narrowing is inactive, which keeps every
+  // downstream expression below identical to what it was.
+  //
+  // This is the OP-LEVEL range: the union over every query row in the call.
+  // The KV copy, the K/V expand and the score buffers are all sized against it,
+  // and copy_lo's write-skip invariant above is stated in terms of it, so it
+  // has to stay the union even though individual chunks below read less than
+  // it.
+  const bool kv_narrow_ok =
+      !bidirectional_no_past && present_key && present_value;
+  int64_t kv_span = total_seq;
+  int64_t kv_lo = 0;
+  if (local_window_size > 0 && kv_narrow_ok) {
+    const int64_t lo = past_len - local_window_size + 1;
+    if (lo > 0) {
+      kv_lo = lo;
+      kv_span = total_seq - kv_lo;
+    }
+  }
+
+  // The bound above is taken at past_len, the absolute position of the FIRST
+  // query row of the call. That is why it does nothing at a fresh prefill:
+  // past_len is 0, so `lo` is negative and every chunk goes on scoring all
+  // total_seq keys even when the window is known. Narrowing per chunk instead,
+  // from the chunk's own query range, is what makes a recovered window pay at
+  // prefill rather than only at decode.
+  //
+  // Dropping keys ABOVE a chunk's last query row needs the op to be causal,
+  // and only the is_causal attribute establishes that. hip_gqa_causal_mask_f32
+  // below then masks exactly the entries being dropped, so narrowing is
+  // provably the same arithmetic. An additive mask cannot reinstate any of them
+  // either, since the causal mask is applied on top of it.
+  //
+  // A recovered window does NOT establish it. That is worth stating outright,
+  // because the shape of the match invites the opposite reading: the window
+  // comes from AttentionWindowFold matching `And(q >= k, q - k < W)`, whose
+  // first conjunct is the causal predicate. But the fold matches that as one
+  // DISJUNCT of the keep-condition, not as the whole of it. Gemma-4's windowed
+  // mask is `And(pad, Or(win, seg))`, and the fold accepts it because the
+  // same-image-block leg `seg` cannot reach further BACK than the window: 256
+  // soft tokens per image block against a window of 1024. That argument bounds
+  // the range below and says nothing about above. `seg` is bidirectional, so it
+  // reaches one image block ABOVE the diagonal, and it keeps those entries at a
+  // bias of 0 -- they are attended, and a diagonal bound would drop them. Text
+  // prompts hide this: `seg` is identically false with no image, which leaves
+  // the keep-condition causal after all and the diagonal bound exact.
+  //
+  // So no_causal takes its upper bound from the mask instead, whether or not a
+  // window was recovered -- see mask_chunk_hi below. That scan floors at the
+  // diagonal, so wherever nothing above it is attended it returns this same
+  // bound and nothing is given up. Whisper's encoder self-attention and decoder
+  // cross-attention have no mask to read and keep their full range, as before.
+  //
+  // The window still supplies the LOWER bound in chunkKeyRange, which is where
+  // the fold's reach-back argument actually applies.
+  const bool causal_narrow_ok = !no_causal;
+
+  // Whether a chunk's row range can be placed in absolute key coordinates at
+  // all. Every bound above is of the form past_len + q0, so it says exactly one
+  // thing: query row q0 of this call sits at absolute position past_len + q0,
+  // and therefore the last row of the call sits at total_seq - 1.
+  //
+  // That is stated as the identity rather than as !bidirectional_no_past, which
+  // is the flag the op-level bound uses. The two agreed until #882 redefined
+  // the flag from no_causal && !attention_bias to no_causal && !past_key, which
+  // set it on windowed Gemma-4 prefills -- shapes where sq == skv and past_len
+  // == 0, so the identity holds perfectly and narrowing is exact. Testing the
+  // flag there silently disabled the narrowing on the only shape that needs it
+  // while looking entirely correct.
+  //
+  // The identity is what actually fails on the shapes that must be excluded: a
+  // Whisper cross-attention has sq == 1 against skv == 1500, so past_len + q0
+  // addresses nothing, and a KV-cache-sharing decode re-reads a full history it
+  // did not produce. Both are caught, and both are also no_causal, so
+  // causal_narrow_ok already refuses them the diagonal bound.
+  const bool chunk_narrow_ok =
+      present_key && present_value && total_seq == past_len + sq;
+
+  //===--------------------------------------------------------------------===//
   // Query-row chunking of the score matrix
   //
   // This path materialises the whole [B*H, sq, total_seq] score matrix twice --
@@ -1548,8 +1782,11 @@ static int gqa_forward_hipblaslt(
   //===--------------------------------------------------------------------===//
   int64_t sq_chunk = sq;
   if (sq > 1 && !use_no_expand) {
+    // kv_span, matching what the score buffers are actually sized to below: on
+    // a narrowed windowed prefill a row is cheaper, so more rows fit per chunk
+    // and the loop runs fewer times.
     const size_t score_row_bytes =
-        static_cast<size_t>(B) * H * total_seq * (sizeof(float) + elem_sz);
+        static_cast<size_t>(B) * H * kv_span * (sizeof(float) + elem_sz);
     const size_t budget = gqa_score_budget_bytes();
     if (budget > 0 && score_row_bytes > 0 &&
         static_cast<size_t>(sq) * score_row_bytes > budget) {
@@ -1566,98 +1803,270 @@ static int gqa_forward_hipblaslt(
     }
   }
   const bool chunked = (sq_chunk < sq);
-  const int64_t sq_tail = chunked ? (sq % sq_chunk) : 0;
+
+  //===--------------------------------------------------------------------===//
+  // Per-chunk key bound recovered from the additive mask
+  //
+  // For a bidirectional op the diagonal bound above is unavailable, so this is
+  // the only thing that can bound a chunk from above -- and for a WINDOWED
+  // bidirectional op it is also what keeps the narrowing correct, since the
+  // diagonal would cut through the mask's same-image-block leg. Where such an
+  // op carries an additive mask, the mask already states which keys are
+  // attended, and the entries it rules out are exactly the ones a chunk can
+  // drop: an additive bias at or below -65504 contributes exactly zero to the
+  // softmax, so dropping it is bit-exact. That makes this a recovery of a bound
+  // the graph already contains rather than an assumption about the model, which
+  // is what the alternative would have been -- AttentionWindowFold cannot
+  // supply it, because the reach of Gemma-4's same-image-block leg is a
+  // property of the input, not of the mask's shape.
+  //
+  // Only worth doing when the op is actually chunked: a single chunk spans
+  // every query row, so its bound is the whole key range either way.
+  //
+  // One kernel over half the mask plus one D2H of a few ints per call, on each
+  // of Gemma-4's 30 layers: ~250 MB read apiece, against the ~6 GB of score
+  // traffic it removes on the 5 global ones and correctness on the 25 local
+  // ones. The mask is shared across layers of a kind, so a cache keyed on the
+  // bias pointer and this call's geometry would collapse the 30 scans to 2 and
+  // their stream syncs with them; that is left for later because the scan is
+  // already small against the score GEMMs it bounds, and because such a cache
+  // belongs on RuntimeState rather than in a file-static -- per-session, and so
+  // safe against a second session and against teardown. A failure anywhere here
+  // leaves the vector empty and the op scores its full range, which is exactly
+  // the old behaviour.
+  //===--------------------------------------------------------------------===//
+  std::vector<int32_t> mask_chunk_hi;
+  if (chunked && chunk_narrow_ok && !causal_narrow_ok && attention_bias &&
+      !use_no_expand) {
+    const int64_t nchunks = (sq + sq_chunk - 1) / sq_chunk;
+    // The scan's output lands at the front of the state workspace, which the
+    // layout below re-sizes and re-partitions for the score buffers. Both uses
+    // are safe together: the result is copied out and the stream synchronized
+    // before that happens, so the region is dead by the time it is reused, and
+    // ensure_workspace only ever grows. On a warm call the workspace already
+    // dwarfs the few hundred bytes wanted here and the request is a no-op; only
+    // a cold first inference pays an extra allocation for it.
+    const size_t hi_bytes = static_cast<size_t>(nchunks) * sizeof(int32_t);
+    int32_t *d_hi = nullptr;
+    if (hipdnn_ep_state_ensure_workspace(state, hi_bytes) == 0)
+      d_hi = static_cast<int32_t *>(hipdnn_ep_state_get_workspace(state));
+    if (d_hi &&
+        hip_gqa_bias_key_extent(
+            stream, attention_bias, d_hi, static_cast<int>(attn_bias_batch),
+            static_cast<int>(attn_bias_num_heads), static_cast<int>(sq),
+            static_cast<int>(total_seq), static_cast<int>(sq),
+            static_cast<int>(sq_chunk), static_cast<int>(past_len),
+            static_cast<int>(nchunks), static_cast<int>(elem_sz)) == 0) {
+      std::vector<int32_t> hi(static_cast<size_t>(nchunks), 0);
+      if (hipMemcpyAsync(hi.data(), d_hi, hi_bytes, hipMemcpyDeviceToHost,
+                         stream) == hipSuccess &&
+          hipStreamSynchronize(stream) == hipSuccess)
+        mask_chunk_hi = std::move(hi);
+    }
+    // Never expected: only a failed scratch allocation or a failed launch gets
+    // here, and both mean the prefill silently reverts to scoring every key.
+    if (mask_chunk_hi.empty())
+      fprintf(stderr,
+              "gqa_forward_hipblaslt: mask key-extent recovery failed; "
+              "scoring the full key range for sq=%lld total_seq=%lld\n",
+              (long long)sq, (long long)total_seq);
+  }
 
   // GEMM descriptor keys. The no-expand flavour uses explicit per-operand
-  // strides (non-zero stride fields); the expand flavour leaves them zero so
-  // queryOrCreateGemmState falls back to the dense packed-batch defaults.
+  // strides (non-zero stride fields); the expand flavour leaves them zero,
+  // so queryOrCreateGemmState falls back to the dense packed-batch defaults,
+  // except where a per-chunk key range makes a dense default wrong (strideA
+  // below).
   //
   // When chunking, the expand flavour must state Q's and O's strides
   // explicitly: n is the chunk length but those two operands still advance by
   // the full sq between heads. The score matrices are freshly packed per chunk,
   // so their strides stay at the dense default.
-  auto makeKeys = [&](int64_t n_rows, GqaGemmKey *score, GqaGemmKey *value) {
-    *score = {total_seq,
+  //
+  // The key extent is kv_ext, the chunk's own narrowed range, which is at most
+  // kv_span: Kexp / Vexp are materialised over the op-level narrowed range and
+  // the score matrices are sized to match, so stating total_seq here would have
+  // the GEMMs read and write past the regions allocated for them.
+  //
+  // strideA has to be stated explicitly the moment kv_ext differs from kv_span.
+  // Both keys otherwise leave it 0, which queryOrCreateGemmState resolves to
+  // the dense default m*k: kv_ext*d for the score GEMM and d*kv_ext for the
+  // value one, while Kexp / Vexp are packed at kv_span*d per head. Those agree
+  // only while the chunk reads the whole op-level range; once it reads a
+  // sub-range
+  // the dense default is short and every head after the first is mis-strided,
+  // silently, with no shape for hipBLASLt to reject. Keeping the 0 in the
+  // un-narrowed case is deliberate rather than tidy: it leaves the cache key
+  // bit-identical to what it was, so a shape that narrows nothing reuses
+  // exactly the descriptor it used before.
+  auto makeKeys = [&](int64_t n_rows, int64_t kv_ext, GqaGemmKey *score,
+                      GqaGemmKey *value) {
+    const int64_t strideA = (kv_ext != kv_span) ? kv_span * d : 0;
+    *score = {kv_ext,
               n_rows,
               d,
               B * H,
               true,
               /*outputFp32=*/true,
               gemm_fp32,
-              /*strideA=*/0,
+              strideA,
               /*strideB=*/chunked ? sq * d : 0,
               /*strideC=*/0};
     *value = {d,
               n_rows,
-              total_seq,
+              kv_ext,
               B * H,
               false,
               /*outputFp32=*/gemm_fp32,
               gemm_fp32,
-              /*strideA=*/0,
+              strideA,
               /*strideB=*/0,
               /*strideC=*/chunked ? sq * d : 0};
   };
 
-  GqaGemmKey scoreKey, valueKey;
+  //===--------------------------------------------------------------------===//
+  // Per-chunk key ranges
+  //
+  // One entry per iteration of the Steps 8-10 loop, resolved up front. Two
+  // things force that rather than deriving each chunk's shape inside the loop:
+  // the GEMM workspace region is sized once below and cannot grow afterwards,
+  // so every algorithm the loop will use has to be known before the allocation;
+  // and the score buffers need the widest chunk, which is not in general the
+  // first or the last one.
+  //
+  // A chunk is now its own GEMM shape, but far fewer distinct ones than that
+  // suggests. With a window the interior chunks all sit at the same extent
+  // (window + chunk rows, capped by the sequence), so at a 16K prefill with
+  // sq_chunk 640 and a 1024 window the 26 chunks collapse to four descriptors:
+  // the two leading partial ones, the interior extent, and the ragged tail.
+  // queryOrCreateGemmState is keyed on shape, so the duplicates cost a hash
+  // lookup and nothing else -- no extra hipblasLtMatmulAlgoGetHeuristic calls.
+  //===--------------------------------------------------------------------===//
+  struct GqaChunkPlan {
+    int64_t q0;     // first query row of the chunk
+    int64_t c;      // query rows in the chunk
+    int64_t kv_off; // first key read, RELATIVE to kv_lo
+    int64_t kv_ext; // key positions read
+    const GqaGemmCacheEntry *score;
+    const GqaGemmCacheEntry *value;
+  };
+  std::vector<GqaChunkPlan> chunks;
+
+  // Key range a chunk of query rows can attend, as [lo, hi) in absolute key
+  // positions. Clamped into the op-level [kv_lo, total_seq) so a chunk can only
+  // ever read a sub-range of what the expand actually materialised.
+  auto chunkKeyRange = [&](int64_t q0, int64_t c, int64_t *lo, int64_t *hi) {
+    int64_t k_lo = kv_lo;
+    int64_t k_hi = total_seq;
+    if (chunk_narrow_ok) {
+      if (causal_narrow_ok) {
+        // The chunk's last query row is at absolute position
+        // past_len + q0 + c - 1, so no key above it is attended.
+        const int64_t h = past_len + q0 + c;
+        if (h < k_hi)
+          k_hi = h;
+      } else if (!mask_chunk_hi.empty()) {
+        // Bidirectional op, windowed or not: no diagonal bound is available,
+        // but the mask stated one. The stored value is the highest key position
+        // any row in this chunk attends, so the exclusive end is one past it.
+        // It is floored at the diagonal, so this is never looser than the bound
+        // a causal op would take.
+        const size_t idx = static_cast<size_t>(q0 / sq_chunk);
+        if (idx < mask_chunk_hi.size()) {
+          const int64_t h = static_cast<int64_t>(mask_chunk_hi[idx]) + 1;
+          if (h < k_hi)
+            k_hi = h;
+        }
+      }
+      if (local_window_size > 0) {
+        // The chunk's first query row has the lowest lower bound in the chunk,
+        // so it covers every row in it.
+        const int64_t l = past_len + q0 - local_window_size + 1;
+        if (l > k_lo)
+          k_lo = l;
+      }
+    }
+    // A degenerate range would give the GEMMs a zero extent. It cannot arise
+    // from the arithmetic above (the chunk's own diagonal is always in range),
+    // but the GEMM descriptors must not be built from one if it ever did.
+    if (k_hi <= k_lo)
+      k_hi = k_lo + 1;
+    *lo = k_lo;
+    *hi = k_hi;
+  };
+
   if (use_no_expand) {
-    // Score: C[total_seq, HPG*sq] = K^T[d,total_seq] * Q[d, HPG*sq] per (b, g)
+    // No-expand is not chunked (see above), so it has exactly one iteration,
+    // spanning the whole query range and therefore the whole op-level key
+    // range: the per-chunk bound would reduce to kv_lo / kv_span anyway, and
+    // its operand layout is different enough that it keeps its own keys.
+    //
+    // Score: C[kv_span, HPG*sq] = K^T[d,kv_span] * Q[d, HPG*sq] per (b, g)
     // pair. strideA steps over the buffer page (present_seq*d) even though only
-    // the first total_seq tokens are read, keeping the descriptor stable across
-    // token steps.
-    scoreKey = {/*m=*/total_seq,
-                /*n=*/HPG * sq,
-                /*k=*/d,
-                /*batch=*/B * G,
-                /*transA=*/true,
-                /*outputFp32=*/true,
-                /*inputFp32=*/gemm_fp32,
-                /*strideA=*/present_seq * d,
-                /*strideB=*/HPG * sq * d,
-                /*strideC=*/HPG * sq * total_seq};
-    // Value: C[d, HPG*sq] = V[d, total_seq] * S[total_seq, HPG*sq] per (b, g)
+    // kv_span tokens are read, keeping the descriptor stable across token
+    // steps. Under window narrowing kv_span also stops changing per token once
+    // the context passes the window, so the descriptor cache stops missing on
+    // every token and the per-token hipblasLtMatmulAlgoGetHeuristic calls
+    // collapse to one entry per shape.
+    const GqaGemmKey scoreKey = {/*m=*/kv_span,
+                                 /*n=*/HPG * sq,
+                                 /*k=*/d,
+                                 /*batch=*/B * G,
+                                 /*transA=*/true,
+                                 /*outputFp32=*/true,
+                                 /*inputFp32=*/gemm_fp32,
+                                 /*strideA=*/present_seq * d,
+                                 /*strideB=*/HPG * sq * d,
+                                 /*strideC=*/HPG * sq * kv_span};
+    // Value: C[d, HPG*sq] = V[d, kv_span] * S[kv_span, HPG*sq] per (b, g)
     // pair, writing into BNSD [B, G, HPG, sq, d] which at sq==1 coincides with
     // BSHD [B, 1, H, d].
-    valueKey = {/*m=*/d,
-                /*n=*/HPG * sq,
-                /*k=*/total_seq,
-                /*batch=*/B * G,
-                /*transA=*/false,
-                /*outputFp32=*/gemm_fp32,
-                /*inputFp32=*/gemm_fp32,
-                /*strideA=*/present_seq * d,
-                /*strideB=*/HPG * sq * total_seq,
-                /*strideC=*/HPG * sq * d};
+    const GqaGemmKey valueKey = {/*m=*/d,
+                                 /*n=*/HPG * sq,
+                                 /*k=*/kv_span,
+                                 /*batch=*/B * G,
+                                 /*transA=*/false,
+                                 /*outputFp32=*/gemm_fp32,
+                                 /*inputFp32=*/gemm_fp32,
+                                 /*strideA=*/present_seq * d,
+                                 /*strideB=*/HPG * sq * kv_span,
+                                 /*strideC=*/HPG * sq * d};
+    const GqaGemmCacheEntry *sSt =
+        queryOrCreateGemmState(state, ltHandle, scoreKey, op_state_slot);
+    if (!sSt)
+      return -1;
+    const GqaGemmCacheEntry *vSt =
+        queryOrCreateGemmState(state, ltHandle, valueKey, op_state_slot);
+    if (!vSt)
+      return -1;
+    chunks.push_back({0, sq, 0, kv_span, sSt, vSt});
   } else {
-    makeKeys(sq_chunk, &scoreKey, &valueKey);
+    for (int64_t q0 = 0; q0 < sq; q0 += sq_chunk) {
+      const int64_t c = std::min<int64_t>(sq_chunk, sq - q0);
+      int64_t lo, hi;
+      chunkKeyRange(q0, c, &lo, &hi);
+      const int64_t ext = hi - lo;
+
+      GqaGemmKey sKey, vKey;
+      makeKeys(c, ext, &sKey, &vKey);
+      const GqaGemmCacheEntry *sSt =
+          queryOrCreateGemmState(state, ltHandle, sKey, op_state_slot);
+      if (!sSt)
+        return -1;
+      const GqaGemmCacheEntry *vSt =
+          queryOrCreateGemmState(state, ltHandle, vKey, op_state_slot);
+      if (!vSt)
+        return -1;
+      chunks.push_back({q0, c, lo - kv_lo, ext, sSt, vSt});
+    }
   }
 
-  const GqaGemmCacheEntry *scoreState =
-      queryOrCreateGemmState(state, ltHandle, scoreKey, op_state_slot);
-  if (!scoreState)
-    return -1;
-  const GqaGemmCacheEntry *valueState =
-      queryOrCreateGemmState(state, ltHandle, valueKey, op_state_slot);
-  if (!valueState)
-    return -1;
-
-  // A ragged final chunk is a different n and so a different descriptor. Both
-  // shapes are resolved before sizing the workspace because the GEMM workspace
-  // region has to cover whichever algorithm asks for more.
-  const GqaGemmCacheEntry *scoreTailState = nullptr;
-  const GqaGemmCacheEntry *valueTailState = nullptr;
-  if (sq_tail > 0) {
-    GqaGemmKey scoreTailKey, valueTailKey;
-    makeKeys(sq_tail, &scoreTailKey, &valueTailKey);
-    scoreTailState =
-        queryOrCreateGemmState(state, ltHandle, scoreTailKey, op_state_slot);
-    if (!scoreTailState)
-      return -1;
-    valueTailState =
-        queryOrCreateGemmState(state, ltHandle, valueTailKey, op_state_slot);
-    if (!valueTailState)
-      return -1;
-  }
+  // The widest chunk, which is what the two score buffers have to hold. This is
+  // at most sq_chunk * kv_span (the size they had before any per-chunk
+  // narrowing) and usually far less, so the allocation only ever shrinks.
+  int64_t max_chunk_score_elems = 0;
+  for (const GqaChunkPlan &cp : chunks)
+    max_chunk_score_elems = std::max(max_chunk_score_elems, cp.c * cp.kv_ext);
 
   // ---- Workspace layout ----
   // All temp buffers are packed contiguously into the shared workspace,
@@ -1676,13 +2085,24 @@ static int gqa_forward_hipblaslt(
   // sq whenever chunking is inactive, so this is the full matrix in that case.
   size_t Qtrans_bytes =
       need_transpose ? static_cast<size_t>(B) * H * sq * d * elem_sz : 0;
+  // Kexp / Vexp span kv_span key positions, not total_seq: the expand copies
+  // below start at kv_lo, so the out-of-window prefix is neither copied nor
+  // allocated for.
   size_t Kexp_bytes =
-      use_no_expand ? 0 : static_cast<size_t>(B) * H * total_seq * d * elem_sz;
+      use_no_expand ? 0 : static_cast<size_t>(B) * H * kv_span * d * elem_sz;
   size_t Vexp_bytes = Kexp_bytes;
+  // Both score buffers are sized to the widest chunk, not to
+  // sq_chunk * total_seq: they hold exactly what the Score GEMM writes on the
+  // heaviest iteration. These offsets chain into off_S_fp16, off_O, temp_end
+  // and the GEMM workspace, so the same extent has to appear in both or the
+  // region boundaries disagree with the GEMM extents and it is a silent heap
+  // overwrite rather than a crash. It must be the max over chunks and not the
+  // current chunk's own extent for the same reason: the offsets are fixed for
+  // the whole call while the extent varies per iteration.
   size_t S_f32_bytes =
-      static_cast<size_t>(B) * H * sq_chunk * total_seq * sizeof(float);
+      static_cast<size_t>(B) * H * max_chunk_score_elems * sizeof(float);
   size_t S_fp16_bytes =
-      static_cast<size_t>(B) * H * sq_chunk * total_seq * elem_sz;
+      static_cast<size_t>(B) * H * max_chunk_score_elems * elem_sz;
   size_t O_bytes =
       need_transpose ? static_cast<size_t>(B) * H * sq * d * elem_sz : 0;
 
@@ -1722,12 +2142,13 @@ static int gqa_forward_hipblaslt(
 
   // Single workspace allocation: temp buffers + GEMM workspace.
   {
-    size_t gemm_ws =
-        std::max(scoreState->workspace_size, valueState->workspace_size);
-    if (scoreTailState)
-      gemm_ws = std::max(gemm_ws, scoreTailState->workspace_size);
-    if (valueTailState)
-      gemm_ws = std::max(gemm_ws, valueTailState->workspace_size);
+    // Over every chunk's pair of algorithms, since the region is allocated once
+    // and the loop below cannot grow it.
+    size_t gemm_ws = 0;
+    for (const GqaChunkPlan &cp : chunks) {
+      gemm_ws = std::max(gemm_ws, cp.score->workspace_size);
+      gemm_ws = std::max(gemm_ws, cp.value->workspace_size);
+    }
     size_t total_needed = temp_end + gemm_ws;
     HIP_CHECK(hipdnn_ep_state_ensure_workspace(state, total_needed));
   }
@@ -1805,29 +2226,66 @@ static int gqa_forward_hipblaslt(
     // no-expand hands seqlens_k_ptr to the append kernel (on-device past_len,
     // no D2H); the expand path already read total_seq host-side so passes null.
     if (present_key && present_value) {
-      // bidirectional_no_past (Whisper encoder / cross-attn): never hand
-      // seqlens_k to the append kernel (it would apply the +1 convention).
-      // ONNX Attention with is_causal=0 + external mask keeps the standard
-      // decode KV path (bidirectional_no_past=false).
+      // bidirectional_no_past (Whisper encoder / cross-attn, KV-sharing decoder
+      // layers): never hand seqlens_k to the append kernel (it would apply the
+      // +1 convention). An onnx.Attention with a past KV cache keeps the
+      // standard decode KV path (bidirectional_no_past=false).
+      //
+      // copy_lo is kv_lo, deliberately the identical value and not a separately
+      // derived one: the bytes this skips writing are then exactly the bytes
+      // the Score and Value GEMMs below skip reading, so the narrowing cannot
+      // be half-applied, and a wrong window is wrong identically for both. That
+      // equality is why this needs no gate of its own -- kv_lo is already 0
+      // whenever no window applies.
+      //
+      // It holds across calls as well as within one. This call writes
+      // [kv_lo, total_seq); the next call has past_len' == total_seq >
+      // past_len, so its own kv_lo == past_len' - W + 1 is strictly greater
+      // than this call's, and its read range is a strict subset of what this
+      // call wrote. That is an induction over calls, not a claim about one
+      // step's stride, so it covers a prefill following a decode as well as
+      // decode following decode -- which is the reason the bound above is
+      // applied at every sq rather than only at sq == 1.
+      //
+      // Only the separate-buffer concat can skip anything. When the cache is
+      // in-place (past_key == present_key) the prefix is already there and
+      // update_kv_cache appends, ignoring this.
       HIP_CHECK(update_kv_cache(
           stream, past_key, past_value, kSrc, vSrc, present_key, present_value,
           static_cast<int>(B), static_cast<int>(past_len), static_cast<int>(sq),
           static_cast<int>(G), static_cast<int>(d),
           static_cast<int>(past_buf_seq), static_cast<int>(present_seq),
           (use_no_expand && !bidirectional_no_past) ? seqlens_k_ptr : nullptr,
-          static_cast<int>(elem_sz), bidirectional_no_past,
-          static_cast<int>(skv)));
+          static_cast<int>(elem_sz), static_cast<int>(kv_lo),
+          bidirectional_no_past, static_cast<int>(skv), KvCacheFormat::Fp16,
+          /*k_scale=*/nullptr, /*v_scale=*/nullptr, kv_bnsd));
     }
 
     // ---- Steps 6-7: KV Expand [B*G,present_seq,d] -> [B*H,total_seq,d] ----
     // Skipped in no-expand mode: the Score/Value GEMMs read K/V directly from
     // the BNSD cache via per-operand batch strides instead.
     if (!use_no_expand) {
-      const void *kCache = present_key ? present_key : key;
-      const void *vCache = present_value ? present_value : value;
+      // The window is selected by advancing the source base pointer rather than
+      // by a new kernel argument. expand_kv_kernel reads
+      // src[g * src_stride + idx], so one offset shifts every group by the same
+      // amount and src_stride keeps describing the untouched cache page -- the
+      // same trick scoreA / valueA use below. The destination is packed over
+      // kv_span, so its stride and the copy length both shrink with it, which
+      // is what makes the skipped positions cost no threads instead of one
+      // predicated-off thread each.
+      // kv_lo is non-zero only when both present pointers exist (see the
+      // narrowing gate above), so this offset never applies to the raw key /
+      // value fallback.
+      const size_t kvExpandOff = static_cast<size_t>(kv_lo) * d * elem_sz;
+      const void *kCache =
+          static_cast<const char *>(present_key ? present_key : key) +
+          kvExpandOff;
+      const void *vCache =
+          static_cast<const char *>(present_value ? present_value : value) +
+          kvExpandOff;
       int kvSrcStride = static_cast<int>(present_seq * d);
-      int kvDstStride = static_cast<int>(total_seq * d);
-      int expandCopy = static_cast<int>(total_seq * d);
+      int kvDstStride = static_cast<int>(kv_span * d);
+      int expandCopy = static_cast<int>(kv_span * d);
 
       HIP_CHECK(
           hip_gqa_expand_kv(stream, kCache, d_Kexp, static_cast<int>(B * H),
@@ -1842,19 +2300,40 @@ static int gqa_forward_hipblaslt(
     // ---- Steps 8-10, per query chunk ----
     // One iteration when chunking is inactive, in which case q0 is 0, c is sq
     // and every pointer and stride below reduces to what it was.
-    const void *scoreA = use_no_expand ? present_key : d_Kexp;
+    //
+    // K and V are advanced to the first key position in range. The cache is
+    // BNSD with d fastest, so this selects a contiguous span and leaves the
+    // per-(b,g) batch stride at present_seq*d. kv_lo is 0 unless the sliding
+    // window narrowed the range.
+    //
+    // elem_sz is the cache's element size as well as the GEMM's: unlike
+    // update_kv_cache, gqa_forward_hipblaslt takes no separate kv_format, so
+    // the two cannot differ here. A quantized KV cache would have to pass its
+    // own element size for this offset to stay correct.
+    const size_t kv_byte_off = static_cast<size_t>(kv_lo) * d * elem_sz;
+    const void *scoreA =
+        (use_no_expand ? static_cast<const char *>(present_key) + kv_byte_off
+                       : static_cast<const char *>(d_Kexp));
     const void *scoreBBase = need_transpose ? d_Qtrans : qSrc;
-    const void *valueA = use_no_expand ? present_value : d_Vexp;
+    const void *valueA =
+        (use_no_expand ? static_cast<const char *>(present_value) + kv_byte_off
+                       : static_cast<const char *>(d_Vexp));
     void *valueCBase = need_transpose ? d_O : output;
     float scoreAlpha = scale;
     float beta = 0.0f;
     float valAlpha = 1.0f;
 
-    for (int64_t q0 = 0; q0 < sq; q0 += sq_chunk) {
-      const int64_t c = std::min<int64_t>(sq_chunk, sq - q0);
-      const bool is_tail = (c != sq_chunk);
-      const GqaGemmCacheEntry *sSt = is_tail ? scoreTailState : scoreState;
-      const GqaGemmCacheEntry *vSt = is_tail ? valueTailState : valueState;
+    for (const GqaChunkPlan &cp : chunks) {
+      const int64_t q0 = cp.q0;
+      const int64_t c = cp.c;
+      // Key positions this chunk actually scores, and where they start.
+      // chunk_kv_lo is absolute (it indexes the bias and drives the mask's
+      // shift); cp.kv_off is the same position relative to kv_lo, which is what
+      // indexes the K / V operands because the expand packed them from kv_lo.
+      const int64_t kv_ext = cp.kv_ext;
+      const int64_t chunk_kv_lo = kv_lo + cp.kv_off;
+      const GqaGemmCacheEntry *sSt = cp.score;
+      const GqaGemmCacheEntry *vSt = cp.value;
 
       // Q and O keep their full-sq batch strides (stated in the GEMM key), so
       // selecting a chunk is a plain offset into the query axis of each.
@@ -1862,9 +2341,17 @@ static int gqa_forward_hipblaslt(
                            static_cast<size_t>(q0) * d * elem_sz;
       void *valueC = static_cast<char *>(valueCBase) +
                      static_cast<size_t>(q0) * d * elem_sz;
+      // The chunk's key range is selected the same way the op-level one is: by
+      // advancing the K / V base pointers. The cache and the expand destination
+      // are both BNSD with d fastest, so a key offset is a contiguous byte
+      // offset, and the per-head batch stride stated in the GEMM key keeps
+      // describing the whole buffer rather than the slice.
+      const size_t chunkKvOff = static_cast<size_t>(cp.kv_off) * d * elem_sz;
+      const void *scoreAc = static_cast<const char *>(scoreA) + chunkKvOff;
+      const void *valueAc = static_cast<const char *>(valueA) + chunkKvOff;
       // The score buffers are re-packed per chunk, so their per-head stride is
-      // the chunk's own row count.
-      const int scoreBatchStride = static_cast<int>(c * total_seq);
+      // the chunk's own row count over the key range actually scored.
+      const int scoreBatchStride = static_cast<int>(c * kv_ext);
 
       // ---- Step 8: Score GEMM (fp16/fp32 in, fp32 out) ----
       // A = K: no-expand reads present_key directly, expand reads d_Kexp.
@@ -1872,27 +2359,18 @@ static int gqa_forward_hipblaslt(
       // (BSHD==BNSD@sq=1).
       hipblasLtMatmulAlgo_t sAlgo = sSt->algo;
       HIPBLAS_CHECK(hipblasLtMatmul(
-          ltHandle, sSt->desc, &scoreAlpha, scoreA, sSt->layA, scoreB,
+          ltHandle, sSt->desc, &scoreAlpha, scoreAc, sSt->layA, scoreB,
           sSt->layB, &beta, d_S_f32, sSt->layC, d_S_f32, sSt->layD, &sAlgo,
           gemm_ws_ptr, gemm_ws_bytes, stream));
 
-      // ---- Step 8b: Add external attention bias (onnx.Attention attn_mask) --
-      // The bias is indexed over the full query range, so the chunk's row
-      // offset is passed through rather than folded into the pointer: with
-      // bias_batch or bias_heads > 1 the plane stride still spans all sq rows.
-      if (attention_bias) {
-        HIP_CHECK(hip_gqa_add_attention_bias_f32(
-            stream, d_S_f32, const_cast<void *>(attention_bias),
-            static_cast<int>(B * H), static_cast<int>(H),
-            static_cast<int>(attn_bias_batch),
-            static_cast<int>(attn_bias_num_heads), static_cast<int>(c),
-            static_cast<int>(total_seq), scoreBatchStride,
-            static_cast<int>(elem_sz), static_cast<int>(sq),
-            static_cast<int>(q0)));
-      }
+      // ---- Step 8b: external attention bias (onnx.Attention attn_mask) ----
+      // Folded into the softmax's own score read below rather than added by a
+      // pass of its own. hip_gqa_add_attention_bias_f32 was a full
+      // read-modify-write over this buffer -- 2.14 GB per head at a 16K prompt
+      // -- to deliver a value the softmax was about to read anyway.
 
       // ---- Step 9: Causal Mask (fp32) + Softmax (fp32 -> fp16/fp32) ----
-      // S is treated as [B*H, c, total_seq] (head stride c*total_seq) by both
+      // S is treated as [B*H, c, kv_span] (head stride c*kv_span) by both
       // GEMM flavours. softmax dtype follows gemm_fp32.
       //
       // The built-in causal triangle is applied whenever !no_causal,
@@ -1911,11 +2389,17 @@ static int gqa_forward_hipblaslt(
       // The mask kernel derives each row's absolute query position as
       // past_len + row, so advancing past_len by the chunk's start puts the
       // triangle and the sliding window in the right place for the chunk.
+      // Under window narrowing the score columns start at kv_lo rather than 0,
+      // and since both of the kernel's predicates reference the query position
+      // only as (past_len_arg + row), shifting past_len down by kv_lo is
+      // exactly equivalent to shifting the column index up by it. No kernel
+      // change needed. (At sq == 1 the narrowed range is precisely the window,
+      // so the kernel then writes nothing -- correct, just redundant.)
       if ((sq > 1 || local_window_size > 0) && !no_causal) {
         HIP_CHECK(hip_gqa_causal_mask_f32(
-            stream, d_S_f32, static_cast<int>(B * H),
-            static_cast<int>(total_seq), static_cast<int>(c), scoreBatchStride,
-            static_cast<int>(past_len + q0),
+            stream, d_S_f32, static_cast<int>(B * H), static_cast<int>(kv_ext),
+            static_cast<int>(c), scoreBatchStride,
+            static_cast<int>(past_len + q0 - chunk_kv_lo),
             static_cast<int>(local_window_size)));
       }
       // fp16 GQA: softmax writes fp16 probabilities for the fp16 Value GEMM.
@@ -1923,16 +2407,40 @@ static int gqa_forward_hipblaslt(
       // fp32 Value GEMM. d_S_fp16 is the probabilities buffer either way (sized
       // by elem_sz above), so the name is fp16-specific but holds fp32 when
       // gemm_fp32.
-      if (gemm_fp32) {
+      //
+      // With a bias, the biased entry folds it in while reading the score. It
+      // takes the bias's own extents and the chunk's / window's offsets into
+      // them, for the same reason hip_gqa_add_attention_bias_f32 did: the score
+      // block is a sub-block of the logical [sq, total_seq] matrix, and with
+      // attn_bias_batch or attn_bias_num_heads > 1 a bumped pointer would
+      // mis-stride every plane after the first.
+      //
+      // Folding here applies the bias AFTER the causal triangle above, which
+      // inverts the order documented at Step 8b. That is safe only because the
+      // triangle writes -INFINITY: adding any finite bias to it leaves
+      // -INFINITY, and where the triangle wrote nothing the sum is the same
+      // either way.
+      if (attention_bias) {
+        HIP_CHECK(hip_gqa_softmax_f32_to_out_biased(
+            stream, d_S_f32, d_S_fp16, static_cast<int>(B * H * c),
+            static_cast<int>(kv_ext), static_cast<int>(c), scoreBatchStride,
+            scoreBatchStride, head_sink, static_cast<int>(H),
+            static_cast<int>(use_smooth_softmax), attention_bias,
+            static_cast<int>(attn_bias_batch),
+            static_cast<int>(attn_bias_num_heads), static_cast<int>(elem_sz),
+            static_cast<int>(gemm_fp32), static_cast<int>(sq),
+            static_cast<int>(q0), static_cast<int>(total_seq),
+            static_cast<int>(chunk_kv_lo)));
+      } else if (gemm_fp32) {
         HIP_CHECK(hip_gqa_softmax_f32_to_f32(
             stream, d_S_f32, d_S_fp16, static_cast<int>(B * H * c),
-            static_cast<int>(total_seq), static_cast<int>(c), scoreBatchStride,
+            static_cast<int>(kv_ext), static_cast<int>(c), scoreBatchStride,
             scoreBatchStride, head_sink, static_cast<int>(H),
             static_cast<int>(use_smooth_softmax)));
       } else {
         HIP_CHECK(hip_gqa_softmax_f32_to_f16(
             stream, d_S_f32, d_S_fp16, static_cast<int>(B * H * c),
-            static_cast<int>(total_seq), static_cast<int>(c), scoreBatchStride,
+            static_cast<int>(kv_ext), static_cast<int>(c), scoreBatchStride,
             scoreBatchStride, head_sink, static_cast<int>(H),
             static_cast<int>(use_smooth_softmax)));
       }
@@ -1943,7 +2451,7 @@ static int gqa_forward_hipblaslt(
       //        GEMM writes straight to output (BSHD==BNSD).
       hipblasLtMatmulAlgo_t vAlgo = vSt->algo;
       HIPBLAS_CHECK(hipblasLtMatmul(
-          ltHandle, vSt->desc, &valAlpha, valueA, vSt->layA, d_S_fp16,
+          ltHandle, vSt->desc, &valAlpha, valueAc, vSt->layA, d_S_fp16,
           vSt->layB, &beta, valueC, vSt->layC, valueC, vSt->layD, &vAlgo,
           gemm_ws_ptr, gemm_ws_bytes, stream));
     }
@@ -1957,12 +2465,37 @@ static int gqa_forward_hipblaslt(
           static_cast<int>(elem_sz)));
     }
 
+    // kv_inplace and the three sequence lengths are here because they decide
+    // whether any of this narrowing does anything: the copy can only be skipped
+    // on the separate-buffer branch, which is exactly kv_inplace=0, and that in
+    // turn is visible only as present_seq differing from past_buf_seq. A model
+    // exporting its cache in place takes the append branch and the copy_lo
+    // below is inert, which is otherwise indistinguishable from the narrowing
+    // failing to engage.
+    // The per-chunk key extents are summarised as their range and their sum
+    // rather than listed: the sum against sq*kv_span is the whole point of the
+    // narrowing (it is the score-matrix area actually computed), and chunks is
+    // what says how many descriptors the loop cycled through.
+    int64_t kv_ext_min = chunks.empty() ? 0 : chunks.front().kv_ext;
+    int64_t kv_ext_max = 0, score_elems = 0;
+    for (const GqaChunkPlan &cp : chunks) {
+      kv_ext_min = std::min(kv_ext_min, cp.kv_ext);
+      kv_ext_max = std::max(kv_ext_max, cp.kv_ext);
+      score_elems += cp.c * cp.kv_ext;
+    }
     RUNTIME_DEBUG_LOG(
         "[REAL] GQA hipBLASLt: B=%lld sq=%lld sq_chunk=%lld total_seq=%lld "
-        "H=%lld G=%lld d=%lld no_expand=%d transpose=%d\n",
+        "kv_lo=%lld kv_span=%lld chunks=%zu kv_ext=[%lld,%lld] "
+        "score_elems=%lld/%lld H=%lld G=%lld d=%lld no_expand=%d "
+        "transpose=%d kv_inplace=%d past_len=%lld past_buf_seq=%lld "
+        "present_seq=%lld\n",
         (long long)B, (long long)sq, (long long)sq_chunk, (long long)total_seq,
-        (long long)H, (long long)G, (long long)d,
-        static_cast<int>(use_no_expand), static_cast<int>(need_transpose));
+        (long long)kv_lo, (long long)kv_span, chunks.size(),
+        (long long)kv_ext_min, (long long)kv_ext_max, (long long)score_elems,
+        (long long)(sq * kv_span), (long long)H, (long long)G, (long long)d,
+        static_cast<int>(use_no_expand), static_cast<int>(need_transpose),
+        static_cast<int>(past_key != nullptr && past_key == present_key),
+        (long long)past_len, (long long)past_buf_seq, (long long)present_seq);
   }
 
 cleanup:
@@ -2054,7 +2587,7 @@ static bool classify_kv_cache(int64_t k_quant_type, int64_t v_quant_type,
 
 //===----------------------------------------------------------------------===//
 // Public wrapper called by generated IR. ABI MUST stay identical to the
-// HipToLLVM lowering (kWrapGQA = "wrap_group_query_attention", 41 params).
+// HipToLLVM lowering (kWrapGQA = "wrap_group_query_attention", 42 params).
 //===----------------------------------------------------------------------===//
 int wrap_group_query_attention(
     RuntimeState *state, int op_state_slot,
@@ -2075,7 +2608,7 @@ int wrap_group_query_attention(
     // Shape values (6)
     int64_t batch_size, int64_t seq_len_q, int64_t seq_len_kv,
     int64_t past_buf_seq, int64_t head_dim, int64_t element_size_bytes,
-    int64_t attn_bias_batch, int64_t attn_bias_num_heads) {
+    int64_t attn_bias_batch, int64_t attn_bias_num_heads, int64_t kv_bnsd) {
   OP_PROFILE(
       "gqa",
       [&] {
@@ -2249,7 +2782,8 @@ int wrap_group_query_attention(
         attention_bias, attn_bias_batch, attn_bias_num_heads, output,
         present_key, present_value, batch_size, seq_len_q, seq_len_kv,
         past_buf_seq, num_heads, kv_num_heads, head_dim, scale, do_rotary,
-        local_window_size, no_causal != 0, element_size_bytes, op_state_slot);
+        local_window_size, no_causal != 0, element_size_bytes, op_state_slot,
+        kv_bnsd != 0);
     if (lrc != 0)
       fprintf(stderr,
               "wrap_group_query_attention: legacy decomposed pipeline failed "

@@ -8,6 +8,7 @@
 
 #include "hip/Dialect/IR/HipDialect.h"
 #include "hip/Dialect/Transforms/Passes.h"
+#include "hip/datatype_abi.h"
 #include "hip/debug_log.h"
 #include "mlir/Conversion/ArithToLLVM/ArithToLLVM.h"
 #include "mlir/Conversion/ControlFlowToLLVM/ControlFlowToLLVM.h"
@@ -92,8 +93,11 @@ inline constexpr const char *kWrapMultiHeadAttention =
     "wrap_multi_head_attention";
 inline constexpr const char *kWrapMatMulNBits = "wrap_matmul_nbits";
 inline constexpr const char *kWrapQMoE = "wrap_qmoe";
+inline constexpr const char *kWrapQMoEAmd = "wrap_qmoe_amd";
 inline constexpr const char *kWrapGatherBlockQuantized =
     "wrap_gather_block_quantized";
+inline constexpr const char *kWrapQuantizeLinear = "wrap_quantize_linear";
+inline constexpr const char *kWrapDequantizeLinear = "wrap_dequantize_linear";
 inline constexpr const char *kWrapGemm = "wrap_gemm";
 inline constexpr const char *kWrapLinearAttention = "wrap_linear_attention";
 inline constexpr const char *kHipGetConstant = "hipdnn_ep_constant_get";
@@ -113,6 +117,7 @@ inline constexpr const char *kWrapSin = "wrap_sin";
 inline constexpr const char *kWrapCeil = "wrap_ceil";
 inline constexpr const char *kWrapRound = "wrap_round";
 inline constexpr const char *kWrapAtan = "wrap_atan";
+inline constexpr const char *kWrapFloor = "wrap_floor";
 inline constexpr const char *kWrapExp = "wrap_exp";
 inline constexpr const char *kWrapSigmoid = "wrap_sigmoid";
 inline constexpr const char *kWrapTanh = "wrap_tanh";
@@ -135,6 +140,9 @@ inline constexpr const char *kWrapSlice = "wrap_slice";
 inline constexpr const char *kWrapScatterND = "wrap_scatter_nd";
 inline constexpr const char *kWrapNonZero = "wrap_nonzero";
 inline constexpr const char *kWrapSize = "wrap_size";
+inline constexpr const char *kWrapQElementwise = "wrap_qelementwise";
+inline constexpr const char *kWrapQMatMul = "wrap_qmatmul";
+inline constexpr const char *kWrapQConv = "wrap_qconv";
 // Synchronize the stream and read a device i32 scalar back to the host
 // (used by hip.readback_dim to materialise a data-dependent dynamic dim).
 inline constexpr const char *kHipReadbackI32 = "hipdnn_ep_readback_i32";
@@ -152,6 +160,11 @@ inline constexpr int64_t kOffsetIdx = 2;
 inline constexpr int64_t kSizesIdx = 3;
 inline constexpr int64_t kStridesIdx = 4;
 
+// com.amd QMoE (hip.qmoe_amd / wrap_qmoe_amd) activation and routing modes.
+// Values must match HIPDNN_EP_QMOE_AMD_* in lib/Runtime/hipdnn_ep_runtime.h.
+inline constexpr int64_t kQMoEAmdActivationRelu2 = 0;
+inline constexpr int64_t kQMoEAmdRoutingSigmoid = 0;
+
 // Window-pool reduction mode constants (hip.pool / wrap_pool).
 // Values must match HIPDNN_EP_POOL_* in lib/Runtime/hipdnn_ep_runtime.h
 // and the `pool_mode` constants used in OnnxToHip/PoolConversion.cpp.
@@ -165,29 +178,31 @@ inline constexpr int64_t kGlobalPoolAverage = 0;
 inline constexpr int64_t kGlobalPoolMax = 1;
 inline constexpr int64_t kGlobalPoolLp = 2;
 
-// Maps MLIR element type to runtime data type enum (HIPDNN_EP_DATATYPE_*).
-// Values must match the #defines in hipdnn_ep_runtime.h.
-// Returns -1 for unsupported types.
+// Maps MLIR element type to the runtime data type identifier shared through
+// hip/datatype_abi.h. Returns HIPDNN_EP_DATATYPE_UNSUPPORTED for types the
+// runtime cannot name.
 inline int64_t getHipdnnDataType(Type elemType) {
   if (elemType.isF32())
-    return 0; // HIPDNN_EP_DATATYPE_FLOAT
+    return HIPDNN_EP_DATATYPE_FLOAT;
   if (elemType.isF16())
-    return 1; // HIPDNN_EP_DATATYPE_HALF
+    return HIPDNN_EP_DATATYPE_HALF;
   if (elemType.isBF16())
-    return 2; // HIPDNN_EP_DATATYPE_BFLOAT16
+    return HIPDNN_EP_DATATYPE_BFLOAT16;
   if (elemType.isInteger(32))
-    return 3; // HIPDNN_EP_DATATYPE_INT32
+    return HIPDNN_EP_DATATYPE_INT32;
   if (elemType.isInteger(64))
-    return 4; // HIPDNN_EP_DATATYPE_INT64
+    return HIPDNN_EP_DATATYPE_INT64;
   if (elemType.isUnsignedInteger(8))
-    return 7; // HIPDNN_EP_DATATYPE_UINT8
+    return HIPDNN_EP_DATATYPE_UINT8;
   if (elemType.isSignedInteger(8) || elemType.isSignlessInteger(8))
-    return 5; // HIPDNN_EP_DATATYPE_INT8
+    return HIPDNN_EP_DATATYPE_INT8;
   if (elemType.isF64())
-    return 6; // HIPDNN_EP_DATATYPE_DOUBLE
+    return HIPDNN_EP_DATATYPE_DOUBLE;
+  if (elemType.isUnsignedInteger(16))
+    return HIPDNN_EP_DATATYPE_UINT16;
   if (elemType.isInteger(16))
-    return 8; // HIPDNN_EP_DATATYPE_INT16
-  return -1;
+    return HIPDNN_EP_DATATYPE_INT16;
+  return HIPDNN_EP_DATATYPE_UNSUPPORTED;
 }
 
 // Tensor operation types (must match runtime enum).
@@ -372,6 +387,12 @@ inline SmallVector<Value, 4> extractShape4D(MemRefType type, Value descriptor,
   return dims;
 }
 
+// Must match HIPDNN_EP_QELEMENTWISE_* in lib/Runtime/hipdnn_ep_runtime.h
+enum HipdnnQElementwiseKind : int64_t {
+  kQElementwiseAdd = 0,
+  kQElementwiseMul = 1,
+};
+
 // Must match HIPDNN_EP_TENSOR_OP_* in lib/Runtime/hipdnn_ep_runtime.h
 enum HipdnnTensorOp : int64_t {
   kTensorOpMul = 0,
@@ -435,8 +456,12 @@ void populateMatMulNBitsLoweringPatterns(const LLVMTypeConverter &converter,
                                          RewritePatternSet &patterns);
 void populateQMoELoweringPatterns(const LLVMTypeConverter &converter,
                                   RewritePatternSet &patterns);
+void populateQMoEAmdLoweringPatterns(const LLVMTypeConverter &converter,
+                                     RewritePatternSet &patterns);
 void populateGatherBlockQuantizedLoweringPatterns(
     const LLVMTypeConverter &converter, RewritePatternSet &patterns);
+void populateQdqLoweringPatterns(const LLVMTypeConverter &converter,
+                                 RewritePatternSet &patterns);
 void populateGraphLoweringPatterns(const LLVMTypeConverter &converter,
                                    RewritePatternSet &patterns);
 void populateCausalConvWithStateLoweringPatterns(
@@ -500,7 +525,12 @@ void populateGridSampleLoweringPatterns(const LLVMTypeConverter &converter,
                                         RewritePatternSet &patterns);
 void populateGlobalPoolLoweringPatterns(const LLVMTypeConverter &converter,
                                         RewritePatternSet &patterns);
-
+void populateQElementwiseLoweringPatterns(const LLVMTypeConverter &converter,
+                                          RewritePatternSet &patterns);
+void populateQMatMulLoweringPatterns(const LLVMTypeConverter &converter,
+                                     RewritePatternSet &patterns);
+void populateQConvLoweringPatterns(const LLVMTypeConverter &converter,
+                                   RewritePatternSet &patterns);
 } // namespace hip
 } // namespace mlir
 
