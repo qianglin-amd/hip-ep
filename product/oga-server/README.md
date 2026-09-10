@@ -100,6 +100,8 @@ Every setting is an environment variable; the common ones also have flags.
 | `HIPEP_MAX_TOKENS` | `512` | Default completion length |
 | `HIPEP_MAX_JOBS` | `1` | Concurrent port/quantize jobs |
 | `HIPEP_CORS` | `1` | Allow cross-origin browser clients |
+| `HIPEP_KV_REUSE` | `1` | Carry a conversation's KV cache between turns |
+| `HIPEP_KV_GROWTH` | `2048` | Token granularity of a carried cache's budget |
 
 ## Concurrency
 

@@ -19,10 +19,13 @@ Two properties matter for correctness of the product, not just of the code:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 import queue
+import shutil
+import tempfile
 import threading
 import time
 from collections.abc import AsyncIterator
@@ -39,12 +42,82 @@ from .base import (
     ModelNotAvailable,
     Stopwatch,
     estimate_tokens,
+    image_prefill_tokens,
 )
 from .tools import describe_tools, extract_tool_calls
 
 log = logging.getLogger(__name__)
 
 _SENTINEL = object()
+
+# How long the generating thread stands aside each token so the event loop can write
+# what has been produced. Short next to a decode, which is tens of milliseconds on the
+# models served here; shorter values leave the stream arriving in visible bursts.
+_YIELD_S = 0.001
+
+# Carrying a generator between turns keeps its KV cache, so a follow-up question only
+# has to read the words that were added rather than the whole conversation again.
+# Set HIPEP_KV_REUSE=0 to prefill every turn from scratch, which costs time but makes a
+# reply depend only on the conversation and not on what the server happens to hold.
+_KV_REUSE = os.environ.get("HIPEP_KV_REUSE", "1").lower() not in ("0", "false", "no")
+
+# A kept generator can only grow to the budget it was built with, so that budget is
+# rounded up to leave room for turns to come. Sizing it to the current turn exactly
+# would force a rebuild, and so a full prefill, on the very next question.
+_KV_GROWTH = max(1, int(os.environ.get("HIPEP_KV_GROWTH", "2048")))
+
+
+@dataclass
+class _Session:
+    """A generator kept alive between turns, and what its cache is known to hold.
+
+    `fed` is the token sequence the cache was built from, which is the prompt plus
+    everything generated from it. The next turn is only allowed onto this cache for as
+    far as it agrees with `fed`; past that point the cache describes a different
+    conversation and has to be rewound.
+    """
+
+    generator: Any
+    fed: list[int]
+    budget: int
+    search: tuple[tuple[str, Any], ...]
+
+
+def _common_prefix(a: list[int], b: list[int]) -> int:
+    n = 0
+    for x, y in zip(a, b, strict=False):
+        if x != y:
+            break
+        n += 1
+    return n
+
+
+def _resume(loaded: _LoadedModel, tokens: list[int], key: tuple, needed: int) -> Any | None:
+    """Continue the kept generator on `tokens`, or None if it cannot serve them.
+
+    The saved cache is usable up to the point where this prompt still matches what
+    built it. That is normally the whole of the previous turn, so only the new question
+    is read; when the caller edits or drops earlier messages the match ends sooner and
+    the cache is rewound to there, which still spares everything before the change.
+    """
+    session = loaded.session
+    if session is None or session.search != key or session.budget < needed:
+        return None
+    # One token has to be left to append: a generator is driven by feeding it something
+    # to answer, so a prompt already held in full still has to re-read its last token.
+    common = min(_common_prefix(session.fed, tokens), len(tokens) - 1)
+    if common <= 0:
+        return None
+    try:
+        if common < len(session.fed):
+            session.generator.rewind_to(common)
+        session.generator.append_tokens(tokens[common:])
+    except Exception as exc:  # noqa: BLE001 - a refused cache is recoverable
+        log.warning("could not continue the kept generator, prefilling instead: %s", exc)
+        loaded.session = None
+        return None
+    log.debug("reused %d of %d prompt tokens for %s", common, len(tokens), loaded.model.id)
+    return session.generator
 
 
 def _drain(out: queue.Queue) -> list[Any]:
@@ -121,16 +194,28 @@ class _LoadedModel:
         # Multimodal models expose a processor; text-only models expose a tokenizer.
         self.processor = None
         self.tokenizer = None
-        if model.supports_vision and hasattr(og, "MultiModalProcessor"):
+        if model.supports_vision:
+            # The processor is built by the model, not constructed from it: the class is
+            # exposed for its methods but has no constructor bound, so calling it raises
+            # and leaves a vision model reading its prompt as plain text.
             try:
-                self.processor = og.MultiModalProcessor(self.og_model)
+                self.processor = self.og_model.create_multimodal_processor()
             except Exception as exc:  # noqa: BLE001
-                log.warning("no multimodal processor for %s: %s", model.id, exc)
+                log.error(
+                    "no multimodal processor for %s, so images cannot be read: %s",
+                    model.id,
+                    exc,
+                )
         if self.processor is None:
             self.tokenizer = og.Tokenizer(self.og_model)
         self.lock = threading.Lock()
+        # At most one conversation is carried at a time. A second one would double the
+        # cache held on the GPU for a case the console cannot reach, so a request that
+        # does not continue the kept conversation replaces it instead of joining it.
+        self.session: _Session | None = None
 
     def close(self) -> None:
+        self.session = None
         self.processor = None
         self.tokenizer = None
         self.og_model = None
@@ -292,18 +377,32 @@ class OgaEngine(Engine):
 
             prompt = loaded.chat.render(request.messages, request.tools)
 
+            # A model with no working processor cannot see an image, but it will answer
+            # anyway and what it invents reads exactly like a description of the picture
+            # that was sent. Refusing is the only way the caller finds out.
+            if request.images and loaded.processor is None:
+                raise EngineError(
+                    f"'{request.model.id}' cannot read images on this build: its "
+                    "multimodal processor failed to load, so the server would be "
+                    "answering from the text alone. The server log records why."
+                )
+
             # The model holds one generator at a time; concurrent requests for the same
             # model are serialised here and queued by the scheduler above.
             with loaded.lock:
                 if loaded.processor is not None:
-                    images = _load_images(og, request)
-                    inputs = loaded.processor(prompt, images=images)
+                    # The staged files only have to outlive the processor call: what it
+                    # returns is the pixels already read, not a reference to the path.
+                    with _staged_images(og, request) as images:
+                        inputs = loaded.processor(prompt, images=images)
                     tokens = None
                     detok = loaded.processor.create_stream()
-                    prompt_len = 0
+                    prompt_len = _input_length(inputs, prompt, len(request.images))
                 else:
                     inputs = None
-                    tokens = loaded.tokenizer.encode(prompt)
+                    # Listed rather than left as the tokenizer's array, because these
+                    # tokens are compared against a kept cache token by token.
+                    tokens = list(loaded.tokenizer.encode(prompt))
                     detok = loaded.tokenizer.create_stream()
                     prompt_len = len(tokens)
 
@@ -316,19 +415,35 @@ class OgaEngine(Engine):
                 # settled once that prompt exists. Sizing it from the raw request text
                 # misses everything the chat markup adds, and onnxruntime-genai rejects
                 # a budget smaller than the input outright rather than clamping it.
-                search["max_length"] = min(
-                    request.model.max_context, counted + request.params.max_tokens
-                )
-                params.set_search_options(**search)
+                needed = counted + request.params.max_tokens
+                # Sampling settings are fixed when the generator is built, so a turn
+                # that changes them cannot join a cache built under the old ones.
+                key = tuple(sorted(search.items()))
+                reusable = _KV_REUSE and inputs is None
 
-                # The prompt attaches to the generator rather than to the params, and
-                # logits are computed by generate_next_token. Both moved when
-                # onnxruntime-genai gained continuous batching.
-                generator = og.Generator(loaded.og_model, params)
-                if inputs is not None:
-                    generator.set_inputs(inputs)
-                else:
-                    generator.append_tokens(tokens)
+                generator = None
+                if reusable:
+                    generator = _resume(loaded, tokens, key, needed)
+                if generator is None:
+                    budget = needed
+                    if reusable:
+                        # Room for the turns after this one, so the cache survives them.
+                        budget = -(-needed // _KV_GROWTH) * _KV_GROWTH
+                    search["max_length"] = min(request.model.max_context, budget)
+                    params.set_search_options(**search)
+                    # The prompt attaches to the generator rather than to the params,
+                    # and logits are computed by generate_next_token. Both moved when
+                    # onnxruntime-genai gained continuous batching.
+                    loaded.session = None
+                    generator = og.Generator(loaded.og_model, params)
+                    if inputs is not None:
+                        generator.set_inputs(inputs)
+                    else:
+                        generator.append_tokens(tokens)
+                    if reusable:
+                        loaded.session = _Session(
+                            generator, list(tokens), search["max_length"], key
+                        )
                 # The family's own end-of-turn markers, on top of anything the caller
                 # asked for, so a model whose artifact under-declares its EOS ids still
                 # stops at the end of its answer instead of continuing the transcript.
@@ -337,6 +452,13 @@ class OgaEngine(Engine):
                 while not generator.is_done():
                     if cancel.is_set():
                         break
+                    # onnxruntime-genai holds the GIL for the whole of a decode, and
+                    # this thread reacquires it before the event loop is scheduled, so
+                    # the frames the loop has to write pile up until generation ends
+                    # and the answer arrives in one burst. Standing aside for a moment
+                    # each token leaves the loop a window to drain the queue and write,
+                    # which is what makes the stream arrive as it is produced.
+                    time.sleep(_YIELD_S)
                     generator.generate_next_token()
                     if first_token_at is None:
                         first_token_at = time.perf_counter()
@@ -365,8 +487,17 @@ class OgaEngine(Engine):
                         out.put(piece)
                 if stops and buffered and not cancel.is_set():
                     out.put(buffered)
+
+                # What the cache holds now is the prompt plus whatever was generated
+                # from it, including a part-written answer from a cancelled turn. Read
+                # it back from the generator rather than reconstructing it, so the next
+                # turn compares against the tokens the model actually saw.
+                if loaded.session is not None:
+                    loaded.session.fed = list(generator.get_sequence(0))
         except Exception as exc:  # noqa: BLE001 - surfaced to the client as an error
             log.exception("generation failed for %s", request.model.id)
+            # The generator failed part way, so what its cache holds is unknown.
+            loaded.session = None
             out.put(exc)
         finally:
             out.put(_SENTINEL)
@@ -390,9 +521,19 @@ class ChatFormat:
     reply: str
     prefix: str = ""
     stops: tuple[str, ...] = ()
+    # How an attached image is marked inside a turn, with `{n}` the image's position in
+    # the conversation. The processor matches the pictures it was handed against these
+    # markers and refuses the prompt if the two disagree, and the marker is per family:
+    # the Phi wording in a Qwen prompt is read as ordinary text, which leaves the model
+    # describing a picture it was never shown.
+    image: str = "Picture {n}: <|vision_start|><|image_pad|><|vision_end|>\n"
 
     def render(self, messages: Any, tools: list[dict[str, Any]] | None = None) -> str:
         parts = [self.prefix]
+        # Images are numbered across the conversation rather than within a turn, which
+        # is what the families' own templates do and what keeps the count matching the
+        # pictures handed to the processor.
+        seen_images = 0
         if tools:
             # The tool list is a system turn because that is where these models were
             # trained to look for it, and because it must not read as something the
@@ -433,8 +574,10 @@ class ChatFormat:
             if message.images:
                 # Image placeholders are what the multimodal processors look for.
                 placeholders = "".join(
-                    f"<|image_{i + 1}|>" for i in range(len(message.images))
+                    self.image.format(n=seen_images + i + 1)
+                    for i in range(len(message.images))
                 )
+                seen_images += len(message.images)
                 content = placeholders + content
             template = self.turns.get(role, self.turns["user"])
             parts.append(template.format(content=content))
@@ -443,7 +586,12 @@ class ChatFormat:
 
 
 def _symmetric(
-    turn: str, reply: str, *, prefix: str = "", stops: tuple[str, ...] = ()
+    turn: str,
+    reply: str,
+    *,
+    prefix: str = "",
+    stops: tuple[str, ...] = (),
+    image: str | None = None,
 ) -> ChatFormat:
     """A format whose three roles differ only by name."""
     return ChatFormat(
@@ -454,7 +602,12 @@ def _symmetric(
         reply=reply,
         prefix=prefix,
         stops=stops,
+        **({"image": image} if image else {}),
     )
+
+
+# Phi marks an image by its number alone; the Qwen wording carries no meaning here.
+_PHI_IMAGE = "<|image_{n}|>\n"
 
 
 # ChatML, used by the Qwen families and the default for anything unrecognised, since it
@@ -484,6 +637,7 @@ _CHAT_FORMATS: tuple[tuple[str, ChatFormat], ...] = (
             "<|im_start|>{role}<|im_sep|>{content}<|im_end|>",
             "<|im_start|>assistant<|im_sep|>",
             stops=("<|im_end|>",),
+            image=_PHI_IMAGE,
         ),
     ),
     (
@@ -492,6 +646,7 @@ _CHAT_FORMATS: tuple[tuple[str, ChatFormat], ...] = (
             "<|{role}|>\n{content}<|end|>\n",
             "<|assistant|>\n",
             stops=("<|end|>", "<|user|>"),
+            image=_PHI_IMAGE,
         ),
     ),
     (
@@ -505,6 +660,7 @@ _CHAT_FORMATS: tuple[tuple[str, ChatFormat], ...] = (
             },
             reply="<start_of_turn>model\n",
             stops=("<end_of_turn>",),
+            image="<start_of_image>",
         ),
     ),
     (
@@ -619,15 +775,62 @@ def _model_type(path: Path) -> str | None:
     return model.get("type") if isinstance(model, dict) else None
 
 
-def _load_images(og: Any, request: GenerationRequest) -> Any:
-    """Wrap request image bytes in the GenAI Images container."""
-    if not request.images:
-        return None
-    import tempfile
+def _input_length(inputs: Any, prompt: str, image_count: int) -> int:
+    """How many tokens the processor actually produced for a prompt and its images.
 
-    paths = []
-    for i, data in enumerate(request.images):
-        tmp = Path(tempfile.gettempdir()) / f"hipep-img-{os.getpid()}-{id(request)}-{i}.png"
-        tmp.write_bytes(data)
-        paths.append(str(tmp))
-    return og.Images.open(*paths)
+    A picture expands into hundreds of tokens that the prompt text gives no sign of, so
+    a budget estimated from the words alone is far smaller than the input it has to
+    cover and onnxruntime-genai rejects the prompt outright. The processor knows the
+    real figure; the estimate is kept only for a build that does not report a shape.
+    """
+    try:
+        return int(inputs["input_ids"].shape[-1])
+    except Exception:  # noqa: BLE001 - any processor that does not report a shape
+        return estimate_tokens(prompt) + image_prefill_tokens(image_count)
+
+
+# What each image format starts with, since the loader dispatches on the file name and
+# a caller may send any of them under any content type.
+_IMAGE_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"\x89PNG\r\n\x1a\n", ".png"),
+    (b"\xff\xd8\xff", ".jpg"),
+    (b"GIF8", ".gif"),
+    (b"BM", ".bmp"),
+    (b"II*\x00", ".tiff"),
+    (b"MM\x00*", ".tiff"),
+)
+
+
+def _image_suffix(data: bytes) -> str:
+    """Name a staged image after what it actually is, not what it was labelled."""
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    for magic, suffix in _IMAGE_MAGIC:
+        if data.startswith(magic):
+            return suffix
+    return ".png"
+
+
+@contextlib.contextmanager
+def _staged_images(og: Any, request: GenerationRequest) -> Any:
+    """Stage the request's images on disk for as long as the processor needs them.
+
+    onnxruntime-genai opens images by path, so the bytes have to be written somewhere
+    first. A directory of its own per request keeps two things right that a shared name
+    did not: `id()` is reused as soon as an object is freed, so naming files after the
+    request eventually handed one request's path to another, and the files were left
+    behind on every call. The directory goes away once the processor has read it.
+    """
+    if not request.images:
+        yield None
+        return
+    folder = Path(tempfile.mkdtemp(prefix="hipep-img-"))
+    try:
+        paths = []
+        for i, data in enumerate(request.images):
+            tmp = folder / f"{i}{_image_suffix(data)}"
+            tmp.write_bytes(data)
+            paths.append(str(tmp))
+        yield og.Images.open(*paths)
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)

@@ -48,6 +48,16 @@ def test_pull_runs_every_stage_and_installs(
     assert chat_model in installed
 
 
+def test_port_scratch_space_is_not_offered_as_a_model(client: TestClient, settings) -> None:
+    """Porting works in `.ports` inside the store, so the listing has to tell a
+    scratch directory from an install: one shown as a model cannot be run or removed."""
+    (settings.models_dir / ".ports" / "half-built").mkdir(parents=True)
+
+    listed = {m["id"] for m in client.get("/v1/local").json()["models"]}
+
+    assert ".ports" not in listed
+
+
 def test_pull_reports_transfer_progress(client: TestClient, chat_model: str, finished) -> None:
     job = client.post("/v1/pull", json={"model": chat_model}).json()["job"]
     result = finished(client, job["id"])["result"]

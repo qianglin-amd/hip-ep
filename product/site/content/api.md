@@ -107,21 +107,23 @@ Pass `tools` in the OpenAI shape. The reply carries `tool_calls` and a `finish_r
 `tool_calls`, and your code runs the tool and sends the result back as a `tool` message.
 
 ```python
-tools = [{
-    "type": "function",
-    "function": {
-        "name": "get_current_time",
-        "description": "Get the current date and time.",
-        "parameters": {"type": "object", "properties": {}, "required": []},
-    },
-}]
+tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_current_time",
+            "description": "Get the current date and time.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    }
+]
 
 messages = [{"role": "user", "content": "What time is it?"}]
 first = client.chat.completions.create(model="qwen2.5:14b", messages=messages, tools=tools)
 call = first.choices[0].message.tool_calls[0]
 
 messages += [
-    first.choices[0].message,          # the turn that asked, sent back unchanged
+    first.choices[0].message,  # the turn that asked, sent back unchanged
     {"role": "tool", "tool_call_id": call.id, "content": '{"iso": "2026-09-08T08:27:54Z"}'},
 ]
 final = client.chat.completions.create(model="qwen2.5:14b", messages=messages, tools=tools)

@@ -490,6 +490,32 @@ HIP_KERNEL_API int hip_leaky_relu(
     double alpha);
 
 /* =========================================================================
+ * Swish activation
+ * =========================================================================
+ *
+ * Element-wise Swish: y = x * sigmoid(alpha * x) (ONNX opset 24).
+ * At alpha == 1 this is SiLU.
+ *
+ * Parameters:
+ *   stream       - HIP stream (cast to hipStream_t internally)
+ *   input        - Device pointer to input tensor
+ *   output       - Device pointer to output tensor
+ *   num_elements - Total number of elements
+ *   hip_dtype    - Data type enum (HIP_DTYPE_FLOAT32, HIP_DTYPE_FLOAT16,
+ *                  HIP_DTYPE_FLOAT64)
+ *   alpha        - Sigmoid gain (default 1.0 per ONNX spec)
+ *
+ * Returns: 0 on success (hipSuccess), non-zero hipError_t on failure
+ */
+HIP_KERNEL_API int hip_swish(
+    void* stream,
+    const void* input,
+    void* output,
+    int64_t num_elements,
+    int hip_dtype,
+    double alpha);
+
+/* =========================================================================
  * Softplus activation
  * =========================================================================
  *
@@ -1980,7 +2006,12 @@ HIP_KERNEL_API int hip_gather_block_quantized(
  */
 
 /* Top-k routing: find top-k experts per token from router_probs.
- *   router_probs   - GPU [num_tokens, num_experts]
+ *   router_probs   - GPU [num_tokens, num_experts] routing logits
+ *   router_weights - GPU [num_tokens, num_experts] or null. When null the
+ *                    softmax of router_probs supplies the mixing weights.
+ *                    When present router_probs only selects the experts and
+ *                    the mixing weights are gathered from router_weights at
+ *                    the selected indices (ONNX QMoE input 14).
  *   expert_indices - GPU [num_tokens, k] int32 (output)
  *   expert_weights - GPU [num_tokens, k] (output, same type as probs)
  *   normalize      - 1 to normalize selected weights (sum-to-one)
@@ -1988,6 +2019,7 @@ HIP_KERNEL_API int hip_gather_block_quantized(
 HIP_KERNEL_API int hip_qmoe_topk_routing(
     void* stream,
     const void* router_probs,
+    const void* router_weights,
     void* expert_indices,
     void* expert_weights,
     int64_t num_tokens,

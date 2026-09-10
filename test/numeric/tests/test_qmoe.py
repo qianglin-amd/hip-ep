@@ -22,15 +22,16 @@ Weight statistics (from real model, layer 0):
 
 Input context:
   hidden input:   post-layernorm, approximately normalised (range [-1, 1])
-  router weights: raw logits from router projection (range [-5, 5], std ~ 1.2)
+  router probs:   raw logits from router projection (range [-5, 5], std ~ 1.2)
 """
+
+import functools
 
 import numpy as np
 import pytest
-from onnx import TensorProto, helper, numpy_helper
-
 from framework.comparator import compare_outputs
 from framework.onnx_utils import make_model_from_nodes
+from onnx import TensorProto, helper, numpy_helper
 
 SEQ_LENS = [1, 128]
 HIDDEN = 2880
@@ -54,6 +55,7 @@ def _make_qmoe_model(
     down_scale_range: tuple[float, float] = (0.001, 0.02),
     down_bias_range: tuple[float, float] = (-0.5, 0.5),
     seed: int = 42,
+    separate_router_weights: bool = False,
 ):
     """Build a QMoE ONNX model with random quantized expert weights.
 
@@ -63,6 +65,11 @@ def _make_qmoe_model(
 
     Scale and bias ranges are tuneable to match real model distributions.
     Scales are always positive (matching the real GPT-OSS-20B pattern).
+
+    With ``separate_router_weights`` the model takes the optional input 14,
+    which decouples expert selection from output weighting: ``router_probs``
+    only picks the top-k experts and the mixing weights are gathered from
+    ``router_agg_weights`` at those indices.
     """
     down_in = intermediate // 2
     packed_gate_up = hidden // 2
@@ -76,7 +83,12 @@ def _make_qmoe_model(
         [batch, seq_len, hidden],
     )
     router = helper.make_tensor_value_info(
-        "router_weights",
+        "router_probs",
+        TensorProto.FLOAT16,
+        [seq_len, num_experts],
+    )
+    router_agg = helper.make_tensor_value_info(
+        "router_agg_weights",
         TensorProto.FLOAT16,
         [seq_len, num_experts],
     )
@@ -131,21 +143,30 @@ def _make_qmoe_model(
         numpy_helper.from_array(down_bias, name="down_bias"),
     ]
 
+    node_inputs = [
+        "input",
+        "router_probs",
+        "gate_up_qweight",
+        "gate_up_scales",
+        "gate_up_bias",
+        "down_qweight",
+        "down_scales",
+        "down_bias",
+        "",  # fc3_experts_weights
+        "",  # fc3_scales
+        "",  # fc3_experts_bias
+    ]
+    if separate_router_weights:
+        node_inputs += [
+            "",  # fc1_zero_points
+            "",  # fc2_zero_points
+            "",  # fc3_zero_points
+            "router_agg_weights",
+        ]
+
     node = helper.make_node(
         "QMoE",
-        [
-            "input",
-            "router_weights",
-            "gate_up_qweight",
-            "gate_up_scales",
-            "gate_up_bias",
-            "down_qweight",
-            "down_scales",
-            "down_bias",
-            "",
-            "",
-            "",
-        ],
+        node_inputs,
         ["output"],
         domain="com.microsoft",
         activation_type="swiglu",
@@ -163,12 +184,32 @@ def _make_qmoe_model(
     ms_opset = helper.make_opsetid("com.microsoft", 1)
     return make_model_from_nodes(
         [node],
-        [x, router],
+        [x, router, router_agg] if separate_router_weights else [x, router],
         [output],
         initializers=initializers,
         opset=21,
         extra_opsets=[ms_opset],
     )
+
+
+@functools.cache
+def _cpu_supports_router_weights() -> bool:
+    """Whether the installed ORT CPU kernel implements QMoE input 14.
+
+    The input was added in ORT 1.24.5. Older CPU kernels reject the extra
+    operand, which would fail the reference leg rather than the EP under test.
+    """
+    import onnxruntime as ort
+
+    model = _make_qmoe_model(1, 4, 64, 128, 4, 2, separate_router_weights=True)
+    try:
+        ort.InferenceSession(
+            model.SerializeToString(),
+            providers=["CPUExecutionProvider"],
+        )
+    except Exception:  # noqa: BLE001 - any failure here means the input is unusable
+        return False
+    return True
 
 
 class TestQMoE:
@@ -235,4 +276,56 @@ class TestQMoE:
         )
 
         actual, expected = model_runner.run_sample(model, [x, router])
+        compare_outputs(actual, expected, atol=1e-1, rtol=1e-2, cos_threshold=0.99)
+
+    @pytest.mark.parametrize(
+        "seq_len,hidden,intermediate,num_experts,top_k,block_size",
+        [
+            (8, 64, 128, 4, 2, 32),
+            # Qwen3-30B-A3B MoE layer: 128 experts, top-8, 128-element blocks.
+            (1, 2048, 1536, 128, 8, 128),
+        ],
+    )
+    def test_qmoe_separate_router_weights(
+        self,
+        model_runner,
+        seq_len,
+        hidden,
+        intermediate,
+        num_experts,
+        top_k,
+        block_size,
+    ):
+        """QMoE with the optional `router_weights` input (index 14).
+
+        Expert selection reads router_probs while the mixing weights come from
+        a different tensor, so a wrong implementation that softmaxes the
+        aggregation tensor or reuses the selection scores diverges from the
+        reference even though the chosen experts match.
+        """
+        if not _cpu_supports_router_weights():
+            pytest.skip("installed onnxruntime CPU kernel predates QMoE router_weights")
+
+        model = _make_qmoe_model(
+            1,
+            seq_len,
+            hidden,
+            intermediate,
+            num_experts,
+            top_k,
+            block_size,
+            separate_router_weights=True,
+        )
+
+        rng = np.random.default_rng(99)
+        x = rng.uniform(-1, 1, [1, seq_len, hidden]).astype(np.float16)
+        router = (rng.standard_normal([seq_len, num_experts]) * 1.2).astype(np.float16)
+
+        # Aggregation weights are independent of the selection logits, and
+        # positive so that `normalize_routing_weights` has a well-defined sum.
+        logits = rng.standard_normal([seq_len, num_experts])
+        agg = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        agg = (agg / agg.sum(axis=-1, keepdims=True)).astype(np.float16)
+
+        actual, expected = model_runner.run_sample(model, [x, router, agg])
         compare_outputs(actual, expected, atol=1e-1, rtol=1e-2, cos_threshold=0.99)

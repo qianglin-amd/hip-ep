@@ -4,7 +4,10 @@ Licensed under the MIT License.
 -->
 # HIP EP Product Plan
 
-Status: **Draft for review** · Author: HIP EP team · Date: 2026-08-28 · Plan ID: `HIPEP-PROD-2026H2`
+Status: **Draft for review** · Author: HIP EP team · Date: 2026-09-02 · Plan ID: `HIPEP-PROD-2026H2`
+
+Revision 2 replaces the six-milestone schedule that ran to January 2027 with three
+phases and GA 1.0 on 31 October 2026.
 
 This document is the single source of truth for the HIP EP productization effort. The
 slide deck at [`HIP-EP-Product-Plan.pptx`](HIP-EP-Product-Plan.pptx) is generated from
@@ -119,46 +122,49 @@ docs foreground LLM and VLM.
 
 ## 6. Roadmap
 
-Six milestones, three weeks each, GA in January 2027. Every milestone ends with a git
-tag and a `MILESTONES.md` entry so any checkpoint can be re-reviewed and re-tested.
+Three phases, GA 1.0 at the end of October 2026. Foundations are already complete, which
+is what makes the compressed schedule credible: the product tree, registry, server,
+console, CLI, docs site, installers and test suite all exist and run on Strix Halo today.
+Every phase ends with a git tag and a `MILESTONES.md` entry so any checkpoint can be
+re-reviewed and re-tested.
 
-| ID | Milestone | Window | Exit criteria | Tag |
+| ID | Phase | Window | Exit criteria | Tag |
 |---|---|---|---|---|
-| **M0** | Foundations | Aug 28 – Sep 11, 2026 | Plan approved. Product tree, registry, server skeleton, mock engine, console shell, landing page live locally on Strix Halo. | `hipep-product-m0` |
-| **M1** | Serving Alpha | Sep 12 – Oct 2, 2026 | Real OGA engine streaming on Strix Halo. OpenAI + Ollama API parity. VLM image path. Console chat with live TTFT/TPS. Multi-user status. | `hipep-product-m1` |
-| **M2** | Model Pipeline | Oct 3 – Oct 23, 2026 | HF URL → export → Quark quantize → validate → publish, driven from the console with live status and a shareable artifact link. | `hipep-product-m2` |
-| **M3** | Benchmark & Certification | Oct 24 – Nov 13, 2026 | Bench harness runs through `oga-server`. Nightly certification matrix. Public benchmark numbers match the internal dashboard within tolerance. | `hipep-product-m3` |
-| **M4** | Cross-platform | Nov 14 – Dec 4, 2026 | Linux server + container. Windows installer. Device profiles for Strix, Krackan, Strix Halo, Radeon dGPU. Remote/BYO-machine mode. | `hipep-product-m4` |
-| **M5** | Docs & SDK | Dec 5 – Dec 25, 2026 | Full docs site, model cards for every certified model, C++/Python/WinML samples, recipe collection with 6+ architectures. | `hipep-product-m5` |
-| **M6** | GA 1.0 | Jan 5 – Jan 30, 2027 | Public launch. Security review, opt-in telemetry, perf hardening, support rotation. | `hipep-product-v1.0` |
+| **M0** | Foundations | Aug 28 – Sep 1, 2026 | **Complete.** Product tree, registry, `oga-server`, console, CLI, client samples, docs site, installers and test suite live locally on Strix Halo. | `hipep-product-m0` |
+| **P1** | Serving on hardware | Sep 2 – Sep 30, 2026 | Real OGA engine streaming through HIP EP for the certified LLM and VLM set. OpenAI + Ollama API parity. VLM image path. Console chat with live TTFT/TPS. Multi-user scheduling under load. | `hipep-product-p1` |
+| **P2** | Pipeline & certification | Oct 1 – Oct 16, 2026 | HF URL → export → Quark quantize → validate → publish, driven from the console with live status and a shareable artifact link. Bench harness runs through `oga-server`; nightly certification matrix; published numbers match the internal dashboard within tolerance. | `hipep-product-p2` |
+| **P3** | Cross-platform, docs & GA 1.0 | Oct 17 – Oct 31, 2026 | Linux server + container, Windows installer, device profiles for Strix, Krackan, Strix Halo and Radeon dGPU. Model cards for every certified model, C++/Python/WinML samples. Security review, opt-in telemetry, perf hardening, support rotation. Public launch. | `hipep-product-v1.0` |
 
-### Gantt (weeks from 2026-08-28)
+Two phases carry what were previously two milestones each. That is deliberate rather than
+optimistic: the pipeline, bench harness, installers, container and docs site landed early
+as part of foundations, so P2 and P3 are hardening and validating existing surfaces on
+hardware, not building them from nothing.
+
+### Gantt (weeks from 2026-09-01)
 
 ```text
-Week          1  3  5  7  9 11 13 15 17 19 21 23
-M0 Foundation ███
-M1 Serving       ██████
-M2 Pipeline            ██████
-M3 Benchmark                 ██████
-M4 Platform                        ██████
-M5 Docs/SDK                              ██████
-M6 GA                                          █████
+Week            1     2     3     4     5     6     7     8     9
+P1 Serving      ████████████████████████
+P2 Pipeline+Cert                        ████████████
+P3 Platform/GA                                      ████████████
+GA 1.0                                                        ▲
 ```
 
 ## 7. Resourcing
 
-Peak 9.5 FTE, ramping from 4.0 in M0.
+Peak 9.5 FTE. The compressed schedule front-loads the team: every role is at full load
+from P1 onward, because there is no longer a quiet milestone to absorb a slip.
 
-| Role | FTE | M0 | M1 | M2 | M3 | M4 | M5 | M6 | Owns |
-|---|---|---|---|---|---|---|---|---|---|
-| Tech lead / architect | 1.0 | ● | ● | ● | ● | ● | ● | ● | Architecture, reviews, roadmap |
-| Server & API engineer | 2.0 | ● | ● | ● | ● | ● | ○ | ● | `oga-server`, scheduler, APIs |
-| Front-end engineer | 1.5 | ○ | ● | ● | ● | ○ | ● | ● | HIP EP Studio, landing page |
-| Model enablement engineer | 2.0 | ○ | ● | ● | ● | ● | ● | ○ | Export, quantization, recipes |
-| Performance engineer | 1.0 | ○ | ○ | ○ | ● | ● | ○ | ● | Bench harness, tuning, regressions |
-| Docs / DevRel | 1.0 | ○ | ○ | ○ | ● | ● | ● | ● | Docs site, model cards, samples |
-| QA / release engineer | 1.0 | ○ | ○ | ● | ● | ● | ○ | ● | CI, certification, packaging |
-| **Total** | **9.5** | 4.0 | 7.0 | 8.5 | 9.5 | 9.5 | 8.0 | 8.5 | |
+| Role | FTE | M0 | P1 | P2 | P3 | Owns |
+|---|---|---|---|---|---|---|
+| Tech lead / architect | 1.0 | ● | ● | ● | ● | Architecture, reviews, roadmap |
+| Server & API engineer | 2.0 | ● | ● | ● | ● | `oga-server`, scheduler, APIs |
+| Front-end engineer | 1.5 | ○ | ● | ● | ● | HIP EP Studio, landing page |
+| Model enablement engineer | 2.0 | ○ | ● | ● | ● | Export, quantization, recipes |
+| Performance engineer | 1.0 | ○ | ● | ● | ● | Bench harness, tuning, regressions |
+| Docs / DevRel | 1.0 | ○ | ○ | ● | ● | Docs site, model cards, samples |
+| QA / release engineer | 1.0 | ○ | ● | ● | ● | CI, certification, packaging |
+| **Total** | **9.5** | 4.0 | 8.5 | 9.5 | 9.5 | |
 
 ● primary load · ○ partial load
 
@@ -167,22 +173,28 @@ Peak 9.5 FTE, ramping from 4.0 in M0.
 | Item | Qty | Purpose | Status |
 |---|---|---|---|
 | Strix Halo (Radeon 8060S, gfx1151, 48 GB) | 1 | Primary dev + demo server | **Available now** (this machine) |
-| Strix / Krackan laptops | 2 | Device-profile validation | Request in M1 |
-| Radeon dGPU workstation (gfx1100/gfx1201) | 1 | Discrete GPU coverage | Request in M1 |
-| Linux GPU server | 1 | Linux `oga-server` hosting | **Not yet available** — plan targets M4; code paths land earlier and are validated in Docker |
-| Nightly CI runner with GPU | 1 | Certification matrix | Request in M3 |
-| Public docs hosting | 1 | Landing page + docs | Request in M5 |
+| Strix / Krackan laptops | 2 | Device-profile validation | Needed by P1 |
+| Radeon dGPU workstation (gfx1100/gfx1201) | 1 | Discrete GPU coverage | Needed by P1 |
+| Linux GPU server | 1 | Linux `oga-server` hosting | **Not yet available** — needed by P3; code paths exist now and are validated in Docker |
+| Nightly CI runner with GPU | 1 | Certification matrix | Needed by P2 |
+| Public docs hosting | 1 | Landing page + docs | Needed by P3 |
+
+The compressed schedule turns hardware from a planning item into a gate. Every machine
+above is now needed within eight weeks rather than five months, and the Linux host in
+particular has no slack left in front of it.
 
 ## 8. Risks
 
 | # | Risk | Impact | Likelihood | Mitigation |
 |---|---|---|---|---|
-| R1 | No Linux GPU server available | Linux support slips or ships unvalidated | High | Build and test the Linux path in the existing `docker/` flow now; treat the hosted Linux server as an M4 dependency, not an M1 one; gate the Linux claim on real hardware |
+| R1 | No Linux GPU server available | Linux support slips or ships unvalidated | High | Build and test the Linux path in the existing `docker/` flow now; the hosted Linux server is a P3 gate with no slack in front of it; gate the Linux claim on real hardware |
 | R2 | OGA + HIP EP wheel availability lags | Server cannot run real models on fresh machines | Medium | Mock engine keeps the whole product testable; pin known-good wheel set; ship a preflight doctor command |
-| R3 | Model export/quantize is slow and fragile | Pipeline milestone slips | High | Recipes are data-driven and resumable; every stage caches artifacts; failures produce an actionable diagnosis, not a stack trace |
+| R3 | Model export/quantize is slow and fragile | P2 slips into the GA window | High | Recipes are data-driven and resumable; every stage caches artifacts; failures produce an actionable diagnosis, not a stack trace |
 | R4 | Certified numbers drift from the internal dashboard | Loss of trust in published numbers | Medium | One harness, run through the server, same metric definitions; publish run metadata with every number |
 | R5 | Multi-user concurrency exhausts GPU memory | Demo failures under load | Medium | Admission control, per-model worker cap, queue with visible depth, memory headroom checks |
-| R6 | Scope creep into a general model hub | GA slips | Medium | Certified tiers are fixed per milestone; BYO models are user-owned, not certified |
+| R6 | Scope creep into a general model hub | GA slips | Medium | Certified tiers are fixed per phase; BYO models are user-owned, never certified |
+| R7 | Two months absorbs six milestones of scope | GA slips or ships thin | High | Foundations are already complete, so each phase hardens an existing surface rather than building one; scope is fixed per phase and cut rather than extended if a gate is missed |
+| R8 | A wrong model artifact looks like an engine bug | Days lost to misdirected debugging | Medium | Certification records the artifact identity, not just its throughput; a throughput benchmark that never prints output cannot detect a mislabelled or base-versus-instruct model |
 
 ## 9. Success metrics
 

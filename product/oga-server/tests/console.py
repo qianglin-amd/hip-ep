@@ -20,7 +20,10 @@ Requires Playwright and a Chromium-family browser:
 from __future__ import annotations
 
 import argparse
+import struct
 import sys
+import tempfile
+import zlib
 from pathlib import Path
 
 try:
@@ -33,6 +36,31 @@ except ImportError:  # pragma: no cover - the message is the whole point
 # Ignore noise the console cannot control: favicon-style requests and the aborted
 # fetches that streaming views produce on navigation are not defects.
 IGNORED_ERRORS = ("net::ERR_ABORTED", "favicon")
+
+
+def _solid_png(colour: tuple[int, int, int], size: int = 224) -> bytes:
+    """A PNG of one flat colour, encoded here so the suite needs no imaging library.
+
+    The vision check has to know the right answer with certainty, and nothing states a
+    colour more plainly than an image that contains only that colour.
+    """
+    raw = b"".join(b"\x00" + bytes(colour) * size for _ in range(size))
+
+    def chunk(kind: bytes, body: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(body))
+            + kind
+            + body
+            + struct.pack(">I", zlib.crc32(kind + body) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">2I5B", size, size, 8, 2, 0, 0, 0)  # 8-bit truecolour RGB
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
 
 
 class Checks:
@@ -191,12 +219,79 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
         )
         shot("chat")
 
+        # The router rebuilds a view on every navigation, so a transcript held inside
+        # the render function is lost the moment the user steps over to Models to look
+        # something up and comes back.
+        goto("models")
+        goto("chat")
+        checks.ok(
+            "conversation survives navigation",
+            page.locator(".msg.user").count() == 1
+            and page.locator(".msg.assistant").count() == 1,
+            f"{page.locator('.msg.user').count()} user, "
+            f"{page.locator('.msg.assistant').count()} assistant",
+        )
+        checks.ok("clearing is still possible", page.locator("text=Clear chat").count() == 1)
+
         # --- vision ------------------------------------------------------------
         print("\nvision")
         goto("vision")
         options = page.locator(".chat-side select option").all_inner_texts()
         checks.ok("vision models only", len(options) > 0, f"{len(options)} options")
         checks.ok("attach button visible", page.locator("text=Attach image").count() == 1)
+
+        # Checking that the page renders proves nothing about whether the picture ever
+        # reaches the model: a model that is handed no image answers anyway, and what it
+        # invents reads exactly like a description of what was sent. The only check that
+        # can tell those apart is one whose answer is wrong unless the image arrived.
+        # What is installed and what a model can do are reported separately: the local
+        # list knows the ids on disk, the catalog knows which of them can see.
+        installed = {
+            m["id"]
+            for m in page.request.get(f"{base}/v1/local").json()["models"]
+            if m.get("ready") and not m.get("extra", {}).get("simulated")
+        }
+        vision_ready = next(
+            (
+                m["id"]
+                for m in page.request.get(f"{base}/v1/models").json()["data"]
+                if m["id"] in installed
+                and m.get("hipep", {}).get("capabilities", {}).get("vision")
+            ),
+            None,
+        )
+        if engine_is_real and vision_ready:
+            swatch = Path(tempfile.gettempdir()) / "hipep-console-swatch.png"
+            # A PNG of a single strong colour, written by hand so the suite needs no
+            # imaging library to say what the right answer is.
+            swatch.write_bytes(_solid_png((214, 32, 32)))
+            page.select_option(".chat-side select", vision_ready)
+            page.set_input_files(".composer input[type=file]", str(swatch))
+            page.wait_for_selector(".attachments img", timeout=15_000)
+            checks.ok(
+                "attached image previewed", page.locator(".attachments img").count() == 1
+            )
+            page.fill(
+                ".composer textarea",
+                "What is the single dominant colour in this image? Answer with one word.",
+            )
+            page.click(".composer-actions .btn-primary")
+            page.wait_for_function(
+                "() => document.querySelector('.composer-actions .btn-primary')?.hidden"
+                " === false",
+                timeout=300_000,
+            )
+            # A thinking model opens with a reasoning block and the answer follows it.
+            # Newlines are collapsed so a failure prints as one readable line.
+            said = page.locator(".msg.assistant .md").last.inner_text().lower()
+            said = " ".join(said.split("</think>")[-1].split())
+            checks.ok(
+                "the model answered about the image it was sent",
+                any(w in said for w in ("red", "crimson", "scarlet", "maroon")),
+                said[:110] or "(empty)",
+            )
+        else:
+            print("  ..    no vision model installed; the round trip is skipped")
         shot("vision")
 
         # --- agent -------------------------------------------------------------
@@ -447,6 +542,11 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
             )
         else:
             page.select_option(".chat-side select", ported)
+            # A transcript now survives navigation, so the earlier chat is still on the
+            # page. Clearing it first keeps the reply this reads unambiguously the one
+            # the ported model just produced.
+            page.click("text=Clear chat")
+            page.wait_for_selector(".chat-log .empty", timeout=10_000)
             # "Does my imported model answer?" is a yes/no question, and a correct
             # answer to it is about thirty characters, so asserting a longer reply
             # failed a working model. The prompt has to be one whose correct answer is
@@ -460,7 +560,7 @@ def run(base: str, *, headed: bool, channel: str | None, screenshots: Path | Non
                 " === false",
                 timeout=120_000,
             )
-            answer = page.locator(".msg.assistant .md").inner_text()
+            answer = page.locator(".msg.assistant .md").last.inner_text()
             checks.ok("ported model answers", len(answer) > 40, f"{len(answer)} chars")
 
         # Leave no trace: the imported model would otherwise persist in the data

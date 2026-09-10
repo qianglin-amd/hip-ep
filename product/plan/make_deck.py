@@ -214,7 +214,7 @@ def slide_title(prs):
         [
             ("Plan for review  ·  HIPEP-PROD-2026H2", Pt(13), True, WHITE),
             (
-                "28 August 2026  ·  M0 → GA January 2027  ·  9.5 FTE peak",
+                "2 September 2026  ·  3 phases → GA 31 October 2026  ·  9.5 FTE peak",
                 Pt(12),
                 False,
                 RGBColor(0x8E, 0x99, 0xA5),
@@ -253,10 +253,10 @@ def slide_tldr(prs):
         (
             "The plan",
             GREEN,
-            "Six three-week milestones to GA in January 2027. Ship oga-server (OpenAI + "
+            "Three phases to GA on 31 October 2026. Ship oga-server (OpenAI + "
             "Ollama compatible), HIP EP Studio, a certified model zoo with cards, a "
             "bring-your-own-model pipeline with Quark quantization, one benchmark harness "
-            "and a public docs site, on Windows and Linux.",
+            "and a public docs site, on Windows and Linux. Foundations are already complete.",
         ),
     ]
     w = Inches(3.94)
@@ -282,9 +282,9 @@ def slide_tldr(prs):
         [
             ("The ask", Pt(15), True, INK),
             (
-                "Approve the roadmap and resourcing, and commit a Linux GPU host by M4. "
+                "Approve the roadmap and resourcing, and commit a Linux GPU host by P3. "
                 "Everything else is already in motion: the branch, the product tree, the "
-                "server skeleton and this deck are generated from the plan in-repo.",
+                "server and this deck are generated from the plan in-repo.",
                 Pt(12.5),
                 False,
                 INK_SOFT,
@@ -428,7 +428,7 @@ def slide_surfaces(prs):
         prs,
         "Seven product surfaces",
         kicker="Scope",
-        subtitle="Each surface has an owner, an exit criterion and a milestone.",
+        subtitle="Each surface has an owner, an exit criterion and a phase.",
     )
     items = [
         (
@@ -653,25 +653,25 @@ def slide_models(prs):
             "LLM",
             "8",
             "Llama-3.1-8B · Mistral-7B-v0.3 · Qwen2.5-14B · Qwen2.5-Coder-14B · Phi-4-14B · gpt-oss-20b · gpt-oss-120b · DeepSeek-R1-Distill-70B",
-            "M1",
+            "P1",
         ],
         [
             "VLM",
             "8",
             "Qwen3.5-9B · Qwen3.5-35B-A3B · Qwen3.6-27B · Qwen3.6-35B-A3B · Qwen3.8-27B · Gemma-3-4B · Gemma-4-12B · Gemma-4-26B-A4B",
-            "M1",
+            "P1",
         ],
         [
             "Speech",
             "7",
             "Whisper tiny / base / small / medium / large-v3 / large-v3-turbo",
-            "M3",
+            "P2",
         ],
         [
             "Vision",
             "14",
             "ResNet50 · MobileNetV2 · DETR · Swin / SwinV2 · YOLOv5 · SAM 2.1 · BLIP · ConvNeXt · ESRGAN",
-            "M3",
+            "P2",
         ],
     ]
     colors = {(1, 0): ACCENT, (2, 0): TEAL, (3, 0): INK_SOFT, (4, 0): INK_SOFT}
@@ -711,25 +711,22 @@ def slide_roadmap(prs):
     slide = new_slide(
         prs,
         "Roadmap",
-        kicker="Six milestones to GA",
-        subtitle="Three-week milestones. Each ends with a git tag and a MILESTONES.md entry so any checkpoint is reviewable and re-testable.",
+        kicker="Three phases to GA",
+        subtitle="GA 1.0 on 31 October 2026. Each phase ends with a git tag and a MILESTONES.md entry so any checkpoint is reviewable and re-testable.",
     )
     ms = [
-        ("M0", "Foundations", "Aug 28 – Sep 11", 0, 1.0, ACCENT),
-        ("M1", "Serving Alpha", "Sep 12 – Oct 2", 1.0, 1.5, TEAL),
-        ("M2", "Model Pipeline", "Oct 3 – Oct 23", 2.5, 1.5, GREEN),
-        ("M3", "Benchmark & Cert", "Oct 24 – Nov 13", 4.0, 1.5, AMBER),
-        ("M4", "Cross-platform", "Nov 14 – Dec 4", 5.5, 1.5, TEAL),
-        ("M5", "Docs & SDK", "Dec 5 – Dec 25", 7.0, 1.5, GREEN),
-        ("M6", "GA 1.0", "Jan 5 – Jan 30", 8.5, 1.8, ACCENT),
+        ("M0", "Foundations", "Aug 28 – Sep 1", 0, 1.0, INK_SOFT),
+        ("P1", "Serving on hardware", "Sep 2 – Sep 30", 1.0, 4.0, ACCENT),
+        ("P2", "Pipeline & cert", "Oct 1 – Oct 16", 5.0, 2.5, TEAL),
+        ("P3", "Platform, docs & GA", "Oct 17 – Oct 31", 7.5, 2.5, GREEN),
     ]
     label_w = Inches(2.15)
     date_w = Inches(1.85)
     track_x = MARGIN + label_w + date_w
     track_w = CONTENT_W - label_w - date_w
     unit = Emu(int(track_w / 10.3))
-    y = BODY_TOP + Inches(0.25)
-    row_h = Inches(0.6)
+    y = BODY_TOP + Inches(0.35)
+    row_h = Inches(0.95)
 
     for i, (mid, name, window, start, span, color) in enumerate(ms):
         ry = y + Emu(int(i * row_h))
@@ -762,9 +759,12 @@ def slide_roadmap(prs):
 
     gate_y = y + Emu(int(len(ms) * row_h)) + Inches(0.25)
     gates = [
-        ("M0 gate", "Server skeleton + registry + console shell run locally on Strix Halo."),
-        ("M2 gate", "A user brings a Hugging Face URL and gets a benchmarked local model."),
-        ("M4 gate", "Linux host validated — the single largest schedule dependency."),
+        ("P1 gate", "The certified LLM and VLM set streams through HIP EP on real hardware."),
+        ("P2 gate", "A user brings a Hugging Face URL and gets a benchmarked local model."),
+        (
+            "P3 gate",
+            "Linux host validated — the largest schedule dependency, now in the final two weeks.",
+        ),
     ]
     w = Inches(3.94)
     for i, (h, d) in enumerate(gates):
@@ -785,52 +785,34 @@ def slide_roadmap(prs):
 def slide_milestones(prs):
     slide = new_slide(
         prs,
-        "Milestone exit criteria",
+        "Phase exit criteria",
         kicker="Definition of done",
-        subtitle="A milestone is done when its exit criteria are demonstrable on hardware, not when its code is merged.",
+        subtitle="A phase is done when its exit criteria are demonstrable on hardware, not when its code is merged.",
     )
     rows = [
-        ["ID", "Milestone", "Exit criteria", "Tag"],
+        ["ID", "Phase", "Exit criteria", "Tag"],
         [
             "M0",
-            "Foundations",
-            "Plan approved. Product tree, model registry, server skeleton, mock engine, console shell and landing page running locally.",
+            "Foundations — complete",
+            "Product tree, model registry, oga-server, console, CLI, client samples, docs site, installers and test suite running locally on Strix Halo.",
             "hipep-product-m0",
         ],
         [
-            "M1",
-            "Serving Alpha",
-            "Real OGA engine streaming on Strix Halo. OpenAI + Ollama parity. VLM image path. Console chat with live TTFT/TPS. Multi-user status.",
-            "hipep-product-m1",
+            "P1",
+            "Serving on hardware",
+            "Real OGA engine streaming through HIP EP for the certified LLM and VLM set. OpenAI + Ollama parity. VLM image path. Console chat with live TTFT/TPS. Multi-user scheduling under load.",
+            "hipep-product-p1",
         ],
         [
-            "M2",
-            "Model Pipeline",
-            "HF URL → export → Quark quantize → validate → publish from the console, with live status and a shareable artifact link.",
-            "hipep-product-m2",
+            "P2",
+            "Pipeline & certification",
+            "HF URL → export → Quark quantize → validate → publish from the console. Bench harness runs through oga-server; nightly certification matrix; published numbers match the internal dashboard within tolerance.",
+            "hipep-product-p2",
         ],
         [
-            "M3",
-            "Benchmark & Cert",
-            "Bench harness runs through oga-server. Nightly certification matrix. Published numbers match the internal dashboard within tolerance.",
-            "hipep-product-m3",
-        ],
-        [
-            "M4",
-            "Cross-platform",
-            "Linux server + container. Windows installer. Device profiles for Strix, Krackan, Strix Halo, Radeon dGPU. Remote / BYO-machine mode.",
-            "hipep-product-m4",
-        ],
-        [
-            "M5",
-            "Docs & SDK",
-            "Full docs site, a card for every certified model, C++/Python/WinML samples, recipes covering six or more architectures.",
-            "hipep-product-m5",
-        ],
-        [
-            "M6",
-            "GA 1.0",
-            "Public launch. Security review, opt-in telemetry, performance hardening, support rotation staffed.",
+            "P3",
+            "Platform, docs & GA 1.0",
+            "Linux server + container, Windows installer, four device profiles. Model cards and C++/Python/WinML samples. Security review, opt-in telemetry, perf hardening, support rotation. Public launch.",
             "hipep-product-v1.0",
         ],
     ]
@@ -841,8 +823,8 @@ def slide_milestones(prs):
         BODY_TOP,
         CONTENT_W,
         rows,
-        [0.7, 2.1, 8.0, 2.0],
-        row_h=Inches(0.64),
+        [0.7, 2.4, 7.7, 2.0],
+        row_h=Inches(0.9),
         font=Pt(10),
         colors=colors,
     )
@@ -853,46 +835,13 @@ def slide_resources(prs):
         prs,
         "Resourcing",
         kicker="Team",
-        subtitle="Peak 9.5 FTE at M3–M4, ramping from 4.0 at M0.  ● primary load   ○ partial load",
+        subtitle="Peak 9.5 FTE. The compressed schedule front-loads the team: no phase is quiet enough to absorb a slip.  ● primary load   ○ partial load",
     )
     rows = [
-        ["Role", "FTE", "M0", "M1", "M2", "M3", "M4", "M5", "M6", "Owns"],
-        [
-            "Tech lead / architect",
-            "1.0",
-            "●",
-            "●",
-            "●",
-            "●",
-            "●",
-            "●",
-            "●",
-            "Architecture, reviews, roadmap",
-        ],
-        [
-            "Server & API engineer",
-            "2.0",
-            "●",
-            "●",
-            "●",
-            "●",
-            "●",
-            "○",
-            "●",
-            "oga-server, scheduler, APIs",
-        ],
-        [
-            "Front-end engineer",
-            "1.5",
-            "○",
-            "●",
-            "●",
-            "●",
-            "○",
-            "●",
-            "●",
-            "HIP EP Studio, landing page",
-        ],
+        ["Role", "FTE", "M0", "P1", "P2", "P3", "Owns"],
+        ["Tech lead / architect", "1.0", "●", "●", "●", "●", "Architecture, reviews, roadmap"],
+        ["Server & API engineer", "2.0", "●", "●", "●", "●", "oga-server, scheduler, APIs"],
+        ["Front-end engineer", "1.5", "○", "●", "●", "●", "HIP EP Studio, landing page"],
         [
             "Model enablement engineer",
             "2.0",
@@ -900,65 +849,38 @@ def slide_resources(prs):
             "●",
             "●",
             "●",
-            "●",
-            "●",
-            "○",
             "Export, quantization, recipes",
         ],
         [
             "Performance engineer",
             "1.0",
             "○",
-            "○",
-            "○",
             "●",
             "●",
-            "○",
             "●",
             "Bench harness, tuning, regressions",
         ],
-        [
-            "Docs / DevRel",
-            "1.0",
-            "○",
-            "○",
-            "○",
-            "●",
-            "●",
-            "●",
-            "●",
-            "Docs site, model cards, samples",
-        ],
-        [
-            "QA / release engineer",
-            "1.0",
-            "○",
-            "○",
-            "●",
-            "●",
-            "●",
-            "○",
-            "●",
-            "CI, certification, packaging",
-        ],
-        ["Total FTE", "9.5", "4.0", "7.0", "8.5", "9.5", "9.5", "8.0", "8.5", ""],
+        ["Docs / DevRel", "1.0", "○", "○", "●", "●", "Docs site, model cards, samples"],
+        ["QA / release engineer", "1.0", "○", "●", "●", "●", "CI, certification, packaging"],
+        ["Total FTE", "9.5", "4.0", "8.5", "9.5", "9.5", ""],
     ]
+    total_row = len(rows) - 1
     colors = {}
     for r in range(1, len(rows)):
         colors[(r, 1)] = ACCENT
-        for c in range(2, 9):
+        for c in range(2, 6):
             colors[(r, c)] = ACCENT if rows[r][c] == "●" else INK_SOFT
     for c in range(len(rows[0])):
-        colors[(8, c)] = INK
+        colors[(total_row, c)] = INK
     table(
         slide,
         MARGIN,
         BODY_TOP,
         CONTENT_W,
         rows,
-        [2.9, 0.7, 0.62, 0.62, 0.62, 0.62, 0.62, 0.62, 0.62, 4.4],
-        row_h=Inches(0.42),
-        font=Pt(10.5),
+        [3.2, 0.8, 0.9, 0.9, 0.9, 0.9, 5.2],
+        row_h=Inches(0.5),
+        font=Pt(11),
         colors=colors,
     )
 
@@ -979,17 +901,17 @@ def slide_hardware(prs):
             "Available now",
             "M0",
         ],
-        ["Strix / Krackan laptops", "2", "Device-profile validation", "Request", "M1"],
+        ["Strix / Krackan laptops", "2", "Device-profile validation", "Request", "P1"],
         [
             "Radeon dGPU workstation (gfx1100 / gfx1201)",
             "1",
             "Discrete GPU coverage",
             "Request",
-            "M1",
+            "P1",
         ],
-        ["Linux GPU server", "1", "Hosted Linux oga-server", "NOT AVAILABLE", "M4"],
-        ["Nightly CI runner with GPU", "1", "Certification matrix", "Request", "M3"],
-        ["Public docs hosting", "1", "Landing page + docs site", "Request", "M5"],
+        ["Linux GPU server", "1", "Hosted Linux oga-server", "NOT AVAILABLE", "P3"],
+        ["Nightly CI runner with GPU", "1", "Certification matrix", "Request", "P2"],
+        ["Public docs hosting", "1", "Landing page + docs site", "Request", "P3"],
     ]
     colors = {(1, 3): GREEN, (4, 3): ACCENT, (4, 0): ACCENT}
     end = table(
@@ -1025,8 +947,8 @@ def slide_hardware(prs):
             ),
             (
                 "The Linux server, container image, install script and device profiles are written and "
-                "exercised in the existing docker/ build flow starting at M0. We do not claim Linux "
-                "support in the docs until it runs on a real Linux GPU host. That claim is gated at M4.",
+                "exercised in the existing docker/ build flow and are complete today. We do not claim Linux "
+                "support in the docs until it runs on a real Linux GPU host. That claim is gated at P3.",
                 Pt(11.5),
                 False,
                 INK,
@@ -1046,7 +968,7 @@ def slide_risks(prs):
             "No Linux GPU server available",
             "High",
             "High",
-            "Build and test in docker/ now; gate the Linux claim on real hardware at M4",
+            "Build and test in docker/ now; gate the Linux claim on real hardware at P3",
         ],
         [
             "R2",
@@ -1081,7 +1003,7 @@ def slide_risks(prs):
             "Scope creep into a general model hub",
             "High",
             "Medium",
-            "Certified tiers fixed per milestone; BYO models are user-owned, never certified",
+            "Certified tiers fixed per phase; BYO models are user-owned, never certified",
         ],
     ]
     sev = {"High": ACCENT, "Medium": AMBER, "Low": GREEN}
@@ -1189,11 +1111,11 @@ def slide_ask(prs):
     asks = [
         (
             "Approve roadmap and resourcing",
-            "Six milestones, GA end of January 2027, 9.5 FTE at peak.",
+            "Three phases, GA on 31 October 2026, 9.5 FTE at peak.",
         ),
         (
             "Commit a Linux GPU host",
-            "Required by M4. This is the largest single schedule risk in the plan.",
+            "Required by P3. This is the largest single schedule risk in the plan.",
         ),
         (
             "Decide on public benchmark numbers",

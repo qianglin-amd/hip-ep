@@ -245,6 +245,24 @@ def test_wheels_are_copied_and_recorded(tmp_path) -> None:
     assert (stage / "wheels" / names[0]).exists()
 
 
+def test_wheels_are_recorded_by_digest(tmp_path) -> None:
+    """The AMD wheels keep one version string across rebuilds, so the file name cannot
+    say which execution provider a bundle carries and the digest has to."""
+    import hashlib
+
+    source = tmp_path / "wheels"
+    source.mkdir()
+    name = "onnxruntime_ep_hip-0.4.0-py3-none-win_amd64.whl"
+    (source / name).write_bytes(b"a fresh build under an unchanged version")
+    stage = tmp_path / "stage"
+    stage.mkdir()
+
+    names = package.copy_wheels(stage, source)
+    digests = package.wheel_digests(stage, names)
+
+    assert digests[name] == hashlib.sha256((source / name).read_bytes()).hexdigest()
+
+
 def test_an_empty_wheel_directory_is_refused(tmp_path) -> None:
     (tmp_path / "wheels").mkdir()
     with pytest.raises(SystemExit):
@@ -280,6 +298,19 @@ def test_start_here_explains_the_replay_engine_when_no_wheels_ship() -> None:
     )
     assert "replay" in text
     assert "-GpuWheels" in text
+
+
+def test_start_here_says_how_to_run_the_suite_it_ships() -> None:
+    """The bundle advertises a test suite but installs a runtime-only virtualenv, so
+    naming the directory without naming the command earns `No module named pytest`."""
+    text = package.start_here(
+        {
+            "version": "0.1.0",
+            "gpu_wheels": {"included": False, "python": None, "files": []},
+            "contents": {"catalog": {"models": 23, "release": "release_0.4"}, "recipes": []},
+        }
+    )
+    assert "pip install" in text and "pytest" in text
 
 
 def test_start_here_reports_the_real_model_count() -> None:

@@ -146,3 +146,39 @@ def test_multi_turn_conversations_keep_the_roles_apart() -> None:
         "turns are out of order"
     )
     assert "system" in prompt, "the system message was dropped"
+
+
+def test_an_attached_image_is_marked_the_way_its_family_expects() -> None:
+    """The processor matches the pictures it was handed against the markers in the
+    prompt and refuses the two if they disagree. One family's marker in another's prompt
+    is read as ordinary text, which leaves the model describing an invented picture
+    rather than the one that was sent."""
+    picture = [ChatMessage(role="user", content="what is this?", images=[b"png"])]
+
+    qwen = chat_format("qwen3_5_moe").render(picture)
+    assert "<|vision_start|><|image_pad|><|vision_end|>" in qwen
+    assert "<|image_1|>" not in qwen, "the Phi marker means nothing to a Qwen processor"
+
+    assert "<start_of_image>" in chat_format("gemma").render(picture)
+    assert "<|image_1|>" in chat_format("phi").render(picture)
+
+
+def test_pictures_are_numbered_across_the_conversation() -> None:
+    """The count has to match the pictures handed to the processor, and those are
+    collected from the whole conversation rather than from one turn."""
+    fmt = chat_format("phi")
+    prompt = fmt.render(
+        [
+            ChatMessage(role="user", content="first", images=[b"a"]),
+            ChatMessage(role="assistant", content="ok"),
+            ChatMessage(role="user", content="second", images=[b"b", b"c"]),
+        ]
+    )
+    assert "<|image_1|>" in prompt
+    assert "<|image_2|>" in prompt
+    assert "<|image_3|>" in prompt, "the later turn restarted the numbering"
+
+
+def test_a_conversation_without_pictures_carries_no_marker() -> None:
+    prompt = chat_format("qwen3_5_moe").render([ChatMessage(role="user", content="hi")])
+    assert "vision_start" not in prompt, "a marker with no picture is refused too"

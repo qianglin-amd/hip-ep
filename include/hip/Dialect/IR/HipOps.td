@@ -957,7 +957,11 @@ def Hip_QMoEOp : Hip_DpsOp<"qmoe",
       fc1_experts_bias, fc2_experts_bias: bias vectors (optional)
       fc3_*: unfused SwiGLU second GEMM weights/scales/bias (optional)
       fc1/fc2/fc3_zero_points: per-block zero points (optional)
-      router_weights: alternative aggregation weights (optional, ONNX v1.25+, takes precedence over router_probs)
+      router_weights: aggregation weights (optional, ONNX v1.25+). When present,
+        router_probs only selects the top-k experts and the mixing weights are
+        gathered from router_weights at those indices, so a model can route and
+        weight with different tensors. When absent, softmax(router_probs) serves
+        as both.
 
     Uses destination-passing style: output buffer is provided as argument.
 
@@ -991,7 +995,7 @@ def Hip_QMoEOp : Hip_DpsOp<"qmoe",
     Optional<Hip_TensorOrMemRef>:$fc1_zero_points,        // fc1 dequant zero points
     Optional<Hip_TensorOrMemRef>:$fc2_zero_points,        // fc2 dequant zero points
     Optional<Hip_TensorOrMemRef>:$fc3_zero_points,        // fc3 dequant zero points
-    Optional<Hip_TensorOrMemRef>:$router_weights,         // [num_tokens, num_experts] alternative routing weights (ONNX v1.25+)
+    Optional<Hip_TensorOrMemRef>:$router_weights,         // [num_tokens, num_experts] aggregation weights (ONNX v1.25+)
     Hip_TensorOrMemRef:$output,                 // DPS init [batch, seq, hidden]
     I64Attr:$expert_weight_bits,
     I64Attr:$k,
@@ -2176,6 +2180,40 @@ def Hip_LeakyReluOp : Hip_DpsOp<"leaky_relu"> {
     Hip_TensorOrMemRef:$input,
     Hip_TensorOrMemRef:$output,
     DefaultValuedAttr<F64Attr, "0.01">:$alpha
+  );
+
+  let assemblyFormat = [{
+    `(` $ctx `)` `ins` `(` $input `:` type($input) `)`
+    `outs` `(` $output `:` type($output) `)`
+    attr-dict (`:` type($result_tensors)^)?
+  }];
+}
+
+def Hip_SwishOp : Hip_DpsOp<"swish"> {
+  let summary = "Swish activation: y = x * sigmoid(alpha * x)";
+  let description = [{
+    Applies Swish activation element-wise.
+    Implements the ONNX Swish operator (opset 24).
+
+    Formula: Y = X * sigmoid(alpha * X)
+
+    At the default alpha of 1.0 this is the SiLU activation.
+
+    Uses destination-passing style: output buffer is provided as argument.
+
+    Example:
+    ```mlir
+    hip.swish(%ctx) ins(%x : memref<3x4xf32, 1>)
+                    outs(%y : memref<3x4xf32, 1>)
+                    {alpha = 1.0 : f64}
+    ```
+  }];
+
+  let arguments = (ins
+    Hip_ContextType:$ctx,
+    Hip_TensorOrMemRef:$input,
+    Hip_TensorOrMemRef:$output,
+    DefaultValuedAttr<F64Attr, "1.0">:$alpha
   );
 
   let assemblyFormat = [{

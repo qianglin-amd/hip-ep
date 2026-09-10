@@ -48,9 +48,37 @@ file. The flags that `hipep serve` accepts override the corresponding variable.
 | `HIPEP_MAX_TOKENS` | `512` | Used when a request omits `max_tokens` |
 | `HIPEP_MAX_JOBS` | `1` | Concurrent port, pull and benchmark jobs |
 | `HIPEP_CORS` | `1` | Allow cross-origin browser clients |
+| `HIPEP_KV_REUSE` | `1` | Carry a conversation's KV cache between turns |
+| `HIPEP_KV_GROWTH` | `2048` | Token granularity of a carried cache's budget |
 
 On a machine whose memory fits exactly one model, set `HIPEP_MAX_LOADED=1` and
 `HIPEP_MAX_CONCURRENT=1`. The defaults suit a card with room to spare.
+
+## Conversations and the KV cache
+
+A chat client re-sends the whole conversation every turn, so a server that starts fresh
+each time reads the entire transcript back before it answers. That shows up as a reply
+that takes longer to start the longer the conversation runs, while the words themselves
+arrive at an unchanged rate.
+
+The server instead keeps the generator that answered the last turn, along with the
+tokens its cache was built from. The next turn is matched against those tokens and only
+the part that is new is read; on `llama3.1:8b` this holds time-to-first-token near
+120 ms out to 800 tokens of conversation, where re-reading each turn reached 760 ms and
+was still climbing. Editing or deleting an earlier message shortens the match, and the
+cache is wound back to the last point the two still agree, so everything before the
+change is still spared.
+
+One conversation is carried per model. A request that continues something else replaces
+it rather than being held alongside it, which bounds what is kept on the card to a
+single cache. Two things are worth knowing before leaving it on:
+
+* The cache costs GPU memory for as long as the model stays loaded, sized by
+  `HIPEP_KV_GROWTH` rather than by the conversation so far.
+* A carried cache holds the previous answer as it was generated, token by token, rather
+  than as it would be read back in one pass. Those are not bit-identical on a quantized
+  model, so a reply can differ from what re-reading the transcript would have produced.
+  Set `HIPEP_KV_REUSE=0` where a reply has to depend on the conversation alone.
 
 ## Admission control
 

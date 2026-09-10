@@ -168,6 +168,14 @@ def copy_wheels(stage: Path, wheels: Path) -> list[str]:
     return names
 
 
+def wheel_digests(stage: Path, names: list[str]) -> dict[str, str]:
+    """Digest each wheel, because the AMD wheels keep their version string across
+    rebuilds: two bundles can carry the same `onnxruntime_ep_hip-0.4.0` file name and
+    different execution providers, and only the digest tells them apart."""
+    target = stage / "wheels"
+    return {name: hashlib.sha256((target / name).read_bytes()).hexdigest() for name in names}
+
+
 def wheel_python(names: list[str]) -> str | None:
     """The Python version the wheels were built for, from their file names."""
     for name in names:
@@ -241,6 +249,7 @@ def manifest(stage: Path, wheels: list[str]) -> dict:
             "included": bool(wheels),
             "python": wheel_python(wheels),
             "files": wheels,
+            "sha256": wheel_digests(stage, wheels),
         },
         "requires": {
             "python": ">=3.10 for the server; the GPU wheels pin their own version",
@@ -471,6 +480,12 @@ cards, the published benchmarks and the recipe collection.
 | `tests/` | The test suite, which needs no GPU |
 | `MANIFEST.json` | Version, commit and wheel provenance for this bundle |
 | `SHA256SUMS` | A checksum per file |
+
+The virtualenv the installer builds carries what the server needs to run and not what
+it takes to test it, so the suite asks for its own tools first:
+
+    pip install "pytest>=8.0" "pytest-asyncio>=0.23"
+    pytest
 
 ## Without an AMD GPU
 

@@ -32,6 +32,13 @@ function saveSettings(settings) {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
 }
 
+// The router rebuilds a view from scratch on every navigation, so a transcript held
+// inside the render function is discarded the moment the user steps over to Models to
+// look something up. Clearing a conversation stays deliberate -- the Clear chat button
+// or a reload -- rather than a side effect of using the nav. Chat and Vision keep
+// separate transcripts because they are separate conversations with different models.
+const transcripts = { chat: [], vision: [] };
+
 export async function renderChat(root, { vision = false } = {}) {
   const settings = loadSettings();
   const models = state.catalog.filter((m) => m.tier === "llm" || m.tier === "vlm");
@@ -48,7 +55,7 @@ export async function renderChat(root, { vision = false } = {}) {
     candidates[0];
 
   /** @type {{role:string,content:string,images:string[],usage?:object}[]} */
-  const history = [];
+  const history = transcripts[vision ? "vision" : "chat"];
   let attachments = [];
   let active = null;
 

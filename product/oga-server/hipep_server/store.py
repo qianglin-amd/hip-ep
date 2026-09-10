@@ -156,7 +156,10 @@ class ModelStore:
     def list(self) -> list[LocalModel]:
         models: list[LocalModel] = []
         for child in sorted(self.root.iterdir()) if self.root.is_dir() else []:
-            if not child.is_dir():
+            # Porting keeps its scratch space in `.ports` beside the models it builds,
+            # so a dot-prefixed directory is store bookkeeping and not something the
+            # user installed. Listing one offers a model that cannot be run or removed.
+            if not child.is_dir() or child.name.startswith("."):
                 continue
             sidecar = child / SIDECAR
             model_id = child.name.replace("--", ":").replace("__", "/")
