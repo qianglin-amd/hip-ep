@@ -41,7 +41,7 @@ set_target_properties(test-output-allocator PROPERTIES FOLDER "runtime-tests")
 # (lut/gfx1151.fb) and drive the same resolver that ships in
 # custom_kernels_<arch>, through the exported extern "C" shims. The resolver's
 # GPU-free build reads the arch from HIPDNN_EP_GQA_ARCH (set on the test), so no
-# device is needed. The linkable kGqaLutData[] is generated from the .fb with
+# device is needed. The linkable kGqaLutBlobs[] registry is generated from the .fb with
 # pure CMake (file(READ ... HEX)), mirroring how custom_kernels embeds it -- no
 # Python, no committed generated source.
 set(_gqa_test_lut_fb
@@ -55,8 +55,10 @@ string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _gqa_test_body "${_gqa_test_h
 file(WRITE ${_gqa_test_lut_cpp}
 "// Auto-generated from gfx1151.fb by test/runtime/CMakeLists.txt; do not edit, do not commit.\n"
 "#include <cstddef>\n"
-"extern \"C\" const unsigned char kGqaLutData[] = {${_gqa_test_body}};\n"
-"extern \"C\" const size_t kGqaLutData_size = ${_gqa_test_n};\n")
+"static const unsigned char _blob[] = {${_gqa_test_body}};\n"
+"extern \"C\" const unsigned char* const kGqaLutBlobs[] = { _blob };\n"
+"extern \"C\" const size_t kGqaLutBlobSizes[] = { ${_gqa_test_n} };\n"
+"extern \"C\" const size_t kGqaLutBlobCount = 1;\n")
 
 add_executable(test-gqa-autotune
     test_gqa_autotune.cpp
@@ -77,3 +79,15 @@ add_test(NAME GqaAutotuneUnitTest COMMAND test-gqa-autotune)
 set_tests_properties(GqaAutotuneUnitTest PROPERTIES
     ENVIRONMENT "HIPDNN_EP_GQA_ARCH=gfx1151")
 set_target_properties(test-gqa-autotune PROPERTIES FOLDER "runtime-tests")
+
+# ELF-only. Require DF_1_NODELETE and the two plugin entry points.
+# See test_hipgpu_elf_contract.cpp.
+if(UNIX AND NOT APPLE AND TARGET ${morphizen_CORE_DYNAMIC_UNIQUE_ID})
+  add_executable(test-hipgpu-elf-contract test_hipgpu_elf_contract.cpp)
+  target_compile_features(test-hipgpu-elf-contract PRIVATE cxx_std_17)
+  target_link_libraries(test-hipgpu-elf-contract PRIVATE ${CMAKE_DL_LIBS})
+  add_test(NAME HipGpuElfContract
+    COMMAND test-hipgpu-elf-contract $<TARGET_FILE:${morphizen_CORE_DYNAMIC_UNIQUE_ID}>)
+  set_tests_properties(HipGpuElfContract PROPERTIES TIMEOUT 60)
+  set_target_properties(test-hipgpu-elf-contract PROPERTIES FOLDER "runtime-tests")
+endif()

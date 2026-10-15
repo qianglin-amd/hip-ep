@@ -39,7 +39,8 @@
 //
 // Quantize evaluates the spec formula `y = saturate(round(x / scale) + zp)` in
 // that exact order. Dequantize evaluates `y = (x - zp) * scale` with the
-// subtraction kept in int32.
+// subtraction kept in int64, which is wide enough for the int32 storage the
+// dequantize direction accepts.
 //
 // Intermediate arithmetic is fp32 for every storage-type combination; see the
 // `precision` handling in hip_quantize_linear for how that relates to the ONNX
@@ -285,9 +286,36 @@ __global__ void dequantize_linear_kernel(
   int32_t zp = zero_point ? QuantLoad<QuantT>::load(zero_point, p) : 0;
   float s = FloatIO<ScaleT>::load(scale[p]);
 
-  // Subtract in int32 so nothing is lost before the widening; doing it in the
-  // scale's type would round twice for 16-bit storage with an fp16 scale.
-  output[tid] = FloatIO<OutT>::store(static_cast<float>(x - zp) * s);
+  // Keep `x - zp` in integer arithmetic and convert once afterwards; doing the
+  // subtraction in the scale's floating type would round both operands first
+  // and so round twice for 16-bit storage with an fp16 scale. The operands
+  // widen to int64 before subtracting because int32 storage can overflow an
+  // int32 difference, and ONNX only requires a zero point of 0 there rather
+  // than guaranteeing it.
+  int64_t centered = static_cast<int64_t>(x) - static_cast<int64_t>(zp);
+  output[tid] = FloatIO<OutT>::store(static_cast<float>(centered) * s);
+}
+
+// Materialize the device-side parameters consumed by the existing Q/DQ and
+// RMS kernels used by wrap_qlpnormalization. Keeping this stream-ordered avoids
+// synchronous hipMemcpy calls that would otherwise drain all preceding work
+// and incorrectly charge that GPU time to the wrapper's CPU profile.
+__global__ void qlpnormalization_prepare_params_kernel(
+    float *__restrict__ rms_scale, int64_t norm_num_elements,
+    float norm_scale, float *__restrict__ input_scale_device,
+    float input_scale, float *__restrict__ output_scale_device,
+    float output_scale, uint16_t *__restrict__ input_zp_device,
+    uint16_t input_zp, uint16_t *__restrict__ output_zp_device,
+    uint16_t output_zp) {
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (tid < norm_num_elements)
+    rms_scale[tid] = norm_scale;
+  if (tid == 0) {
+    *input_scale_device = input_scale;
+    *output_scale_device = output_scale;
+    *input_zp_device = input_zp;
+    *output_zp_device = output_zp;
+  }
 }
 
 // ---- host-side plan ------------------------------------------------------
@@ -442,6 +470,10 @@ int qdq_storage_bits(int dtype) {
   case HIP_DTYPE_INT16:
   case HIP_DTYPE_UINT16:
     return 16;
+  case HIP_DTYPE_INT32:
+    // Dequantize only; the quantize dispatch has no int32 instantiation, which
+    // matches ONNX giving QuantizeLinear no int32 output.
+    return 32;
   default:
     return 0;
   }
@@ -601,6 +633,84 @@ int dispatch_dequantize_scale(hipStream_t stream, const void *input,
 }
 
 } // namespace
+
+extern "C" int hip_qlpnormalization_prepare_params(
+    void *stream, void *rms_scale, int64_t norm_num_elements, float norm_scale,
+    void *input_scale_device, float input_scale, void *output_scale_device,
+    float output_scale, void *input_zp_device, uint16_t input_zp,
+    void *output_zp_device, uint16_t output_zp) {
+  if (!rms_scale || !input_scale_device || !output_scale_device ||
+      !input_zp_device || !output_zp_device || norm_num_elements <= 0) {
+    fprintf(stderr,
+            "[custom_kernels] hip_qlpnormalization_prepare_params: invalid "
+            "argument\n");
+    return -1;
+  }
+
+  constexpr int kBlockSize = 256;
+  int grid = 0;
+  if (qdq_grid_size("hip_qlpnormalization_prepare_params", norm_num_elements,
+                    kBlockSize, &grid) != 0)
+    return -1;
+
+  (void)hipGetLastError();
+  hipLaunchKernelGGL(
+      qlpnormalization_prepare_params_kernel, dim3(grid), dim3(kBlockSize), 0,
+      static_cast<hipStream_t>(stream), static_cast<float *>(rms_scale),
+      norm_num_elements, norm_scale, static_cast<float *>(input_scale_device),
+      input_scale, static_cast<float *>(output_scale_device), output_scale,
+      static_cast<uint16_t *>(input_zp_device), input_zp,
+      static_cast<uint16_t *>(output_zp_device), output_zp);
+  hipError_t err = hipGetLastError();
+  if (err != hipSuccess) {
+    fprintf(stderr,
+            "[custom_kernels] hip_qlpnormalization_prepare_params launch "
+            "failed: %s\n",
+            hipGetErrorString(err));
+  }
+  return static_cast<int>(err);
+}
+
+// Materialize the device-side scale/zp scalars consumed by the existing Q/DQ
+// kernels used by wrap_qsigmoid. Keeping this stream-ordered avoids
+// synchronous hipMemcpy that would drain preceding GPU work.
+__global__ void qsigmoid_prepare_params_kernel(
+    float *__restrict__ input_scale_device, float input_scale,
+    float *__restrict__ output_scale_device, float output_scale,
+    uint16_t *__restrict__ input_zp_device, uint16_t input_zp,
+    uint16_t *__restrict__ output_zp_device, uint16_t output_zp) {
+  *input_scale_device = input_scale;
+  *output_scale_device = output_scale;
+  *input_zp_device = input_zp;
+  *output_zp_device = output_zp;
+}
+
+extern "C" int hip_qsigmoid_prepare_params(
+    void *stream, void *input_scale_device, float input_scale,
+    void *output_scale_device, float output_scale, void *input_zp_device,
+    uint16_t input_zp, void *output_zp_device, uint16_t output_zp) {
+  if (!input_scale_device || !output_scale_device || !input_zp_device ||
+      !output_zp_device) {
+    fprintf(stderr,
+            "[custom_kernels] hip_qsigmoid_prepare_params: invalid argument\n");
+    return -1;
+  }
+
+  (void)hipGetLastError();
+  hipLaunchKernelGGL(qsigmoid_prepare_params_kernel, dim3(1), dim3(1), 0,
+                     static_cast<hipStream_t>(stream),
+                     static_cast<float *>(input_scale_device), input_scale,
+                     static_cast<float *>(output_scale_device), output_scale,
+                     static_cast<uint16_t *>(input_zp_device), input_zp,
+                     static_cast<uint16_t *>(output_zp_device), output_zp);
+  hipError_t err = hipGetLastError();
+  if (err != hipSuccess) {
+    fprintf(stderr,
+            "[custom_kernels] hip_qsigmoid_prepare_params launch failed: %s\n",
+            hipGetErrorString(err));
+  }
+  return static_cast<int>(err);
+}
 
 extern "C" int
 hip_quantize_linear(void *stream, const void *input, const void *scale,
@@ -764,6 +874,13 @@ hip_dequantize_linear(void *stream, const void *input, const void *scale,
                                                zero_point, output, plan,
                                                scale_dtype, out_dtype);
       break;
+    case HIP_DTYPE_INT32:
+      // QDQ exporters quantize a conv/gemm bias to int32 at
+      // input_scale * weight_scale. ONNX requires its zero point to be 0.
+      lrc = dispatch_dequantize_scale<int32_t>(hip_stream, input, scale,
+                                               zero_point, output, plan,
+                                               scale_dtype, out_dtype);
+      break;
     case HIP_DTYPE_UINT16:
       lrc = dispatch_dequantize_scale<uint16_t>(hip_stream, input, scale,
                                                 zero_point, output, plan,
@@ -778,7 +895,7 @@ hip_dequantize_linear(void *stream, const void *input, const void *scale,
     fprintf(stderr,
             "[custom_kernels] hip_dequantize_linear: unsupported dtype "
             "combination (input=%d bits=%d scale=%d output=%d); expected "
-            "int8/uint8/int16/uint16 input (int8/uint8 when bits=4) and "
+            "int8/uint8/int16/uint16/int32 input (int8/uint8 when bits=4) and "
             "float32 or float16 scale and output\n",
             in_dtype, in_bits, scale_dtype, out_dtype);
     return -1;

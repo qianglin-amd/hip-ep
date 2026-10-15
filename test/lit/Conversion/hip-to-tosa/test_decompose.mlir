@@ -1,0 +1,552 @@
+// Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
+// Licensed under the MIT License.
+
+// ============================================================================
+// TEST PURPOSE:
+// Verify hip ops that decompose to more than one TOSA op inside a
+// rock.kernel function, so rocMLIR can absorb them into a fused kernel, and
+// verify the forms the conversion rejects.
+//
+// hip.leaky_relu is not a BinaryConverter/UnaryConverter mapping: TOSA has no
+// leaky-relu op. For alpha in [0, 1] the lowering is
+// tosa.maximum(x, tosa.mul(x, splat(alpha))) with nan_mode = IGNORE. Outside
+// that range it is tosa.select(tosa.greater(x, 0), x, scaled).
+//
+// hip.miopen.softmax is last-dim softmax. TOSA has no softmax op; the
+// lowering is reduce_max/sub/exp/reduce_sum/reciprocal/mul, which TosaToRock
+// attention matching expects.
+//
+// hip.sqrt has no TOSA sqrt; the lowering is tosa.reciprocal(tosa.rsqrt(x)).
+// rocMLIR folds that pair back to math.sqrt.
+//
+// hip.silu / hip.swish have no TOSA ops. silu is x * sigmoid(x). swish is
+// x * sigmoid(alpha * x); default alpha is 1, which is silu.
+// hip.gelu has no TOSA op. Exact (approximate="none") expands to
+// 0.5 * x * (1 + erf(x / sqrt(2))); approximate="tanh" uses the
+// 0.044715 cubic / tanh form. Both match hip_elementwise_gelu.
+// hip.bias_gelu is that erf expansion after adding a last-dim bias.
+// hip.fast_gelu is the tanh expansion, with optional bias.
+//
+// hip.softplus has no TOSA op. The lowering is the stable expansion
+// max(x, 0) + log(1 + exp(-abs(x))) rather than log(1 + exp(x)), matching
+// hip_softplus and avoiding overflow on ordinary f16 values.
+//
+// FILE LAYOUT:
+// Everything that converts lives in the first --split-input-file chunk, so
+// it is one module and therefore also covers several ops converting in a
+// single pass run. Each rejected form then gets its own chunk: full
+// conversion turns a rejection into a pass failure that aborts the run for
+// the whole module, so sharing a chunk would let one rejection mask the cases
+// after it. A failing chunk contributes no output, while the chunks that
+// convert still print for FileCheck.
+// ============================================================================
+
+// RUN: hip-mlir-opt --convert-hip-to-tosa --split-input-file \
+// RUN:   --verify-diagnostics %s | FileCheck %s
+
+// CHECK-LABEL: func.func @leaky_relu
+// CHECK: %[[ALPHA:.*]] = "tosa.const"{{.*}}tensor<2x8xf16>
+// CHECK: %[[SHIFT:.*]] = "tosa.const"{{.*}}dense<0> : tensor<1xi8>
+// CHECK: %[[SCALED:.*]] = tosa.mul %arg1, %[[ALPHA]], %[[SHIFT]]
+// CHECK: tosa.maximum %arg1, %[[SCALED]] {{.*}}nan_mode = IGNORE
+// CHECK-NOT: hip.leaky_relu
+func.func @leaky_relu(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                      %init: tensor<2x8xf16>) -> tensor<2x8xf16>
+    attributes {rock.kernel} {
+  %r = hip.leaky_relu(%ctx) ins(%x : tensor<2x8xf16>)
+                            outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @leaky_relu_alpha
+// CHECK: tosa.mul
+// CHECK: tosa.maximum {{.*}}nan_mode = IGNORE
+// CHECK-NOT: hip.leaky_relu
+func.func @leaky_relu_alpha(%ctx: !hip.context, %x: tensor<4xf32>,
+                           %init: tensor<4xf32>) -> tensor<4xf32>
+    attributes {rock.kernel} {
+  %r = hip.leaky_relu(%ctx) ins(%x : tensor<4xf32>)
+                            outs(%init : tensor<4xf32>)
+                            {alpha = 0.2 : f64} : tensor<4xf32>
+  return %r : tensor<4xf32>
+}
+
+// The shape hip-fuse-rocmlir actually produces: the !hip.context is a
+// ub.poison materialized inside the outlined kernel rather than a block
+// argument.
+// CHECK-LABEL: func.func @leaky_relu_outlined_kernel
+// CHECK: tosa.maximum {{.*}}nan_mode = IGNORE
+// CHECK-NOT: hip.leaky_relu
+func.func @leaky_relu_outlined_kernel(%x: tensor<2x8xf16>,
+                                     %init: tensor<2x8xf16>)
+    -> tensor<2x8xf16> attributes {rock.kernel} {
+  %ctx = ub.poison : !hip.context
+  %r = hip.leaky_relu(%ctx) ins(%x : tensor<2x8xf16>)
+                            outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// alpha > 1 is not max(x, alpha*x); keep the ONNX select.
+// CHECK-LABEL: func.func @leaky_relu_alpha_gt1
+// CHECK: tosa.mul
+// CHECK: tosa.greater
+// CHECK: tosa.select
+// CHECK-NOT: tosa.maximum
+// CHECK-NOT: hip.leaky_relu
+func.func @leaky_relu_alpha_gt1(%ctx: !hip.context, %x: tensor<4xf32>,
+                                %init: tensor<4xf32>) -> tensor<4xf32>
+    attributes {rock.kernel} {
+  %r = hip.leaky_relu(%ctx) ins(%x : tensor<4xf32>)
+                            outs(%init : tensor<4xf32>)
+                            {alpha = 1.1 : f64} : tensor<4xf32>
+  return %r : tensor<4xf32>
+}
+
+// Negative alpha is the same select path, not maximum.
+// CHECK-LABEL: func.func @leaky_relu_alpha_neg
+// CHECK: tosa.mul
+// CHECK: tosa.greater
+// CHECK: tosa.select
+// CHECK-NOT: tosa.maximum
+// CHECK-NOT: hip.leaky_relu
+func.func @leaky_relu_alpha_neg(%ctx: !hip.context, %x: tensor<4xf32>,
+                                %init: tensor<4xf32>) -> tensor<4xf32>
+    attributes {rock.kernel} {
+  %r = hip.leaky_relu(%ctx) ins(%x : tensor<4xf32>)
+                            outs(%init : tensor<4xf32>)
+                            {alpha = -1.000000e-01 : f64} : tensor<4xf32>
+  return %r : tensor<4xf32>
+}
+
+// CHECK-LABEL: func.func @softmax
+// CHECK: tosa.reduce_max %arg1 {axis = 1 : i32}
+// CHECK: tosa.sub
+// CHECK: tosa.exp
+// CHECK: tosa.reduce_sum {{.*}}{axis = 1 : i32}
+// CHECK: tosa.reciprocal
+// CHECK: tosa.mul
+// CHECK-NOT: hip.miopen.softmax
+func.func @softmax(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                   %init: tensor<2x8xf16>) -> tensor<2x8xf16>
+    attributes {rock.kernel} {
+  %r = hip.miopen.softmax(%ctx) ins(%x : tensor<2x8xf16>)
+                                 outs(%init : tensor<2x8xf16>)
+                                 -> tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// 3D [B,S,D] softmax is over the last dim (axis = 2).
+// CHECK-LABEL: func.func @softmax_3d
+// CHECK: tosa.reduce_max %arg1 {axis = 2 : i32}
+// CHECK: tosa.reduce_sum {{.*}}{axis = 2 : i32}
+// CHECK-NOT: hip.miopen.softmax
+func.func @softmax_3d(%ctx: !hip.context, %x: tensor<2x4x8xf16>,
+                      %init: tensor<2x4x8xf16>) -> tensor<2x4x8xf16>
+    attributes {rock.kernel} {
+  %r = hip.miopen.softmax(%ctx) ins(%x : tensor<2x4x8xf16>)
+                                 outs(%init : tensor<2x4x8xf16>)
+                                 -> tensor<2x4x8xf16>
+  return %r : tensor<2x4x8xf16>
+}
+
+// CHECK-LABEL: func.func @softmax_outlined_kernel
+// CHECK: tosa.reduce_max %arg0 {axis = 1 : i32}
+// CHECK-NOT: hip.miopen.softmax
+func.func @softmax_outlined_kernel(%x: tensor<2x8xf16>,
+                                   %init: tensor<2x8xf16>)
+    -> tensor<2x8xf16> attributes {rock.kernel} {
+  %ctx = ub.poison : !hip.context
+  %r = hip.miopen.softmax(%ctx) ins(%x : tensor<2x8xf16>)
+                                 outs(%init : tensor<2x8xf16>)
+                                 -> tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @sqrt
+// CHECK: %[[RSQRT:.*]] = tosa.rsqrt %arg1
+// CHECK: tosa.reciprocal %[[RSQRT]]
+// CHECK-NOT: hip.sqrt
+func.func @sqrt(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                %init: tensor<2x8xf16>) -> tensor<2x8xf16>
+    attributes {rock.kernel} {
+  %r = hip.sqrt(%ctx) ins(%x : tensor<2x8xf16>)
+                      outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @sqrt_outlined_kernel
+// CHECK: tosa.rsqrt
+// CHECK: tosa.reciprocal
+// CHECK-NOT: hip.sqrt
+func.func @sqrt_outlined_kernel(%x: tensor<2x8xf16>, %init: tensor<2x8xf16>)
+    -> tensor<2x8xf16> attributes {rock.kernel} {
+  %ctx = ub.poison : !hip.context
+  %r = hip.sqrt(%ctx) ins(%x : tensor<2x8xf16>)
+                      outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+
+// CHECK-LABEL: func.func @silu
+// CHECK: tosa.sigmoid
+// CHECK: tosa.mul
+// CHECK-NOT: hip.silu
+func.func @silu(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                %init: tensor<2x8xf16>) -> tensor<2x8xf16>
+    attributes {rock.kernel} {
+  %r = hip.silu(%ctx) ins(%x : tensor<2x8xf16>)
+                      outs(%init : tensor<2x8xf16>) -> tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @silu_outlined_kernel
+// CHECK: tosa.sigmoid
+// CHECK: tosa.mul
+// CHECK-NOT: hip.silu
+func.func @silu_outlined_kernel(%x: tensor<2x8xf16>, %init: tensor<2x8xf16>)
+    -> tensor<2x8xf16> attributes {rock.kernel} {
+  %ctx = ub.poison : !hip.context
+  %r = hip.silu(%ctx) ins(%x : tensor<2x8xf16>)
+                      outs(%init : tensor<2x8xf16>) -> tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// Default alpha = 1 is silu: one sigmoid and one mul, no alpha scale.
+// CHECK-LABEL: func.func @swish_default
+// CHECK: tosa.sigmoid
+// CHECK: tosa.mul
+// CHECK-NOT: hip.swish
+func.func @swish_default(%ctx: !hip.context, %x: tensor<3x4xf32>,
+                         %init: tensor<3x4xf32>) -> tensor<3x4xf32>
+    attributes {rock.kernel} {
+  %r = hip.swish(%ctx) ins(%x : tensor<3x4xf32>)
+                       outs(%init : tensor<3x4xf32>) : tensor<3x4xf32>
+  return %r : tensor<3x4xf32>
+}
+
+// CHECK-LABEL: func.func @swish_alpha
+// CHECK: tosa.mul
+// CHECK: tosa.sigmoid
+// CHECK: tosa.mul
+// CHECK-NOT: hip.swish
+func.func @swish_alpha(%ctx: !hip.context, %x: tensor<2x3xf16>,
+                       %init: tensor<2x3xf16>) -> tensor<2x3xf16>
+    attributes {rock.kernel} {
+  %r = hip.swish(%ctx) ins(%x : tensor<2x3xf16>)
+                       outs(%init : tensor<2x3xf16>)
+                       {alpha = 5.000000e-01 : f64} : tensor<2x3xf16>
+  return %r : tensor<2x3xf16>
+}
+
+// CHECK-LABEL: func.func @swish_outlined_kernel
+// CHECK: tosa.sigmoid
+// CHECK-NOT: hip.swish
+func.func @swish_outlined_kernel(%x: tensor<3x4xf32>, %init: tensor<3x4xf32>)
+    -> tensor<3x4xf32> attributes {rock.kernel} {
+  %ctx = ub.poison : !hip.context
+  %r = hip.swish(%ctx) ins(%x : tensor<3x4xf32>)
+                       outs(%init : tensor<3x4xf32>) : tensor<3x4xf32>
+  return %r : tensor<3x4xf32>
+}
+
+// CHECK-LABEL: func.func @gelu
+// CHECK: tosa.mul
+// CHECK: tosa.erf
+// CHECK: tosa.add
+// CHECK: tosa.mul
+// CHECK-NOT: hip.gelu
+func.func @gelu(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                %init: tensor<2x8xf16>) -> tensor<2x8xf16>
+    attributes {rock.kernel} {
+  %r = hip.gelu(%ctx) ins(%x : tensor<2x8xf16>)
+                      outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @gelu_tanh
+// CHECK: tosa.mul
+// CHECK: tosa.tanh
+// CHECK-NOT: tosa.erf
+// CHECK-NOT: hip.gelu
+func.func @gelu_tanh(%ctx: !hip.context, %x: tensor<4xf32>,
+                     %init: tensor<4xf32>) -> tensor<4xf32>
+    attributes {rock.kernel} {
+  %r = hip.gelu(%ctx) ins(%x : tensor<4xf32>)
+                      outs(%init : tensor<4xf32>)
+                      {approximate = "tanh"} : tensor<4xf32>
+  return %r : tensor<4xf32>
+}
+
+// CHECK-LABEL: func.func @gelu_outlined_kernel
+// CHECK: tosa.erf
+// CHECK-NOT: hip.gelu
+func.func @gelu_outlined_kernel(%x: tensor<2x8xf16>, %init: tensor<2x8xf16>)
+    -> tensor<2x8xf16> attributes {rock.kernel} {
+  %ctx = ub.poison : !hip.context
+  %r = hip.gelu(%ctx) ins(%x : tensor<2x8xf16>)
+                      outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @bias_gelu
+// CHECK: tosa.reshape
+// CHECK: tosa.add
+// CHECK: tosa.erf
+// CHECK-NOT: hip.bias_gelu
+func.func @bias_gelu(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                     %bias: tensor<8xf16>, %init: tensor<2x8xf16>)
+    -> tensor<2x8xf16> attributes {rock.kernel} {
+  %r = hip.bias_gelu(%ctx) ins(%x, %bias : tensor<2x8xf16>, tensor<8xf16>)
+                           outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @fast_gelu
+// CHECK: tosa.tanh
+// CHECK-NOT: tosa.erf
+// CHECK-NOT: hip.fast_gelu
+func.func @fast_gelu(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                     %init: tensor<2x8xf16>) -> tensor<2x8xf16>
+    attributes {rock.kernel} {
+  %r = hip.fast_gelu(%ctx) ins(%x : tensor<2x8xf16>)
+                           outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @fast_gelu_bias
+// CHECK: tosa.add
+// CHECK: tosa.tanh
+// CHECK-NOT: tosa.erf
+// CHECK-NOT: hip.fast_gelu
+func.func @fast_gelu_bias(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                          %bias: tensor<8xf16>, %init: tensor<2x8xf16>)
+    -> tensor<2x8xf16> attributes {rock.kernel} {
+  %r = hip.fast_gelu(%ctx) ins(%x : tensor<2x8xf16>)
+                           bias(%bias : tensor<8xf16>)
+                           outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @softplus
+// CHECK: tosa.abs
+// CHECK: tosa.negate
+// CHECK: tosa.exp
+// CHECK: tosa.add
+// CHECK: tosa.log
+// CHECK: tosa.maximum
+// CHECK: tosa.add
+// CHECK-NOT: hip.softplus
+func.func @softplus(%ctx: !hip.context, %x: tensor<2x8xf16>,
+                    %init: tensor<2x8xf16>) -> tensor<2x8xf16>
+    attributes {rock.kernel} {
+  %r = hip.softplus(%ctx) ins(%x : tensor<2x8xf16>)
+                          outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// CHECK-LABEL: func.func @softplus_outlined_kernel
+// CHECK: tosa.abs
+// CHECK: tosa.log
+// CHECK: tosa.maximum
+// CHECK-NOT: hip.softplus
+func.func @softplus_outlined_kernel(%x: tensor<2x8xf16>,
+                                    %init: tensor<2x8xf16>)
+    -> tensor<2x8xf16> attributes {rock.kernel} {
+  %ctx = ub.poison : !hip.context
+  %r = hip.softplus(%ctx) ins(%x : tensor<2x8xf16>)
+                          outs(%init : tensor<2x8xf16>) : tensor<2x8xf16>
+  return %r : tensor<2x8xf16>
+}
+
+// -----
+
+// Dynamic shapes give the pattern no static shape to reason about.
+func.func @dynamic_shape(%ctx: !hip.context, %x: tensor<?x8xf16>,
+                         %init: tensor<?x8xf16>) -> tensor<?x8xf16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.leaky_relu'}}
+  %r = hip.leaky_relu(%ctx) ins(%x : tensor<?x8xf16>)
+                            outs(%init : tensor<?x8xf16>) : tensor<?x8xf16>
+  return %r : tensor<?x8xf16>
+}
+
+// -----
+
+// Integer operands are not a valid ONNX LeakyRelu and would have no TOSA
+// float-profile lowering for the mul/maximum pair.
+func.func @integer_operand(%ctx: !hip.context, %x: tensor<4xi32>,
+                           %init: tensor<4xi32>) -> tensor<4xi32>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.leaky_relu'}}
+  %r = hip.leaky_relu(%ctx) ins(%x : tensor<4xi32>)
+                            outs(%init : tensor<4xi32>) : tensor<4xi32>
+  return %r : tensor<4xi32>
+}
+
+// -----
+
+func.func @softmax_dynamic_shape(%ctx: !hip.context, %x: tensor<?x8xf16>,
+                                  %init: tensor<?x8xf16>) -> tensor<?x8xf16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.miopen.softmax'}}
+  %r = hip.miopen.softmax(%ctx) ins(%x : tensor<?x8xf16>)
+                                 outs(%init : tensor<?x8xf16>)
+                                 -> tensor<?x8xf16>
+  return %r : tensor<?x8xf16>
+}
+
+// -----
+
+func.func @softmax_integer_operand(%ctx: !hip.context, %x: tensor<4xi32>,
+                                  %init: tensor<4xi32>) -> tensor<4xi32>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.miopen.softmax'}}
+  %r = hip.miopen.softmax(%ctx) ins(%x : tensor<4xi32>)
+                                 outs(%init : tensor<4xi32>)
+                                 -> tensor<4xi32>
+  return %r : tensor<4xi32>
+}
+
+// -----
+
+func.func @softmax_rank0(%ctx: !hip.context, %x: tensor<f16>,
+                          %init: tensor<f16>) -> tensor<f16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.miopen.softmax'}}
+  %r = hip.miopen.softmax(%ctx) ins(%x : tensor<f16>)
+                                 outs(%init : tensor<f16>) -> tensor<f16>
+  return %r : tensor<f16>
+}
+
+// -----
+
+func.func @sqrt_dynamic_shape(%ctx: !hip.context, %x: tensor<?x8xf16>,
+                               %init: tensor<?x8xf16>) -> tensor<?x8xf16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.sqrt'}}
+  %r = hip.sqrt(%ctx) ins(%x : tensor<?x8xf16>)
+                      outs(%init : tensor<?x8xf16>) : tensor<?x8xf16>
+  return %r : tensor<?x8xf16>
+}
+
+// -----
+
+func.func @sqrt_integer_operand(%ctx: !hip.context, %x: tensor<4xi32>,
+                                 %init: tensor<4xi32>) -> tensor<4xi32>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.sqrt'}}
+  %r = hip.sqrt(%ctx) ins(%x : tensor<4xi32>)
+                      outs(%init : tensor<4xi32>) : tensor<4xi32>
+  return %r : tensor<4xi32>
+}
+
+// -----
+
+func.func @silu_dynamic_shape(%ctx: !hip.context, %x: tensor<?x8xf16>,
+                               %init: tensor<?x8xf16>) -> tensor<?x8xf16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.silu'}}
+  %r = hip.silu(%ctx) ins(%x : tensor<?x8xf16>)
+                      outs(%init : tensor<?x8xf16>) -> tensor<?x8xf16>
+  return %r : tensor<?x8xf16>
+}
+
+// -----
+
+func.func @silu_integer_operand(%ctx: !hip.context, %x: tensor<4xi32>,
+                                 %init: tensor<4xi32>) -> tensor<4xi32>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.silu'}}
+  %r = hip.silu(%ctx) ins(%x : tensor<4xi32>)
+                      outs(%init : tensor<4xi32>) -> tensor<4xi32>
+  return %r : tensor<4xi32>
+}
+
+// -----
+
+func.func @swish_dynamic_shape(%ctx: !hip.context, %x: tensor<?x8xf16>,
+                                %init: tensor<?x8xf16>) -> tensor<?x8xf16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.swish'}}
+  %r = hip.swish(%ctx) ins(%x : tensor<?x8xf16>)
+                       outs(%init : tensor<?x8xf16>) : tensor<?x8xf16>
+  return %r : tensor<?x8xf16>
+}
+
+// -----
+
+func.func @swish_integer_operand(%ctx: !hip.context, %x: tensor<4xi32>,
+                                  %init: tensor<4xi32>) -> tensor<4xi32>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.swish'}}
+  %r = hip.swish(%ctx) ins(%x : tensor<4xi32>)
+                       outs(%init : tensor<4xi32>) : tensor<4xi32>
+  return %r : tensor<4xi32>
+}
+
+// -----
+
+func.func @gelu_dynamic_shape(%ctx: !hip.context, %x: tensor<?x8xf16>,
+                              %init: tensor<?x8xf16>) -> tensor<?x8xf16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.gelu'}}
+  %r = hip.gelu(%ctx) ins(%x : tensor<?x8xf16>)
+                      outs(%init : tensor<?x8xf16>) : tensor<?x8xf16>
+  return %r : tensor<?x8xf16>
+}
+
+// -----
+
+func.func @softplus_dynamic_shape(%ctx: !hip.context, %x: tensor<?x8xf16>,
+                                  %init: tensor<?x8xf16>) -> tensor<?x8xf16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.softplus'}}
+  %r = hip.softplus(%ctx) ins(%x : tensor<?x8xf16>)
+                          outs(%init : tensor<?x8xf16>) : tensor<?x8xf16>
+  return %r : tensor<?x8xf16>
+}
+
+// -----
+
+func.func @gelu_integer_operand(%ctx: !hip.context, %x: tensor<4xi32>,
+                                %init: tensor<4xi32>) -> tensor<4xi32>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.gelu'}}
+  %r = hip.gelu(%ctx) ins(%x : tensor<4xi32>)
+                      outs(%init : tensor<4xi32>) : tensor<4xi32>
+  return %r : tensor<4xi32>
+}
+
+// -----
+
+func.func @bias_gelu_dynamic_shape(%ctx: !hip.context, %x: tensor<?x8xf16>,
+                                   %bias: tensor<8xf16>,
+                                   %init: tensor<?x8xf16>) -> tensor<?x8xf16>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.bias_gelu'}}
+  %r = hip.bias_gelu(%ctx) ins(%x, %bias : tensor<?x8xf16>, tensor<8xf16>)
+                           outs(%init : tensor<?x8xf16>) : tensor<?x8xf16>
+  return %r : tensor<?x8xf16>
+}
+
+// -----
+
+func.func @fast_gelu_integer_operand(%ctx: !hip.context, %x: tensor<4xi32>,
+                                     %init: tensor<4xi32>) -> tensor<4xi32>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.fast_gelu'}}
+  %r = hip.fast_gelu(%ctx) ins(%x : tensor<4xi32>)
+                           outs(%init : tensor<4xi32>) : tensor<4xi32>
+  return %r : tensor<4xi32>
+}
+
+// -----
+
+func.func @softplus_integer_operand(%ctx: !hip.context, %x: tensor<4xi32>,
+                                    %init: tensor<4xi32>) -> tensor<4xi32>
+    attributes {rock.kernel} {
+  // expected-error @+1 {{failed to legalize operation 'hip.softplus'}}
+  %r = hip.softplus(%ctx) ins(%x : tensor<4xi32>)
+                          outs(%init : tensor<4xi32>) : tensor<4xi32>
+  return %r : tensor<4xi32>
+}

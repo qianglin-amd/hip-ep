@@ -39,14 +39,14 @@ contract; see [Generated-Code Runtime Inputs](#generated-code-runtime-inputs).
         │    __metadata_blob  (binary, for runtime)
         │    __metadata_json  (text, for inspection)
         ▼
-  ┌──────────────────────────────────────┐
-  │           model.bc (bitcode)         │
-  │  __metadata_blob       (internal)    │  ← baked into bitcode data
-  │  __metadata_json       (internal)    │  ← human-readable copy
-  │                                      │
-  │  inference_init(out_state, fs)       │  ← public API
-  │  inference_get_metadata_json()       │  ← public API
-  └──────────────────────────────────────┘
+  ┌───────────────────────────────────────────┐
+  │            model.bc (bitcode)             │
+  │  __metadata_blob       (internal)         │  ← baked into bitcode data
+  │  __metadata_json       (internal)         │  ← human-readable copy
+  │                                           │
+  │  inference_init(out_state, fs, config)    │  ← public API
+  │  inference_get_metadata_json()            │  ← public API
+  └───────────────────────────────────────────┘
         │
         │  LlvmIrJit parses bytes → llvm::orc::LLJIT codegen
         │  inference_init reads __metadata_blob directly
@@ -68,6 +68,22 @@ mirror are produced for both artifact formats
 
 The EP selects the loader from `mlir_metadata::Metadata.artifact_format` before
 opening the artifact. See [native-vs-ir-comparison.md](../native-vs-ir-comparison.md).
+
+`Metadata.rocmlir_arch` records what the embedded rocMLIR code objects were
+built for, not only the GPU arch: it is `hip::compiler::rocMlirArtifactTarget()`,
+which is empty when `HIPDNN_EP_ROCMLIR` was off, the arch alone when rocMLIR
+compiled with default perfConfigs (`gfx1151`), and the arch with an
+`+autotune=<space>` suffix when `HIPDNN_EP_ROCMLIR_AUTOTUNE` selected
+benchmarked ones (`gfx1151+autotune=quick`). The perfConfig a kernel was tuned
+to is baked into its code object, so a tuned and an untuned artifact are not
+interchangeable even on the same GPU.
+
+The model cache / EPContext identity is derived from the graph alone, so the EP
+refuses to load an artifact whose recorded value differs from the current one;
+delete the cache and recompile after changing GPUs or toggling either
+`HIPDNN_EP_ROCMLIR` or `HIPDNN_EP_ROCMLIR_AUTOTUNE`. Compilation fails outright
+if autotuning was requested but no HIP device could be reached, so the suffix
+never claims tuning that did not happen.
 
 ---
 

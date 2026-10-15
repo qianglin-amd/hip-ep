@@ -24,9 +24,45 @@ CRT_LIBS = [
 
 ROCM_DLL_GROUPS = [
     ["hipblaslt.dll", "libhipblaslt.dll"],
+    ["tensilelite-host.dll"],
 ]
 
 HIPBLASLT_DATA = ("hipblaslt", "library")
+
+# AMDGPU Generic Processors table from LLVM AMDGPUUsage; must stay in sync with
+# genericTargetFor in LlvmIrJit.cpp.
+_GENERIC_MEMBERS = {
+    "gfx9-generic": ("gfx900", "gfx902", "gfx904", "gfx906", "gfx909", "gfx90c"),
+    "gfx9-4-generic": ("gfx942", "gfx950"),
+    "gfx10-1-generic": ("gfx1010", "gfx1011", "gfx1012", "gfx1013"),
+    "gfx10-3-generic": (
+        "gfx1030",
+        "gfx1031",
+        "gfx1032",
+        "gfx1033",
+        "gfx1034",
+        "gfx1035",
+        "gfx1036",
+    ),
+    "gfx11-generic": (
+        "gfx1100",
+        "gfx1101",
+        "gfx1102",
+        "gfx1103",
+        "gfx1150",
+        "gfx1151",
+        "gfx1152",
+        "gfx1153",
+    ),
+    "gfx12-generic": ("gfx1200", "gfx1201"),
+}
+
+
+def _resolve_tensile_archs(library, requested):
+    if (library / requested).is_dir():
+        return [requested]
+    members = _GENERIC_MEMBERS.get(requested, ())
+    return [a for a in members if (library / a).is_dir()]
 
 
 def _find_in_lib_env(name: str):
@@ -58,7 +94,7 @@ def _copy_crt_libs(dest: Path) -> int:
     return len(missing)
 
 
-def _copy_rocm_runtime(dist: Path, arch: str, dest: Path) -> int:
+def _copy_rocm_runtime(dist: Path, archs: list, dest: Path) -> int:
     bin_dir = dist / "bin"
     if not bin_dir.is_dir():
         print(f"ERROR: --rocm-dist has no bin/: {dist}", file=sys.stderr)
@@ -77,20 +113,35 @@ def _copy_rocm_runtime(dist: Path, arch: str, dest: Path) -> int:
             shutil.copy2(src, dest / src.name)
             print(f"  packaged ROCm dll: {src.name} <- {src}")
 
-    src_data = bin_dir.joinpath(*HIPBLASLT_DATA, arch)
-    if not src_data.is_dir():
+    library = bin_dir.joinpath(*HIPBLASLT_DATA)
+    tensile_archs = []
+    for arch in archs:
+        resolved = _resolve_tensile_archs(library, arch)
+        if not resolved:
+            available = []
+            if library.is_dir():
+                available = sorted(p.name for p in library.iterdir() if p.is_dir())
+            hint = f" (available: {', '.join(available)})" if available else ""
+            print(
+                f"ERROR: hipBLASLt Tensile data for {arch} not found: "
+                f"{library / arch}{hint}",
+                file=sys.stderr,
+            )
+            return 1
+        if resolved != [arch]:
+            print(f"  hipBLASLt Tensile arch {arch} -> {', '.join(resolved)}")
+        tensile_archs += [a for a in resolved if a not in tensile_archs]
+
+    for tensile_arch in tensile_archs:
+        src_data = library / tensile_arch
+        dst_data = dest.joinpath(*HIPBLASLT_DATA, tensile_arch)
+        shutil.copytree(src_data, dst_data)
+        count = sum(1 for p in dst_data.rglob("*") if p.is_file())
         print(
-            f"ERROR: hipBLASLt Tensile data for {arch} not found: {src_data}",
-            file=sys.stderr,
+            f"  packaged hipBLASLt Tensile data: "
+            f"{'/'.join(HIPBLASLT_DATA)}/{tensile_arch} "
+            f"({count} files) <- {src_data}"
         )
-        return 1
-    dst_data = dest.joinpath(*HIPBLASLT_DATA, arch)
-    shutil.copytree(src_data, dst_data)
-    count = sum(1 for p in dst_data.rglob("*") if p.is_file())
-    print(
-        f"  packaged hipBLASLt Tensile data: {'/'.join(HIPBLASLT_DATA)}/{arch} "
-        f"({count} files) <- {src_data}"
-    )
     return 0
 
 
@@ -118,19 +169,12 @@ def main():
     )
     ap.add_argument(
         "--rocm-arch",
+        action="append",
         required=True,
         metavar="GFX",
-        help="GPU arch whose hipBLASLt Tensile data to bundle, e.g. gfx1151. A "
-        "multi-arch distribution carries every arch; the wheel ships one.",
-    )
-    ap.add_argument(
-        "--data-file",
-        action="append",
-        default=[],
-        metavar="PATH",
-        help="Non-library file the EP loads from its own directory at runtime "
-        "(repeatable), e.g. HipFusionPatterns.pdl.mlir. Missing files are a "
-        "hard error: the EP cannot compile a model without them.",
+        help="Device ISA whose hipBLASLt Tensile data to bundle, e.g. gfx1151 "
+        "(repeatable). A generic compile target (gfx11-generic) expands to "
+        "every member ISA present in the dist.",
     )
     ap.add_argument(
         "--extra-lib",
@@ -157,14 +201,6 @@ def main():
             return 1
         shutil.copy2(lib, dest / lib.name)
         print(f"  packaged library: {lib.name} <- {lib}")
-
-    for raw in args.data_file:
-        data = Path(raw)
-        if not data.is_file():
-            print(f"ERROR: data file not found: {data}", file=sys.stderr)
-            return 1
-        shutil.copy2(data, dest / data.name)
-        print(f"  packaged data file: {data.name} <- {data}")
 
     for raw in args.extra_lib:
         lib = Path(raw)

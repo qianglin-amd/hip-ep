@@ -47,13 +47,21 @@ set(_kernel_sources
     hip/bias_gelu_kernel.hip
     hip/fast_gelu_kernel.hip
     hip/leaky_relu_kernel.hip
+    hip/prelu_kernel.hip
+    hip/lrn_kernel.hip
+    hip/trilu_kernel.hip
     hip/swish_kernel.hip
+    hip/pow_kernel.hip
     hip/softplus_kernel.hip
     hip/elementwise_where_kernel.hip
     hip/qelementwise_kernel.hip
     hip/qmatmul_kernel.hip
+    hip/qgemm_kernel.hip
     hip/qconv_kernel.hip
+    hip/qlinear_conv_kernel.hip
+    hip/qlinear_matmul_kernel.hip
     hip/elementwise_unary_kernel.hip
+    hip/isnan_kernel.hip
     hip/elementwise_binary_kernel.hip  # Mul/Add/Min/Max/Div/Mod/Equal/Less
     hip/tile_kernel.hip
     hip/expand_kernel.hip
@@ -62,6 +70,8 @@ set(_kernel_sources
     hip/pad_kernel.hip
     hip/layer_norm_kernel.hip
     hip/instance_norm_kernel.hip
+    hip/batch_norm_kernel.hip
+    hip/group_norm_kernel.hip
     hip/rms_norm_kernel.hip
     hip/skip_rms_norm_kernel.hip
     hip/cast_kernel.hip
@@ -69,6 +79,7 @@ set(_kernel_sources
     hip/gather_kernel.hip
     hip/gather_elements_kernel.hip
     hip/top_k_kernel.hip
+    hip/random_normal_like_kernel.hip
     hip/scatter_elements_kernel.hip
     hip/compress_kernel.hip
     hip/one_hot_kernel.hip
@@ -81,6 +92,7 @@ set(_kernel_sources
     hip/global_pool_kernel.hip
     hip/matmul_nbits_kernel.hip
     hip/qmoe_kernel.hip
+    hip/qmoe_ragged_mm_kernel.hip
     hip/qmoe_amd_kernel.hip
     hip/linear_attention_kernel.hip
     hip/transpose_kernel.hip
@@ -96,46 +108,101 @@ set(_kernel_sources
 
 # MatMulNBits offline autotune table.
 #
-# The table is per-arch and so is this target, which is why the bytes are
-# embedded here in custom_kernels_<arch>.dll (as is the GQA table below): a DLL
-# carries exactly the table it can use.
+# The tables are embedded here in custom_kernels_<arch>.dll (as is GQA below).
+# A gfx*-generic DLL carries every family member's table that exists on disk
+# (see _lut_arch_members); at load compatible() keeps the one whose gpu_arch
+# matches the device and ignores the rest, so each member ISA gets its own table
+# and the others fall back to runtime autotune -- no cross-arch mixing.
 #
-# Only the checked-in lut/<arch>.fb ships; the linkable kMatmulNbitsLutData[]
-# symbol is generated from it below with pure CMake (file(READ ... HEX)) -- the
-# hip-ep build does not require Python, and no generated .cpp is committed (the
-# compiled array is just the .fb's bytes). An arch with no measured table still
-# builds via tools/empty_lut_data.cpp: the loader finds no table, and every
-# shape falls through to the runtime sweep exactly as before. Shipping a new
-# arch is therefore a table addition (a .fb), never a build break.
+# Only the checked-in lut/<arch>.fb files ship; the linkable blob registry
+# (kMatmulNbitsLutBlobs[]) is generated from them below with pure CMake
+# (file(READ ... HEX)) -- the hip-ep build does not require Python, and no
+# generated .cpp is committed (the arrays are just the .fb bytes). An arch with
+# no measured table still builds -- _emit_lut_registry emits an empty registry
+# (BlobCount 0) -- so the loader finds no table and every shape falls through to
+# the runtime sweep. Shipping a new arch is a table addition (a .fb), never a
+# build break. (tools/empty_lut_data.cpp is only for the manual sweep driver.)
 set(_matmul_nbits_autotune_dir ${CMAKE_CURRENT_SOURCE_DIR}/hip/autotune/matmul_nbits)
 
-function(_matmul_nbits_lut_data_source arch out_var)
-    set(_fb ${_matmul_nbits_autotune_dir}/lut/${arch}.fb)
-    if(EXISTS ${_fb})
-        # Re-run CMake configure if the table changes, so the generated source
-        # below stays in sync with the checked-in .fb.
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_fb})
-        file(READ ${_fb} _hex HEX)
-        string(LENGTH "${_hex}" _len)
-        math(EXPR _n "${_len} / 2")
-        # Each byte "nn" -> "0xnn,". The trailing comma before '}' is valid C++;
-        # one long line is fine (compiled by hipcc/clang, no line-length limit).
-        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _body "${_hex}")
-        set(_gen ${CMAKE_CURRENT_BINARY_DIR}/matmul_nbits_lut_data_${arch}.cpp)
-        file(WRITE ${_gen}
-"// Auto-generated from ${arch}.fb by lib/Runtime/Kernels/CMakeLists.txt; do not edit, do not commit.\n"
-"#include <cstddef>\n"
-"extern \"C\" const unsigned char kMatmulNbitsLutData[] = {${_body}};\n"
-"extern \"C\" const size_t kMatmulNbitsLutData_size = ${_n};\n")
-        set(${out_var} ${_gen} PARENT_SCOPE)
+# Maps a build arch to the concrete family members whose LUT may ship in its
+# DLL. Mirrors genericTargetFor() in backend-mlir-compiler/custom-op-mlir/src/
+# LlvmIrJit.cpp: a gfx*-generic DLL runs on every member ISA, so it carries each
+# member's table that exists on disk and the loader picks the one matching the
+# live device by gpu_arch. A concrete arch maps to itself.
+function(_lut_arch_members arch out_var)
+    if(arch STREQUAL "gfx9-generic")
+        set(_m gfx900 gfx902 gfx904 gfx906 gfx909 gfx90c)
+    elseif(arch STREQUAL "gfx9-4-generic")
+        set(_m gfx942 gfx950)
+    elseif(arch STREQUAL "gfx10-1-generic")
+        set(_m gfx1010 gfx1011 gfx1012 gfx1013)
+    elseif(arch STREQUAL "gfx10-3-generic")
+        set(_m gfx1030 gfx1031 gfx1032 gfx1033 gfx1034 gfx1035 gfx1036)
+    elseif(arch STREQUAL "gfx11-generic")
+        set(_m gfx1100 gfx1101 gfx1102 gfx1103 gfx1150 gfx1151 gfx1152 gfx1153)
+    elseif(arch STREQUAL "gfx12-generic")
+        set(_m gfx1200 gfx1201)
     else()
-        message(STATUS
-            "[custom_kernels] no MatMulNBits LUT for ${arch}; "
-            "shapes will fall back to the runtime autotune")
-        set(${out_var}
-            ${_matmul_nbits_autotune_dir}/tools/empty_lut_data.cpp
-            PARENT_SCOPE)
+        set(_m ${arch})
     endif()
+    set(${out_var} ${_m} PARENT_SCOPE)
+endfunction()
+
+# Generates a .cpp embedding every existing lut/<member>.fb for `arch` as a blob
+# registry: <sym>Blobs[] / <sym>BlobSizes[] / <sym>BlobCount. The loader loads
+# the first blob whose gpu_arch matches the device (compatible() rejects the
+# rest), so a single gfx*-generic DLL serves each member arch its own table with
+# no cross-arch mixing. Members with no lut/<member>.fb are skipped; an arch that
+# matches none yields an empty (count 0) registry and every shape autotunes --
+# never a build error.
+function(_emit_lut_registry arch lut_dir sym out_var)
+    _lut_arch_members(${arch} _members)
+    set(_arrays "")
+    set(_ptrs "")
+    set(_sizes "")
+    set(_count 0)
+    foreach(_m IN LISTS _members)
+        set(_fb ${lut_dir}/lut/${_m}.fb)
+        if(EXISTS ${_fb})
+            # Re-run configure if a table changes, keeping the generated source
+            # in sync with the checked-in .fb.
+            set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_fb})
+            file(READ ${_fb} _hex HEX)
+            string(LENGTH "${_hex}" _len)
+            math(EXPR _n "${_len} / 2")
+            string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _body "${_hex}")
+            string(APPEND _arrays "static const unsigned char _blob_${_m}[] = {${_body}};\n")
+            string(APPEND _ptrs "  _blob_${_m},\n")
+            string(APPEND _sizes "  ${_n},\n")
+            math(EXPR _count "${_count} + 1")
+        endif()
+    endforeach()
+    set(_gen ${CMAKE_CURRENT_BINARY_DIR}/${sym}_data_${arch}.cpp)
+    if(_count EQUAL 0)
+        message(STATUS
+            "[custom_kernels] no ${sym} LUT for ${arch}; "
+            "shapes will fall back to the runtime autotune")
+        file(WRITE ${_gen}
+"// Auto-generated by lib/Runtime/Kernels/CMakeLists.txt; do not edit, do not commit.\n"
+"#include <cstddef>\n"
+"extern \"C\" const unsigned char* const ${sym}Blobs[1] = {nullptr};\n"
+"extern \"C\" const size_t ${sym}BlobSizes[1] = {0};\n"
+"extern \"C\" const size_t ${sym}BlobCount = 0;\n")
+    else()
+        file(WRITE ${_gen}
+"// Auto-generated by lib/Runtime/Kernels/CMakeLists.txt; do not edit, do not commit.\n"
+"#include <cstddef>\n"
+"${_arrays}"
+"extern \"C\" const unsigned char* const ${sym}Blobs[] = {\n${_ptrs}};\n"
+"extern \"C\" const size_t ${sym}BlobSizes[] = {\n${_sizes}};\n"
+"extern \"C\" const size_t ${sym}BlobCount = ${_count};\n")
+    endif()
+    set(${out_var} ${_gen} PARENT_SCOPE)
+endfunction()
+
+function(_matmul_nbits_lut_data_source arch out_var)
+    _emit_lut_registry(${arch} ${_matmul_nbits_autotune_dir} kMatmulNbitsLut _gen)
+    set(${out_var} ${_gen} PARENT_SCOPE)
 endfunction()
 
 # GQA offline autotune table + resolver.
@@ -147,46 +214,18 @@ endfunction()
 # -- a data symbol does not cross the JIT boundary safely on Windows, so the
 # table had to move in with its consumer.
 #
-# Only the checked-in lut/<arch>.fb ships; the linkable kGqaLutData[] symbol is
-# generated from it below with pure CMake (file(READ ... HEX)) -- the hip-ep
-# build needs no Python, and no generated .cpp is committed (the compiled array
-# is just the .fb's bytes). Mirrors matmul_nbits. An arch with no measured table
-# still builds: the size-0 stub makes the loader find no table and every shape
-# falls to the heuristic. Shipping a new arch is a table addition, never a build
-# break.
+# Only the checked-in lut/<arch>.fb files ship; the linkable blob registry
+# (kGqaLutBlobs[]) is generated from them below with pure CMake (file(READ ...
+# HEX)) -- the hip-ep build needs no Python, and no generated .cpp is committed
+# (the arrays are just the .fb bytes). Mirrors matmul_nbits: a gfx*-generic DLL
+# embeds every family member's table, and compatible() picks the device's at
+# load. An arch with no measured table yields an empty registry, so the loader
+# finds no table and every shape falls to the heuristic. Shipping a new arch is
+# a table addition, never a build break.
 set(_gqa_autotune_dir ${CMAKE_CURRENT_SOURCE_DIR}/hip/autotune/gqa)
 
 function(_gqa_lut_data_source arch out_var)
-    set(_fb ${_gqa_autotune_dir}/lut/${arch}.fb)
-    set(_gen ${CMAKE_CURRENT_BINARY_DIR}/gqa_lut_data_${arch}.cpp)
-    # Arch-neutral symbol on purpose: each custom_kernels_<arch> DLL links
-    # exactly one payload, so a fixed name lets gqa_autotune.cpp reference it
-    # whatever arch it is built for.
-    if(EXISTS ${_fb})
-        # Re-run configure if the table changes, so the generated source stays
-        # in sync with the checked-in .fb.
-        set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${_fb})
-        file(READ ${_fb} _hex HEX)
-        string(LENGTH "${_hex}" _len)
-        math(EXPR _n "${_len} / 2")
-        # Each byte "nn" -> "0xnn,". The trailing comma before '}' is valid C++;
-        # one long line is fine (compiled by hipcc/clang, no line-length limit).
-        string(REGEX REPLACE "([0-9a-f][0-9a-f])" "0x\\1," _body "${_hex}")
-        file(WRITE ${_gen}
-"// Auto-generated from ${arch}.fb by lib/Runtime/Kernels/CMakeLists.txt; do not edit, do not commit.\n"
-"#include <cstddef>\n"
-"extern \"C\" const unsigned char kGqaLutData[] = {${_body}};\n"
-"extern \"C\" const size_t kGqaLutData_size = ${_n};\n")
-    else()
-        message(STATUS
-            "[custom_kernels] no GQA LUT for ${arch}; "
-            "shapes will use the compiled-in heuristic")
-        file(WRITE ${_gen}
-"// Auto-generated: no measured GQA LUT for ${arch}.\n"
-"#include <cstddef>\n"
-"extern \"C\" const unsigned char kGqaLutData[1] = {0};\n"
-"extern \"C\" const size_t kGqaLutData_size = 0;\n")
-    endif()
+    _emit_lut_registry(${arch} ${_gqa_autotune_dir} kGqaLut _gen)
     set(${out_var} ${_gen} PARENT_SCOPE)
 endfunction()
 
@@ -239,3 +278,13 @@ set(HIP_CUSTOM_KERNELS_INCLUDE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/include" PARENT_
 # in-tree header (lib/Runtime/Kernels/include/hip_custom_kernels.h) so
 # the host-side declarations stay in lockstep with the kernel TUs that
 # implement them.
+
+# Standalone kernel unit-test executables for the packaging CI
+# (BUILD_HIP_KERNEL_UNIT_TESTS, default ON). Their drivers link the
+# custom_kernels_<arch> targets above instead of recompiling any .hip file.
+# Added from this directory rather than the top level because hip::host and
+# the hip_utils.cmake variables (HIP_INCLUDE_DIR, ...) are directory-scoped:
+# a sibling directory of this one cannot see them.
+if(BUILD_HIP_KERNEL_UNIT_TESTS)
+    add_subdirectory(unit_test)
+endif()

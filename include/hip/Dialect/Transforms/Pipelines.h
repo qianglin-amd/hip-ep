@@ -77,6 +77,27 @@ struct HipToLLVMPipelineOptions
       llvm::cl::init("constants.bin")};
 };
 
+/// Build the common tail of the ONNX-to-HIP pipeline: everything after the
+/// OnnxToHip conversion (shape inference, HIP-to-HIP pattern rewriting,
+/// constant externalization, bufferization, output-allocator rewrite, pooling,
+/// extern-constant resolution) up to -- but not including -- the HIP-to-LLVM
+/// lowering. Exposed
+/// so tools that build a custom head (e.g. hip-rocmlir-compiler, which inserts
+/// fuse-rocmlir + a rocMLIR compile/embed step) can run the standard tail
+/// without duplicating its load-bearing pass ordering.
+void buildOnnxToHipPipelineTail(OpPassManager &pm,
+                                const OnnxToHipPipelineOptions &options,
+                                morphizen::FileSystem *fs = nullptr);
+
+/// Build the head of the ONNX-to-HIP pipeline: everything up to and including
+/// the OnnxToHip conversion. Split out from the tail so a caller can insert
+/// work between the two -- the rocMLIR path outlines kernels and compiles them
+/// there, which has to happen on tensor-level HIP IR before the tail
+/// bufferizes. \p handle, when non-null, inserts the hipDNN graph passes.
+void buildOnnxToHipPipelineHead(OpPassManager &pm,
+                                hipdnnHandle_t handle = nullptr,
+                                CompiledGraphMap output_graphs = {});
+
 /// Build the ONNX-to-HIP compilation pipeline.
 ///
 /// Converts ONNX-level tensor IR into fully bufferized HIP memref IR with
@@ -135,6 +156,12 @@ struct HipdnnPipelineOptions
 /// Chains buildOnnxToHipPipeline and buildHipToLLVMPipeline.
 void buildHipdnnPipeline(OpPassManager &pm,
                          const HipdnnPipelineOptions &options);
+
+struct RocMlirPipelineOptions : PassPipelineOptions<RocMlirPipelineOptions> {};
+
+/// Build rocmlirTriton pipeline
+void buildRocMlirPipeline(OpPassManager &pm,
+                          const RocMlirPipelineOptions &options);
 
 /// Register all pipelines with MLIR's global pass registry so they appear
 /// in hip-mlir-opt --help and are usable as single-flag invocations.

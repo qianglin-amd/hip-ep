@@ -16,7 +16,9 @@
 
 // Component headers
 #include "InferenceState.h"
+#include "hip/Compiler/RocMlirArtifactTarget.h"
 #include "hip/env.h" // shared cross-platform env reader (single Win32 call)
+#include "hip/init_config_abi.h"
 
 // HIPDNN_EP_PERF instrumentation dependencies
 #ifdef HIPDNN_EP_LINK_HIP_HOST
@@ -282,6 +284,26 @@ customop::ArtifactKind determine_artifact_kind(const std::string &format_str) {
             << (kind == customop::ArtifactKind::NATIVE ? "native (Plugin)"
                                                        : "LLVM IR (JIT)");
   return kind;
+}
+
+// The cache / EPContext identity is derived from the graph only, so a cached
+// artifact is reused regardless of GPU or HIPDNN_EP_ROCMLIR. One that embeds
+// rocMLIR code objects for another chip would load and then fail at the first
+// dispatch, and one built with the opposite HIPDNN_EP_ROCMLIR or
+// HIPDNN_EP_ROCMLIR_AUTOTUNE setting silently ignores the switch. Refuse all of
+// them instead of running a stale artifact.
+void check_rocmlir_arch(const std::string &recorded) {
+  const std::string current = hip::compiler::rocMlirArtifactTarget();
+  if (recorded == current)
+    return;
+  auto describe = [](const std::string &arch) {
+    return arch.empty() ? std::string("rocMLIR off") : "rocMLIR for " + arch;
+  };
+  LOG(FATAL) << "Cached MLIR artifact was compiled with " << describe(recorded)
+             << ", but this session requests " << describe(current)
+             << " (HIPDNN_EP_ROCMLIR / HIPDNN_EP_ROCMLIR_AUTOTUNE / ROCK_ARCH "
+                "/ active GPU). Delete the model cache or EPContext model and "
+                "recompile.";
 }
 } // anonymous namespace
 
@@ -652,6 +674,7 @@ MlirCustomOp::MlirCustomOp(
 
   // Parse metadata from JSON
   metadata_ = parse_metadata_from_metadef(context, meta_def);
+  check_rocmlir_arch(metadata_.rocmlir_arch());
   // Precompute index mappings (compiler order -> ORT kernel context order)
   input_index_map_ = build_input_index_map(*meta_def);
   output_index_map_ = build_output_index_map(metadata_.outputs(), *meta_def);
@@ -659,11 +682,32 @@ MlirCustomOp::MlirCustomOp(
   // const_cast follows the established morphizen pattern (custom_op_imp.hpp).
   auto fs =
       const_cast<morphizen::PassContext *>(context.get())->get_file_system();
+  // The config borrows `options`, so it must outlive the create() call below.
+  using ProviderOptionMap = std::map<std::string, std::string>;
+  auto options = context->get_all_provider_options();
+  hipdnn_ep_init_config config{
+      &options,
+      [](void *self) -> size_t {
+        return static_cast<const ProviderOptionMap *>(self)->size();
+      },
+      [](void *self, size_t index, const char **key, const char **value) {
+        if (!key || !value)
+          return;
+        const auto &opts = *static_cast<const ProviderOptionMap *>(self);
+        if (index >= opts.size()) {
+          *key = nullptr;
+          *value = nullptr;
+          return;
+        }
+        auto it = std::next(opts.begin(), static_cast<ptrdiff_t>(index));
+        *key = it->first.c_str();
+        *value = it->second.c_str();
+      }};
   auto artifact_bytes =
       load_artifact_from_epcontext(context, metadata_.artifact_filename());
   auto kind = determine_artifact_kind(metadata_.artifact_format());
   inference_state_ =
-      customop::InferenceState::create(artifact_bytes, fs.get(), kind);
+      customop::InferenceState::create(artifact_bytes, fs.get(), &config, kind);
 }
 
 MlirCustomOp::~MlirCustomOp() {
