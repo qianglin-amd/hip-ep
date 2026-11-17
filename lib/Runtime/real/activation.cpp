@@ -361,3 +361,56 @@ int wrap_swish(RuntimeState *state, void *input, void *output,
   RUNTIME_DEBUG_LOG("[REAL] wrap_swish: completed successfully\n");
   return 0;
 }
+
+int wrap_swiglu(RuntimeState *state, void *gate, void *up, void *output,
+                int64_t num_elements, int64_t data_type) {
+  OP_PROFILE(
+      "swiglu",
+      [&] {
+        char b[64];
+        snprintf(b, sizeof(b), "n=%lld", (long long)num_elements);
+        return std::string(b);
+      },
+      state);
+  if (!state || !gate || !up || !output) {
+    fprintf(stderr, "[REAL] wrap_swiglu: null argument\n");
+    return -1;
+  }
+
+  int hip_dtype = hipdnn_ep_to_hip_dtype_elementwise_unary(data_type);
+  if (hip_dtype < 0) {
+    fprintf(stderr, "[REAL] wrap_swiglu: unsupported data_type %lld\n",
+            (long long)data_type);
+    return -1;
+  }
+
+  void *stream = hipdnn_ep_state_get_stream(state);
+  RUNTIME_DEBUG_LOG("[REAL] wrap_swiglu: num_elements=%lld, "
+                    "data_type=%s(%lld)\n",
+                    (long long)num_elements, hipdnn_ep_datatype_name(data_type),
+                    (long long)data_type);
+
+  int result = hip_swiglu(stream, gate, up, output, num_elements, hip_dtype);
+  if (result != 0) {
+    fprintf(stderr, "[REAL] wrap_swiglu: kernel launch failed (%d)\n", result);
+    return -1;
+  }
+
+  RUNTIME_DEBUG_LOG("[REAL] wrap_swiglu: completed successfully\n");
+  return 0;
+}
+
+// The same flat shape contract as wrap_swiglu, with FP32 intermediates.
+int wrap_swiglu_promoted(RuntimeState *state, void *gate, void *up,
+                         void *output, int64_t num_elements,
+                         int64_t data_type) {
+  OP_PROFILE(
+      "swiglu_promoted",
+      [&] { return std::string("n=") + std::to_string(num_elements); }, state);
+  if (!state || !gate || !up || !output || data_type != 1) {
+    fprintf(stderr, "[REAL] wrap_swiglu_promoted: invalid argument/type\n");
+    return -1;
+  }
+  return hip_swiglu_promoted(hipdnn_ep_state_get_stream(state), gate, up,
+                             output, num_elements, HIP_DTYPE_FLOAT16);
+}

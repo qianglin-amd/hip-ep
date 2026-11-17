@@ -13,6 +13,22 @@
 
 message(STATUS "Configuring MLIR dialect/pass unit tests")
 
+add_executable(test-runtime-lowering-contracts
+  test_runtime_lowering_contracts.cpp
+)
+target_include_directories(test-runtime-lowering-contracts PRIVATE
+  ${CMAKE_SOURCE_DIR}/lib/Conversion/HipToLLVM
+  ${MLIR_INCLUDE_DIRS}
+  ${LLVM_INCLUDE_DIRS}
+)
+target_link_libraries(test-runtime-lowering-contracts PRIVATE
+  HipToLLVM
+  MLIRParser
+)
+add_test(NAME RuntimeLoweringContractsUnit
+  COMMAND test-runtime-lowering-contracts
+)
+
 add_executable(test-hipsr-externalize-constants test_externalize_constants.cpp)
 
 target_compile_features(test-hipsr-externalize-constants PRIVATE cxx_std_17)
@@ -94,3 +110,69 @@ add_test(NAME QLpNormalizationRefUnit
 set_target_properties(test-qlpnormalization-ref PROPERTIES
   FOLDER "mlir/Test/Dialect/Hipsr"
 )
+
+# GPU-free tests for the rocMLIR autotune candidate selection. The selection
+# file has no HIP or MLIR dependency, so it compiles here directly.
+add_executable(test-adaptive-benchmark
+  test_adaptive_benchmark.cpp
+  ${CMAKE_SOURCE_DIR}/lib/Compiler/AdaptiveBenchmark.cpp
+)
+
+target_compile_features(test-adaptive-benchmark PRIVATE cxx_std_17)
+
+target_include_directories(test-adaptive-benchmark PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+)
+
+add_test(NAME AdaptiveBenchmarkUnit
+  COMMAND test-adaptive-benchmark
+)
+
+set_target_properties(test-adaptive-benchmark PROPERTIES
+  FOLDER "mlir/Test/Compiler"
+)
+
+# GPU-free check that rock.elementwise selects the elementwise pipeline.
+if(ENABLE_ROCMLIRTRITON)
+  if(CMAKE_LINK_GROUP_USING_RESCAN_SUPPORTED)
+    set(_rocmlir_link_closure "$<LINK_GROUP:RESCAN,${HIPDNN_ROCMLIR_LINK_LIBS}>")
+  else()
+    set(_rocmlir_link_closure "${HIPDNN_ROCMLIR_LINK_LIBS}")
+  endif()
+
+  foreach(_rocmlir_test IN ITEMS
+      "test-rocmlir-elementwise-pipeline;test_rocmlir_elementwise_pipeline.cpp;RocMlirElementwisePipelineUnit")
+    list(GET _rocmlir_test 0 _target)
+    list(GET _rocmlir_test 1 _source)
+    list(GET _rocmlir_test 2 _ctest_name)
+    add_executable(${_target} ${_source})
+    target_compile_features(${_target} PRIVATE cxx_std_17)
+    target_include_directories(${_target} PRIVATE
+      ${CMAKE_SOURCE_DIR}/include
+      ${CMAKE_BINARY_DIR}/include
+      ${MLIR_INCLUDE_DIRS}
+      ${LLVM_INCLUDE_DIRS}
+    )
+    target_link_libraries(${_target} PRIVATE
+      LibHipCompiler
+      HipDialectIR
+      HipDialectTransforms
+      HipToTosa
+      "${_rocmlir_link_closure}"
+      MLIRIR
+      MLIRParser
+      MLIRPass
+      MLIRSupport
+      ${llvm_libs}
+    )
+    add_test(NAME ${_ctest_name} COMMAND ${_target})
+    # TritonToHsaco dlopens triton_amd_codegen by bare name (see deps.cmake).
+    if(NOT WIN32)
+      set_tests_properties(${_ctest_name} PROPERTIES
+        ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/lib")
+    endif()
+    set_target_properties(${_target} PROPERTIES
+      FOLDER "mlir/Test/Dialect/Hipsr"
+    )
+  endforeach()
+endif()

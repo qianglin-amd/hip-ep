@@ -8,6 +8,7 @@
 #include <mutex>
 
 #include "hip/Compiler/PluginRegistry.h"
+#include "hip/Conversion/HipToLLVM/Passes.h"
 #include "hip/Conversion/OnnxToHip/Passes.h"
 #include "hip/Conversion/Passes.h"
 #include "hip/Dialect/Hipsr/IR/HipsrDialect.h"
@@ -82,6 +83,7 @@ public:
 enum class OnnxDialectKind { Stub, Modeled };
 
 inline void registerConvertToLLVMInterfaces(mlir::DialectRegistry &registry) {
+  mlir::hip::registerRuntimeAccessOpInterfaceExternalModels(registry);
   mlir::hipsr::registerConvertHipsrToLLVMInterface(registry);
   mlir::registerConvertFuncToLLVMInterface(registry);
   mlir::registerConvertMemRefToLLVMInterface(registry);
@@ -136,6 +138,10 @@ registerAllDialects(mlir::DialectRegistry &registry,
   mlir::memref::registerAllocationOpInterfaceExternalModels(registry);
   mlir::hip::registerHipBufferizableOpInterfaceModels(registry);
   mlir::hipsr::registerBufferizableOpInterfaceExternalModels(registry);
+  // The hip.cast canonicalizer walks the tensor view ops through this
+  // interface, so it must be present in every pipeline, not only in the
+  // passes that declare it.
+  mlir::hip::registerElementMoveExternalModels(registry);
 }
 
 /// Load all required dialects into an MLIRContext.
@@ -211,6 +217,9 @@ inline void registerAllPasses() {
     registerConversionPasses();
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
       return mlir::hip::createOnnxLoopOutlinePass();
+    });
+    mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
+      return mlir::hip::createOnnxScanOutlinePass();
     });
     mlir::registerPass([]() -> std::unique_ptr<mlir::Pass> {
       return mlir::hip::createOnnxIfOutlinePass();

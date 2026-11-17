@@ -22,9 +22,12 @@
 #include <optional>
 #endif
 
+#if HIPDNN_EP_ENABLE_NATIVE_ARTIFACTS
 #include "hip/Target/LLVM/DLLLinker.h"
+#endif
 #include "hip/Target/LLVM/LLVMBackend.h"
 #include "hip/artifact_abi.h"
+#include "hip/native_artifacts.h"
 
 #include "mlir/Dialect/Bufferization/Transforms/Passes.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -37,7 +40,10 @@
 #include "mlir/Transforms/Passes.h"
 
 #include "llvm/ADT/Sequence.h"
+#include "llvm/ADT/SmallString.h"
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
@@ -78,6 +84,39 @@ bool rocMlirPipelineRequested() {
   return false;
 #endif
 }
+
+#ifdef ENABLE_ROCMLIRTRITON
+// HIPDNN_EP_ROCMLIR_PRE_FUSION_DUMP=<dir> writes the IR that the rocMLIR
+// fusion reads, one file per compiled graph. The first line records the
+// fusion options in --hip-rocmlir-fusion syntax, so that hip-mlir-opt can
+// replay the same fusion without a GPU.
+void dumpPreFusionIR(mlir::ModuleOp module,
+                     const mlir::hip::FuseRocMlirAnchorPassOptions &fuseOpts) {
+  std::string dir = hip_get_env("HIPDNN_EP_ROCMLIR_PRE_FUSION_DUMP");
+  if (dir.empty())
+    return;
+  static std::atomic<unsigned> sDumpSeq{0};
+  if (std::error_code ec = llvm::sys::fs::create_directories(dir)) {
+    llvm::errs() << "[CompilerDriver] cannot create " << dir << ": "
+                 << ec.message() << "\n";
+    return;
+  }
+  llvm::SmallString<256> path(dir);
+  llvm::sys::path::append(
+      path, "pre-fusion." + std::to_string(sDumpSeq.fetch_add(1)) + ".mlir");
+  std::error_code ec;
+  llvm::raw_fd_ostream os(path, ec);
+  if (ec) {
+    llvm::errs() << "[CompilerDriver] cannot open " << path << ": "
+                 << ec.message() << "\n";
+    return;
+  }
+  os << "// hip-rocmlir-fusion: arch=" << fuseOpts.arch
+     << " gemm-gemm-accel-types="
+     << llvm::join(fuseOpts.gemmGemmAccelTypes, ",") << "\n";
+  module->print(os);
+}
+#endif
 
 OnnxDialectKind onnxDialectKind() {
   return hipsrPipelineRequested() ? OnnxDialectKind::Modeled
@@ -207,6 +246,10 @@ bool CompilerDriver::compileImpl(mlir::ModuleOp module,
   logPhase("translateToLLVMIR");
 
   const bool native = (options.output_mode == mlir::hip::OutputMode::NATIVE);
+  if (native && !hipdnn::nativeArtifactsEnabled()) {
+    error_message = hipdnn::kNativeArtifactsDisabledMessage;
+    return false;
+  }
 
   // Native path merges runtime.bc at producer time so the .dll/.so is
   // self-contained (modulo dynamic imports). The bitcode path leaves
@@ -387,7 +430,7 @@ bool CompilerDriver::runMLIRPasses(
     COMPILER_DEBUG_LOG("[CompilerDriver] HIPDNN_EP_HIPSR set\n");
   } else if (rocMlirPipelineRequested()) {
 #ifdef ENABLE_ROCMLIRTRITON
-    // rocMLIR sits between the ONNX->HIP head and its tail: fuse-rocmlir
+    // rocMLIR sits between the ONNX->HIP head and its tail: the rocMLIR fusion
     // needs tensor-level HIP IR, and each kernel's compiled binary has to be
     // embedded in its hip.rocmlir dispatch before the tail bufferizes that op
     // like any other DPS op. Embedding is not a pass, so the head runs here
@@ -401,10 +444,10 @@ bool CompilerDriver::runMLIRPasses(
     {
       mlir::PassManager headPm(module.getContext());
       // Same handle plumbing as the default arm below. rocMLIR only claims
-      // the subgraphs fuse-rocmlir anchors on; everything else still wants
-      // the hipDNN graph passes, and CompilerAPI needs the compiled graphs to
-      // register. Dropping them here would silently move the rest of the
-      // model off hipDNN the moment HIPDNN_EP_ROCMLIR was set.
+      // the subgraphs the rocMLIR fusion anchors on; everything else still
+      // wants the hipDNN graph passes, and CompilerAPI needs the compiled
+      // graphs to register. Dropping them here would silently move the rest of
+      // the model off hipDNN the moment HIPDNN_EP_ROCMLIR was set.
       if (hipdnnHandle_) {
         compiledGraphs_ =
             std::make_shared<llvm::StringMap<mlir::hip::OwnedGraph>>();
@@ -420,11 +463,23 @@ bool CompilerDriver::runMLIRPasses(
       headPm.addNestedPass<mlir::func::FuncOp>(
           mlir::hip::createDecomposeConvTransposePass());
       headPm.addPass(mlir::createCanonicalizerPass());
-      headPm.addNestedPass<mlir::func::FuncOp>(
-          mlir::hip::createFuseROCMlirPass());
-      headPm.addPass(mlir::func::createDuplicateFunctionEliminationPass());
+      mlir::hip::FuseRocMlirAnchorPassOptions fuseOpts;
+      fuseOpts.arch = mlir::hip::resolveRocMlirArch();
+      std::vector<std::string> accelTypes = mlir::hip::getRocMlirGemmAccelTypes(
+          *module.getContext(), fuseOpts.arch);
+      fuseOpts.gemmGemmAccelTypes.assign(accelTypes.begin(), accelTypes.end());
       if (mlir::failed(headPm.run(module))) {
-        error_message = "ONNX->HIP + fuse-rocmlir passes failed";
+        error_message = "ONNX->HIP passes before the rocMLIR fusion failed";
+        return false;
+      }
+      dumpPreFusionIR(module, fuseOpts);
+      mlir::PassManager fusePm(module.getContext());
+      // HIPDNN_EP_ROCMLIR_FUSION_REPORT=<file> appends one JSON line per
+      // kernel, to compare the kernels of two fusion pipelines.
+      mlir::hip::addRocMlirFusionPasses(
+          fusePm, fuseOpts, hip_get_env("HIPDNN_EP_ROCMLIR_FUSION_REPORT"));
+      if (mlir::failed(fusePm.run(module))) {
+        error_message = "rocMLIR fusion passes failed";
         return false;
       }
     }
@@ -435,6 +490,23 @@ bool CompilerDriver::runMLIRPasses(
       embedOpts.log = &llvm::errs();
       embedOpts.logPrefix = "[CompilerDriver/rocmlir]";
     }
+    embedOpts.strictElementwise = !hip_get_env("HIPDNN_EP_STRICT").empty();
+    std::string fusionReport = hip_get_env("HIPDNN_EP_ROCMLIR_FUSION_REPORT");
+    auto reportHipPath = [&](llvm::StringRef kernel, llvm::StringRef reason) {
+      std::error_code error;
+      std::unique_ptr<llvm::raw_fd_ostream> file;
+      if (fusionReport != "-")
+        file = std::make_unique<llvm::raw_fd_ostream>(fusionReport, error,
+                                                      llvm::sys::fs::OF_Append);
+      if (error)
+        return;
+      llvm::raw_ostream &os = file ? *file : llvm::errs();
+      os << llvm::json::Value(llvm::json::Object{
+                {"kind", "fallback"}, {"name", kernel}, {"reason", reason}})
+         << "\n";
+    };
+    if (!fusionReport.empty())
+      embedOpts.onHipPath = reportHipPath;
 
     // Opt-in: without this the embed falls back to position 0 of the tuning
     // space, which rocMLIR picks for applicability rather than speed. Tuning
@@ -446,6 +518,7 @@ bool CompilerDriver::runMLIRPasses(
     if (mlir::hip::rocMlirAutotuneFromEnv(autotuneSpace)) {
       mlir::hip::AutotuneOptions autotuneOpts;
       autotuneOpts.space = autotuneSpace;
+      mlir::hip::rocMlirAutotuneBenchmarkFromEnv(autotuneOpts.benchmark);
       autotuneOpts.log = embedOpts.log;
       autotuneOpts.logPrefix = "[CompilerDriver/rocmlir-autotune]";
       autotuner.emplace(embedOpts.arch, autotuneOpts);
@@ -679,6 +752,15 @@ bool CompilerDriver::linkToDLL(const std::string &objPath,
                                const std::vector<std::string> &library_paths,
                                const std::vector<std::string> &export_symbols,
                                std::string &error_message) {
+#if !HIPDNN_EP_ENABLE_NATIVE_ARTIFACTS
+  (void)objPath;
+  (void)dllPath;
+  (void)libraries;
+  (void)library_paths;
+  (void)export_symbols;
+  error_message = hipdnn::kNativeArtifactsDisabledMessage;
+  return false;
+#else
   hipdnn::DLLLinker linker;
   if (!linker.linkDLL(objPath, dllPath, libraries, library_paths,
                       export_symbols)) {
@@ -686,6 +768,7 @@ bool CompilerDriver::linkToDLL(const std::string &objPath,
     return false;
   }
   return true;
+#endif
 }
 
 void CompilerDriver::discoverInTreeLibraries(
@@ -777,13 +860,6 @@ void CompilerDriver::discoverInTreeLibraries(
 
   // hipDNN graph runtime: only needed when hipDNN graphs are compiled
   if (hipdnnHandle_) {
-    std::string hipdnn_backend_lib = lib_dir + "/hipdnn_backend.lib";
-    if (llvm::sys::fs::exists(hipdnn_backend_lib))
-      libraries.push_back("hipdnn_backend");
-    else
-      COMPILER_DEBUG_LOG(
-          "  WARNING: hipdnn_backend import library not found\n");
-
 #ifdef HIPDNN_GRAPH_RUNTIME_LIB_PATH
     {
       std::string runtime_lib = HIPDNN_GRAPH_RUNTIME_LIB_PATH;

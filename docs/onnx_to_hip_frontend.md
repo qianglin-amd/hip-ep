@@ -74,6 +74,12 @@ existing `--convert-hip-to-llvm` pipeline.
 | `GridSample` | `hip.grid_sample` | custom HIP kernel |
 | `SkipLayerNormalization` | `hip.add` + `hip.layer_norm` | decomposed, including the optional input bias |
 | `SkipSimplifiedLayerNormalization` | `hip.skip_rms_norm` | `skip_rms_norm_kernel.hip` |
+| `BranchwiseRMSNorm` (`com.microsoft`) | `hip.rms_norm` | `rms_norm_kernel.hip`; per-branch gain via grouped scale |
+| `GatedRMSNorm` (`com.microsoft`) | `hip.gated_rms_norm` | `rms_norm_kernel.hip` |
+| `EngramGate` (`com.microsoft`) | `hip.engram_gate` | `rms_norm_kernel.hip` |
+| `HyperConnectionPreMix` (`com.microsoft`) | `hip.hyper_connection_pre_mix` | `hyper_connection_kernel.hip` |
+| `HyperConnectionPostMix` (`com.microsoft`) | `hip.hyper_connection_post_mix` | `hyper_connection_kernel.hip` |
+| `HyperConnectionPostMix` + `BranchwiseRMSNorm` | `hip.hyper_connection_post_mix_norm` | `hyper_connection_kernel.hip` |
 | LpNorm+Mul pattern (fused) | `hip.rms_norm` | `rms_norm_kernel.hip` |
 
 `SkipSimplifiedLayerNormalization` fuses Add + RMSNorm into one kernel:
@@ -99,19 +105,31 @@ packed `__half2` path for fp16 rows of even width.
 | `QLinearMul` (`com.microsoft`) | `hip.qmul` | decomposed, then QDQ fusion |
 | `QLinearConcat` (`com.microsoft`) | DQ + Concat + Q | no fused kernel |
 | `QLinearGlobalAveragePool` (`com.microsoft`) | DQ + `hip.global_pool` + Q | `channels_last` transposed around the pool |
+| `QLinearAveragePool` (`com.microsoft`) | DQ + `hip.pool` + Q | `channels_last` transposed around the pool |
+| `QLinearLeakyRelu` (`com.microsoft`) | DQ + `hip.leaky_relu` + Q | int8 or uint8, then the f32 LeakyRelu kernel |
 | `QLinearMatMul` | `hip.qlinear_matmul` | `qlinear_matmul_kernel.hip` |
 
 `QLinearMatMul` is the native ONNX op: rank-2 8-bit `a` of shape `[M, K]` times
 `b` of shape `[K, N]`, with per-tensor f32 scales and zero points. `hip.qmatmul`
 is a different op, the DequantizeLinear + MatMul + QuantizeLinear fusion, and
 does not accept `QLinearMatMul`. Rank other than 2, f16 or bf16 scales, and
-per-row or per-column quantization, stay `onnx.QLinearMatMul`.
+per-row or per-column quantization, stay `onnx.QLinearMatMul`. With
+`HIPDNN_EP_ROCMLIR=1`, `hip-fuse-rocmlir-anchor` moves a `hip.qlinear_matmul`
+with constant parameters and a zero B zero point to a rocMLIR kernel, in the
+same form as `QLinearConv` below.
 
 `QLinearConv` is the native ONNX op: 8-bit activations and weights, grouped 2D
 windows, and an optional int32 bias. Input and output quantization is
-per-tensor. Weight quantization is per-tensor or per output channel. `auto_pad`
-must be `NOTSET`. `hip.qconv` is a different op, the W4A16 1x1 QDQ fusion, and
-does not accept `QLinearConv`.
+per-tensor. Weight quantization is per-tensor or per output channel. `NOTSET`
+keeps the `pads` attribute. `VALID` uses no padding. `SAME_UPPER` and
+`SAME_LOWER` split the pad budget, with the extra pad at the end or the
+beginning, and the kernel receives those explicit pads. `hip.qconv` is a
+different op, the W4A16 1x1 QDQ fusion, and does not accept `QLinearConv`.
+With `HIPDNN_EP_ROCMLIR=1`, `hip-fuse-rocmlir-anchor` moves a `hip.qlinear_conv`
+with constant parameters and a zero weight zero point to a rocMLIR kernel
+(see `docs/design/rocmlir-fusion.md`). Initializers above the ORT bridge clone
+threshold are not inline constants, so large weights need
+`XLNX_ABI_2_0_CLONE_EXTERNAL_DATA_THRESHOLD` raised for this route.
 
 QuantizeLinear and DequantizeLinear storage is int8/uint8/int16/uint16 plus
 int4/uint4. DequantizeLinear additionally accepts int32, which is where a QDQ

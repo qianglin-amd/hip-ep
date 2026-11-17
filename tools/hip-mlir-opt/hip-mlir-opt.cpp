@@ -54,6 +54,10 @@
 
 #include "llvm/Support/CommandLine.h"
 
+#ifdef HIPDNN_EP_INCLUDE_TEST_PASSES
+#include "Dialect/Hip/TestHipPasses.h"
+#endif
+
 namespace {
 /// Which dialect claims the `onnx` namespace.
 enum class OnnxDialectKind { Stub, Modeled };
@@ -105,11 +109,18 @@ int main(int argc, char **argv) {
   // the tool and the EP.
   mlir::hip::registerHipBufferizableOpInterfaceModels(registry);
   mlir::hipsr::registerBufferizableOpInterfaceExternalModels(registry);
+  // Same as hip::compiler::registerAllDialects: the hip.cast canonicalizer
+  // needs the tensor view ops' ElementMoveOpInterface models.
+  mlir::hip::registerElementMoveExternalModels(registry);
 
   // Registers every nameable HIP / pipeline / standard-MLIR pass the tool and
   // the EP share. Defined once (InitAllPasses.h) so the two never drift; see
   // that function for the set and docs/pipeline_pass_menu.md for the catalogue.
   hip::compiler::registerAllPasses();
+
+#ifdef HIPDNN_EP_INCLUDE_TEST_PASSES
+  mlir::hip::test::registerHipTestPasses(registry);
+#endif
 
   // Tool-only extras: the standalone LLVM-lowering conversion passes. The
   // production pipeline reaches LLVM through `convert-hip-to-llvm` (which

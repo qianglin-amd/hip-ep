@@ -25,20 +25,29 @@ add_library(HipDialectTransforms STATIC
   # Native C++ rewrites driven by hip-fusion-transform alongside the PDLL
   # ones. Each is a .hpp/.cpp pair so that HipFusionTransform.cpp, which
   # instantiates the driver, only ever sees their populate declarations.
+  fusion_pattern/linear_attention_group_fold.cpp
   fusion_pattern/patch_embed_conv_to_gemm.cpp
+  fusion_pattern/swiglu_fusion.cpp
   AddHipContextArg.cpp
   AssignOpStateSlots.cpp
   BufferUtils.cpp
   DecomposeConvTranspose.cpp
+  DecomposeMatMulNBits.cpp
   ExternalizeConstants.cpp
   FixLoopAccumulatorOffset.cpp
-  FuseROCMlir.cpp
+  FoldBatchNorm.cpp
+  FoldConstantExtracts.cpp
+  FuseRocMlirAnchor.cpp
+  FuseROCMlirReport.cpp
+  FuseRocMlirElementwise.cpp
+  GemmGemm.cpp
   GenerateInterface.cpp
   GenerateOpStateInit.cpp
   HipFusionTransform.cpp
   HoistAllocSizeArith.cpp
   InferLoopBodyShapesPass.cpp
   InferShapesPass.cpp
+  KernelOutline.cpp
   LoopBodyToOutParams.cpp
   LowerAllocs.cpp
   MaterializeHostScalars.cpp
@@ -46,10 +55,15 @@ add_library(HipDialectTransforms STATIC
   Pipelines.cpp
   PoolAllocs.cpp
   PromoteStridedHipOperands.cpp
+  QLinearPlan.cpp
+  QuantizedEpilogue.cpp
+  RebiasUnsignedQuantize.cpp
   RelaxMultiDynExpandShape.cpp
+  RocMlirPrepareQuant.cpp
   ResolveExternConstants.cpp
   ResolveMemRefDims.cpp
   ResolveTensorDims.cpp
+  SinkQuantize.cpp
   SplitDuplicateDpsInits.cpp
   UseOutputAllocator.cpp
 )
@@ -81,6 +95,7 @@ target_link_libraries(HipDialectTransforms PUBLIC
   MLIRFuncDialect
   MLIRMemRefDialect
   MLIRArithDialect
+  MLIRSCFDialect
   MLIRAffineDialect
   MLIRLLVMDialect
   MLIRBufferizationDialect
