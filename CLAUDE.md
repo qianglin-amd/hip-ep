@@ -33,6 +33,7 @@ The generated model ABI uses `inference_compute(state, inputs)`. Graph outputs a
 | Runtime | `lib/Runtime/` |
 | Custom HIP kernels | `lib/Runtime/Kernels/` |
 | ONNX Runtime / MorphiZen integration | `backend-mlir-compiler/`, `morphizen/` |
+| llama.cpp / GGUF integration (ggml backend) | `frontends/ggml/` |
 | Command-line tools | `tools/` |
 | Compiler tests | `test/lit/`, `test/e2e/`, `test/runtime/` |
 | Numeric and model tests | `test/numeric/`, `test/python/` |
@@ -112,6 +113,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for PR, formatting, AI-disclosure, and co
 - Constant handling: [docs/design/constant-handling-design.md](docs/design/constant-handling-design.md)
 - Compilation options and artifact format: [docs/design/compilation-options.md](docs/design/compilation-options.md)
 - Plugin design and authoring: [docs/design/plugin-interface.md](docs/design/plugin-interface.md), [docs/plugin_authoring.md](docs/plugin_authoring.md)
+- GGUF models through llama.cpp (ggml backend): [docs/design/ggml-frontend.md](docs/design/ggml-frontend.md)
 - Windows and Linux setup: [docs/quick_start.md](docs/quick_start.md), [docs/quick_start_linux.md](docs/quick_start_linux.md)
 - Remote workflow: [docs/remote-dev-workflow.md](docs/remote-dev-workflow.md)
 

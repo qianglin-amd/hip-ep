@@ -244,6 +244,16 @@ endif()
 # Executable targets
 add_subdirectory(tools)
 
+# ggml backend for llama.cpp (GGUF models); needs a real HIP runtime.
+option(HIP_EP_BUILD_GGML_BACKEND
+  "Build the ggml-hipep backend that runs llama.cpp graphs on HIP EP" OFF)
+if(HIP_EP_BUILD_GGML_BACKEND)
+  if(BUILD_MOCK_RUNTIME)
+    message(FATAL_ERROR "HIP_EP_BUILD_GGML_BACKEND requires a non-mock build")
+  endif()
+  add_subdirectory(frontends/ggml)
+endif()
+
 # ==============================================================================
 # HIP Unit Tests (LIT + E2E)
 # ==============================================================================

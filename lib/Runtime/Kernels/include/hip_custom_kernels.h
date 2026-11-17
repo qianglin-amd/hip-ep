@@ -3847,6 +3847,35 @@ HIP_KERNEL_API int hip_strided_copy(void *stream, void *dst, const void *src,
                      int64_t outer_total);
 
 /* =========================================================================
+ * GGML frontend in-place writes (frontends/ggml)
+ * =========================================================================
+ *
+ * Shapes use ggml order: ne[0] is innermost; nb[] are byte strides. Each
+ * ne/nb argument is a host array of 4 values. Element types are
+ * HIP_DTYPE_FLOAT32, HIP_DTYPE_FLOAT16 or HIP_DTYPE_BFLOAT16 with conversion.
+ */
+
+/* ggml_cpy: element i of src in row-major order over src_ne is written to
+ * element i of dst in row-major order over dst_ne. Element counts must match.
+ */
+HIP_KERNEL_API int hip_ggml_cpy(void *stream, void *dst, int dst_dtype,
+                                const int64_t *dst_ne, const int64_t *dst_nb,
+                                const void *src, int src_dtype,
+                                const int64_t *src_ne, const int64_t *src_nb);
+
+/* ggml_set_rows: dst[:, idx[i1, i2 % idx_ne[1], i3 % idx_ne[2]], i2, i3] =
+ * src[:, i1, i2, i3]. idx_dtype is HIP_DTYPE_INT64 or HIP_DTYPE_INT32; rows
+ * outside [0, dst_ne[1]) are skipped.
+ */
+HIP_KERNEL_API int hip_ggml_set_rows(void *stream, void *dst, int dst_dtype,
+                                     const int64_t *dst_ne,
+                                     const int64_t *dst_nb, const void *src,
+                                     int src_dtype, const int64_t *src_ne,
+                                     const int64_t *src_nb, const void *idx,
+                                     int idx_dtype, const int64_t *idx_ne,
+                                     const int64_t *idx_nb);
+
+/* =========================================================================
  * Causal Depthwise 1D Conv -- single-step "decode" path
  * =========================================================================
  *
