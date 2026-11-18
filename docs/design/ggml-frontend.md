@@ -194,6 +194,12 @@ the JIT load at run time. The HIP runtime DLLs (`amdhip64`, `hipblaslt`) must
 be on `PATH`, because llama.cpp loads the backend with a plain
 `LoadLibraryW`.
 
+`frontends/ggml/package/make_package.ps1` assembles a self-contained Windows
+package from a llama.cpp build, the backend, the TheRock runtime libraries
+(with the hipBLASLt Tensile data for one architecture) and the MSVC runtime,
+plus launchers that set `GGML_BACKEND_PATH` and pass `-dev HIPEP0`. The
+`README.md` next to the script is the package's user guide.
+
 ## Usage
 
 ```powershell
