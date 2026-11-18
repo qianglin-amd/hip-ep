@@ -245,8 +245,10 @@ CompiledModule *Engine::get(const std::string &mlir, std::string &error) {
     error = "cannot read " + bitcode.string();
     return nullptr;
   }
-  impl->jit =
-      mlir_compilation::customop::LlvmIrJit::create(bytes, "ggml_" + key);
+  const auto loadStart = std::chrono::steady_clock::now();
+  impl->jit = mlir_compilation::customop::LlvmIrJit::create(
+      bytes, "ggml_" + key,
+      diskCache_ ? (fs::path(cacheRoot_) / "objects").string() : "");
   if (!impl->jit) {
     error = "LlvmIrJit failed to load " + bitcode.string();
     return nullptr;
@@ -272,6 +274,11 @@ CompiledModule *Engine::get(const std::string &mlir, std::string &error) {
             " (module " + key + ")";
     return nullptr;
   }
+  if (envFlag("GGML_HIPEP_VERBOSE"))
+    std::fprintf(stderr, "[ggml-hipep] loaded %s in %.0f ms\n", key.c_str(),
+                 std::chrono::duration<double, std::milli>(
+                     std::chrono::steady_clock::now() - loadStart)
+                     .count());
 
   std::unique_ptr<CompiledModule> module(new CompiledModule());
   module->impl_ = std::move(impl);

@@ -4696,12 +4696,15 @@ static constexpr int kNumSmallMWmmaConfigs =
 
 // Eight packed nibbles (k..k+7 of one B column) -> four half2 words holding
 // (q - zp) * s in k order. Same instruction sequence and rounding as the
-// storeToShared dequant in GemmFp16U4Impl.
+// storeToShared dequant in GemmFp16U4Impl. bias_pk holds -(1024 + floor(zp))
+// and zfrac_pk the fraction zp - floor(zp), which is 0 for integer zero points.
 __device__ __forceinline__ void smallmDequant8(uint32_t packed, uint32_t bias_pk,
-                                               uint32_t s_pk, uint32_t* out) {
+                                               uint32_t s_pk, uint32_t zfrac_pk,
+                                               uint32_t* out) {
     constexpr uint32_t kMagicPk = 0x64006400u;
     const half2v bias2 = __builtin_bit_cast(half2v, bias_pk);
     const half2v scale2 = __builtin_bit_cast(half2v, s_pk);
+    const half2v zfrac2 = __builtin_bit_cast(half2v, zfrac_pk);
     const uint32_t lo = packed & 0x0F0F0F0Fu;
     const uint32_t hi = (packed >> 4) & 0x0F0F0F0Fu;
     uint32_t raw[4];
@@ -4712,7 +4715,7 @@ __device__ __forceinline__ void smallmDequant8(uint32_t packed, uint32_t bias_pk
 #pragma unroll
     for (int i = 0; i < 4; i++) {
         const half2v q = __builtin_bit_cast(half2v, raw[i] | kMagicPk);
-        out[i] = __builtin_bit_cast(uint32_t, (q + bias2) * scale2);
+        out[i] = __builtin_bit_cast(uint32_t, ((q + bias2) - zfrac2) * scale2);
     }
 }
 
@@ -4864,11 +4867,17 @@ __device__ __forceinline__ void SmallMWmmaImpl(
         const int sb = j % DB, sa = j % DA;
 #pragma unroll
         for (int tn = 0; tn < TN; tn++) {
-            const _Float16 bias16 = -((_Float16)1024 + rz[j][tn]);
+            // 1024 + zp is only exact for an integer zp; see smallmDequant8.
+            const _Float16 zint =
+                static_cast<_Float16>(__builtin_floorf(static_cast<float>(rz[j][tn])));
+            const _Float16 zfrac = rz[j][tn] - zint;
+            const _Float16 bias16 = -((_Float16)1024 + zint);
             const uint16_t s_bits = __builtin_bit_cast(uint16_t, rs[j][tn]);
             const uint16_t b_bits = __builtin_bit_cast(uint16_t, bias16);
+            const uint16_t f_bits = __builtin_bit_cast(uint16_t, zfrac);
             const uint32_t s_pk = (uint32_t(s_bits) << 16) | s_bits;
             const uint32_t b_pk = (uint32_t(b_bits) << 16) | b_bits;
+            const uint32_t f_pk = (uint32_t(f_bits) << 16) | f_bits;
 #pragma unroll
             for (int ks = 0; ks < 2; ks++) {
                 // Packed words covering this lane's k range of step ks.
@@ -4876,7 +4885,7 @@ __device__ __forceinline__ void SmallMWmmaImpl(
 #pragma unroll
                 for (int w = 0; w < FRAG_U32 / 4; w++)
                     smallmDequant8(rb[sb][tn][(ks * 16 + k_off) / 8 + w], b_pk, s_pk,
-                                   &bw[w * 4]);
+                                   f_pk, &bw[w * 4]);
                 half16 b_frag = __builtin_bit_cast(half16, bw);
 #pragma unroll
                 for (int tm = 0; tm < TM; tm++) {

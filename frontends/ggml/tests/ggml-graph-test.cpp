@@ -7,7 +7,7 @@
 // causal mask) on the CPU backend and on ggml-hipep and compares the logits
 // plus every intermediate tensor named "chk.*".
 //
-//   ggml-graph-test <ggml-hipep.dll> [n_tokens] [n_past] [f16|q8_0|q4_0]
+//   ggml-graph-test <ggml-hipep.dll> [n_tokens] [n_past] [weight type name]
 
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
@@ -278,10 +278,12 @@ int main(int argc, char **argv) {
   if (argc > 3)
     c.nPast = std::atoll(argv[3]);
   if (argc > 4) {
-    const std::string w = argv[4];
-    c.wtype = w == "q8_0"   ? GGML_TYPE_Q8_0
-              : w == "q4_0" ? GGML_TYPE_Q4_0
-                            : GGML_TYPE_F16;
+    c.wtype = GGML_TYPE_F16;
+    for (int t = 0; t < GGML_TYPE_COUNT; ++t) {
+      const char *name = ggml_type_name(static_cast<ggml_type>(t));
+      if (name && std::string(name) == argv[4])
+        c.wtype = static_cast<ggml_type>(t);
+    }
   }
   // Remaining flags: "llama1b" (Llama 3.2 1B dimensions), "nochk" (no
   // intermediate outputs), "all" (logits for every token).

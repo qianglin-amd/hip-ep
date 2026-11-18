@@ -368,6 +368,7 @@ void GemmFp16U4ImplX(
     [[maybe_unused]] int      grp_k_end = 0;
     [[maybe_unused]] uint32_t s_pk[B_NCH]    = {};
     [[maybe_unused]] uint32_t bias_pk[B_NCH] = {};
+    [[maybe_unused]] uint32_t zfrac_pk[B_NCH] = {};
     // Depth 2: raw per-tile group constants, packed at dequant time.
     [[maybe_unused]] _Float16 s_raw[PGR][B_NCH]  = {};
     [[maybe_unused]] _Float16 zp_raw[PGR][B_NCH] = {};
@@ -384,9 +385,21 @@ void GemmFp16U4ImplX(
         else return (_Float16)8;
     };
 
-    auto packConstants = [&](_Float16 s16, _Float16 zp, uint32_t& s_out, uint32_t& b_out)
-        __attribute__((always_inline))
+    auto packConstants = [&](_Float16 s16, _Float16 zp, uint32_t& s_out, uint32_t& b_out,
+                             uint32_t& f_out) __attribute__((always_inline))
     {
+        // 1024 + zp is only exact for an integer zp (fp16 spacing is 1.0 at
+        // 1024), so a fractional fp16 zero point (e.g. GGUF Q4_K, Q4_1) is
+        // split: the integer part goes in the bias, the fraction is subtracted
+        // separately.
+        if constexpr (USE_ZEROS) {
+            const _Float16 zint =
+                static_cast<_Float16>(__builtin_floorf(static_cast<float>(zp)));
+            const _Float16 zfrac = zp - zint;
+            const uint16_t f_bits = __builtin_bit_cast(uint16_t, zfrac);
+            f_out = (uint32_t(f_bits) << 16) | f_bits;
+            zp = zint;
+        }
         // Subtracting (1024 + zp) from (1024 + q) is exact in fp16 -- both
         // operands and the result are exactly representable -- so the magic-bias
         // conversion loses no accuracy. Folding it into the scale instead
@@ -409,7 +422,7 @@ void GemmFp16U4ImplX(
                 // loads them in, which its instruction schedule depends on.
                 const _Float16 s16 = s_src[c][grp];
                 const _Float16 zp = zeroPoint(c, grp);
-                packConstants(s16, zp, s_pk[c], bias_pk[c]);
+                packConstants(s16, zp, s_pk[c], bias_pk[c], zfrac_pk[c]);
             }
     };
 
@@ -528,15 +541,17 @@ void GemmFp16U4ImplX(
                  * 8 extracts + 8 v_cvt_f32_ubyte0 + 8 v_cvt_f16_f32 + 4 packs +
                  * 4 pk_fma for the arithmetic conversion the compiler generates
                  * from static_cast<_Float16>(unsigned). */
-                uint32_t sp, bp;
+                uint32_t sp, bp, fp = 0;
                 if constexpr (PGR == 1) {
                     sp = s_pk[c];
                     bp = bias_pk[c];
+                    fp = zfrac_pk[c];
                 } else {
-                    packConstants(s_raw[S][c], zp_raw[S][c], sp, bp);
+                    packConstants(s_raw[S][c], zp_raw[S][c], sp, bp, fp);
                 }
                 const half2v bias2 = __builtin_bit_cast(half2v, bp);
                 const half2v scale2 = __builtin_bit_cast(half2v, sp);
+                [[maybe_unused]] const half2v zfrac2 = __builtin_bit_cast(half2v, fp);
 #pragma unroll
                 for (int w = 0; w < B_U32; w++) {
                     const uint32_t packed = pf_b4[S][c][w];
@@ -554,7 +569,11 @@ void GemmFp16U4ImplX(
                     for (int i = 0; i < 4; i++) {
                         const half2v q =
                             __builtin_bit_cast(half2v, raw[i] | kMagicPk);
-                        out[i] = __builtin_bit_cast(uint32_t, (q + bias2) * scale2);
+                        if constexpr (USE_ZEROS)
+                            out[i] = __builtin_bit_cast(
+                                uint32_t, ((q + bias2) - zfrac2) * scale2);
+                        else
+                            out[i] = __builtin_bit_cast(uint32_t, (q + bias2) * scale2);
                     }
                     MNX_SMB_DST(w) = out;
                 }

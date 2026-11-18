@@ -34,9 +34,13 @@ public:
   LlvmIrJit &operator=(LlvmIrJit &&) = delete;
 
   // The bytes are copied internally; `module_name` is a diagnostic tag.
+  // A non-empty `object_cache_dir` keeps each module's machine code there,
+  // keyed by its bitcode, the host target and the LLVM version, so later
+  // loads link the cached object instead of running codegen again.
   // Returns nullptr on parse / JIT-init failure (errors logged via glog).
-  static std::unique_ptr<LlvmIrJit> create(const std::vector<uint8_t> &bitcode,
-                                           const std::string &module_name);
+  static std::unique_ptr<LlvmIrJit>
+  create(const std::vector<uint8_t> &bitcode, const std::string &module_name,
+         const std::string &object_cache_dir = {});
 
   // Returns nullptr when the symbol is absent (callers use this to probe
   // optional hooks like `hipdnn_ep_runtime_begin_compute`).

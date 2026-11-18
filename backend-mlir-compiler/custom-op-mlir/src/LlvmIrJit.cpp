@@ -14,10 +14,14 @@
 #include <llvm/ADT/SmallString.h>
 #include <llvm/ADT/StringSwitch.h>
 #include <llvm/Bitcode/BitcodeReader.h>
+#include <llvm/Config/llvm-config.h>
 #include <llvm/ExecutionEngine/JITLink/JITLinkMemoryManager.h>
 #include <llvm/ExecutionEngine/JITSymbol.h>
+#include <llvm/ExecutionEngine/ObjectCache.h>
 #include <llvm/ExecutionEngine/Orc/AbsoluteSymbols.h>
+#include <llvm/ExecutionEngine/Orc/CompileUtils.h>
 #include <llvm/ExecutionEngine/Orc/ExecutionUtils.h>
+#include <llvm/ExecutionEngine/Orc/JITTargetMachineBuilder.h>
 #include <llvm/ExecutionEngine/Orc/LLJIT.h>
 #include <llvm/ExecutionEngine/Orc/RTDyldObjectLinkingLayer.h>
 #include <llvm/ExecutionEngine/Orc/ThreadSafeModule.h>
@@ -29,6 +33,8 @@
 #include <llvm/Support/MemoryBuffer.h>
 #include <llvm/Support/Path.h>
 #include <llvm/Support/TargetSelect.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Support/xxhash.h>
 #include <llvm/TargetParser/Triple.h>
 
 // Plugin-registry accessors (pluginBitcodeBuffers / pluginLibraries /
@@ -45,6 +51,7 @@ extern "C" const unsigned char runtime_bc_data[];
 extern "C" const std::size_t runtime_bc_data_size;
 
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 #include <new>
 #include <string>
@@ -166,8 +173,76 @@ static_assert(
     "ObjectLinkingLayerCreator arity for LLVM >= 23");
 #endif
 
-llvm::orc::LLJITBuilder makeLLJITBuilder() {
+// Machine code for a module, stored on disk under a content key. Modules opt in
+// by carrying an identifier of the form "objcache:<hex key>"; the key covers
+// the bitcode, the target and the LLVM version, so a stale object is never
+// matched. The embedded runtime.bc is the same in every model module, which
+// makes it the main beneficiary: it is code-generated once instead of once per
+// LlvmIrJit.
+class DiskObjectCache : public llvm::ObjectCache {
+public:
+  explicit DiskObjectCache(std::string dir) : dir_(std::move(dir)) {}
+
+  void notifyObjectCompiled(const llvm::Module *m,
+                            llvm::MemoryBufferRef obj) override {
+    const std::string path = pathFor(m);
+    if (path.empty())
+      return;
+    // Write-then-rename so a concurrent reader never sees a partial object.
+    llvm::SmallString<256> tmp;
+    int fd = -1;
+    if (llvm::sys::fs::createUniqueFile(path + ".%%%%%%.tmp", fd, tmp))
+      return;
+    {
+      llvm::raw_fd_ostream out(fd, /*shouldClose=*/true);
+      out << obj.getBuffer();
+      if (out.has_error()) {
+        out.clear_error();
+        llvm::sys::fs::remove(tmp);
+        return;
+      }
+    }
+    if (llvm::sys::fs::rename(tmp, path))
+      llvm::sys::fs::remove(tmp);
+  }
+
+  std::unique_ptr<llvm::MemoryBuffer>
+  getObject(const llvm::Module *m) override {
+    const std::string path = pathFor(m);
+    if (path.empty())
+      return nullptr;
+    auto buf = llvm::MemoryBuffer::getFile(path, /*IsText=*/false,
+                                           /*RequiresNullTerminator=*/false);
+    if (!buf)
+      return nullptr;
+    return std::move(*buf);
+  }
+
+private:
+  std::string pathFor(const llvm::Module *m) const {
+    llvm::StringRef id = m->getModuleIdentifier();
+    if (!id.consume_front("objcache:"))
+      return {};
+    llvm::SmallString<256> path(dir_);
+    llvm::sys::path::append(path, id + ".o");
+    return std::string(path);
+  }
+
+  std::string dir_;
+};
+
+llvm::orc::LLJITBuilder makeLLJITBuilder(llvm::ObjectCache *object_cache) {
   llvm::orc::LLJITBuilder builder;
+
+  if (object_cache) {
+    builder.setCompileFunctionCreator(
+        [object_cache](llvm::orc::JITTargetMachineBuilder jtmb)
+            -> llvm::Expected<
+                std::unique_ptr<llvm::orc::IRCompileLayer::IRCompiler>> {
+          return std::make_unique<llvm::orc::ConcurrentIRCompiler>(
+              std::move(jtmb), object_cache);
+        });
+  }
 
 #ifdef _WIN32
   if (hipdnn_ep::env_enabled("HIPDNN_EP_JIT_UNRESERVED")) {
@@ -603,6 +678,8 @@ bool installSearchGenerators(llvm::orc::LLJIT &jit) {
 
 // PImpl keeps the LLVM ORC headers out of LlvmIrJit.h.
 struct LlvmIrJit::Impl {
+  // Declared before `jit`: the compiler holds a raw pointer to it.
+  std::unique_ptr<llvm::ObjectCache> object_cache;
   std::unique_ptr<llvm::orc::LLJIT> jit;
   std::vector<AtexitEntry> atexit_dtors;
   bool initialized = false;
@@ -634,15 +711,30 @@ LlvmIrJit::~LlvmIrJit() {
 
 std::unique_ptr<LlvmIrJit>
 LlvmIrJit::create(const std::vector<uint8_t> &bitcode,
-                  const std::string &module_name) {
+                  const std::string &module_name,
+                  const std::string &object_cache_dir) {
   ensureLLVMNativeTargetInitialized();
+
+  std::unique_ptr<llvm::ObjectCache> object_cache;
+  std::string target_key;
+  if (!object_cache_dir.empty() &&
+      !llvm::sys::fs::create_directories(object_cache_dir)) {
+    auto jtmb = llvm::orc::JITTargetMachineBuilder::detectHost();
+    if (jtmb) {
+      target_key = jtmb->getTargetTriple().str() + "|" + jtmb->getCPU() + "|" +
+                   jtmb->getFeatures().getString() + "|" LLVM_VERSION_STRING;
+      object_cache = std::make_unique<DiskObjectCache>(object_cache_dir);
+    } else {
+      llvm::consumeError(jtmb.takeError());
+    }
+  }
 
   // LLJIT auto-selects the object linking layer by triple
   // (LLJITBuilderState::prepareForConstruction): RuntimeDyld on Windows
   // (x86_64 COFF), JITLink on Linux (x86_64 ELF). Both are linked in (see this
   // dir's CMakeLists) for that reason. makeLLJITBuilder keeps that choice but
   // fixes the Windows memory layout; see the comment there.
-  auto jit_or_err = makeLLJITBuilder().create();
+  auto jit_or_err = makeLLJITBuilder(object_cache.get()).create();
   if (!jit_or_err) {
     LOG(ERROR) << "LlvmIrJit::create: LLJITBuilder failed: "
                << llvm::toString(jit_or_err.takeError());
@@ -695,6 +787,16 @@ LlvmIrJit::create(const std::vector<uint8_t> &bitcode,
     mod->setSourceFileName(name);
     mod->setDataLayout(jit->getDataLayout());
     mod->setTargetTriple(jit->getTargetTriple());
+    if (object_cache) {
+      const std::string keyed = target_key + "|" + bytes.str();
+      char hex[17];
+      std::snprintf(hex, sizeof(hex), "%016llx",
+                    static_cast<unsigned long long>(
+                        llvm::xxh3_64bits(llvm::ArrayRef<uint8_t>(
+                            reinterpret_cast<const uint8_t *>(keyed.data()),
+                            keyed.size()))));
+      mod->setModuleIdentifier(std::string("objcache:") + hex);
+    }
     return mod;
   };
 
@@ -775,6 +877,7 @@ LlvmIrJit::create(const std::vector<uint8_t> &bitcode,
     return nullptr;
   }
 
+  result->impl_->object_cache = std::move(object_cache);
   result->impl_->jit = std::move(jit);
   result->impl_->initialized = true;
   return result;

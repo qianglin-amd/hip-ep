@@ -30,6 +30,7 @@ add_library(ggml-hipep SHARED
   src/ggml-hipep.cpp
   src/GgmlImporter.cpp
   src/HipEpEngine.cpp
+  src/QuantRepack.cpp
 )
 
 add_dependencies(ggml-hipep

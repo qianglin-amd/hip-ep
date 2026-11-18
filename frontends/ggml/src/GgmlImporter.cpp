@@ -265,6 +265,15 @@ public:
     return v;
   }
 
+  Val constF32(const std::vector<float> &values) {
+    Val v{fresh(), {static_cast<int64_t>(values.size())}, Elt::F32};
+    body_ << "    " << v.id << " = \"onnx.Constant\"() {value = dense<[";
+    for (size_t i = 0; i < values.size(); ++i)
+      body_ << (i ? ", " : "") << fmtFloat(values[i]);
+    body_ << "]> : " << type(v) << "} : () -> " << type(v) << "\n";
+    return v;
+  }
+
   Val reshape(const Val &v, const Shape &shape) {
     if (v.shape == shape)
       return v;
@@ -498,23 +507,34 @@ private:
     return &storage_.emplace(root, st).first->second;
   }
 
-  // Packed values [rows, blocks, blob] and fp16 scales [rows, blocks] of a
-  // repacked block-quantized weight.
-  std::pair<Val, Val> quantOperands(const ggml_tensor *w) {
+  struct QuantOperands {
+    Val packed;     // [rows, blocks, blob] ui8
+    Val scales;     // [rows, blocks] f16
+    Val zeroPoints; // [rows, blocks] f16, zeroPoints layouts only
+  };
+
+  QuantOperands quantOperands(const ggml_tensor *w) {
     auto it = quant_.find(w);
     if (it != quant_.end())
       return it->second;
     QuantLayout layout;
     quantLayout(w->type, layout);
     const int64_t rows = w->ne[1], blocks = w->ne[0] / layout.blockSize;
-    SegmentInput data, scales;
-    data.kind = SegmentInput::Kind::QuantData;
-    data.tensor = w;
-    scales.kind = SegmentInput::Kind::QuantScales;
-    scales.tensor = w;
-    Val d = addInput({rows, blocks, layout.blob}, Elt::U8, data);
-    Val s = addInput({rows, blocks}, Elt::F16, scales);
-    return quant_.emplace(w, std::make_pair(d, s)).first->second;
+    auto input = [&](SegmentInput::Kind kind) {
+      SegmentInput in;
+      in.kind = kind;
+      in.tensor = w;
+      return in;
+    };
+    QuantOperands ops;
+    ops.packed = addInput({rows, blocks, layout.blob}, Elt::U8,
+                          input(SegmentInput::Kind::QuantData));
+    ops.scales = addInput({rows, blocks}, Elt::F16,
+                          input(SegmentInput::Kind::QuantScales));
+    if (layout.zeroPoints)
+      ops.zeroPoints = addInput({rows, blocks}, Elt::F16,
+                                input(SegmentInput::Kind::QuantZeroPoints));
+    return quant_.emplace(w, ops).first->second;
   }
 
   Val valueOf(const ggml_tensor *t) {
@@ -619,6 +639,9 @@ private:
     case GGML_OP_SOFT_MAX:
       r = lowerSoftMax(node);
       break;
+    case GGML_OP_FLASH_ATTN_EXT:
+      r = lowerFlashAttn(node);
+      break;
     case GGML_OP_GLU:
       r = lowerGlu(node);
       break;
@@ -719,10 +742,13 @@ private:
     quantLayout(a->type, layout);
     const int64_t K = a->ne[0], N = a->ne[1];
     const int64_t rows = c->ne[1] * c->ne[2] * c->ne[3];
-    auto [packed, scales] = quantOperands(a);
+    const QuantOperands q = quantOperands(a);
     Val x = b_.reshape(b_.cast(valueOf(c), Elt::F16), {1, rows, K});
+    std::vector<Val> operands{x, q.packed, q.scales};
+    if (layout.zeroPoints)
+      operands.push_back(q.zeroPoints);
     Val y =
-        b_.emit("Custom", {x, packed, scales},
+        b_.emit("Custom", operands,
                 "function_name = \"MatMulNBits\", K = " + std::to_string(K) +
                     " : si64, N = " + std::to_string(N) +
                     " : si64, accuracy_level = 0 : si64, bits = " +
@@ -791,11 +817,11 @@ private:
     Val ids = b_.reshape(b_.cast(valueOf(idx), Elt::I64), {count});
     QuantLayout layout;
     if (quantLayout(a->type, layout)) {
-      auto [packed, scales] = quantOperands(a);
-      const int64_t rowBytes = packed.shape[1] * packed.shape[2];
-      Val data = b_.reshape(packed, {a->ne[1], rowBytes});
+      const QuantOperands q = quantOperands(a);
+      const int64_t rowBytes = q.packed.shape[1] * q.packed.shape[2];
+      Val data = b_.reshape(q.packed, {a->ne[1], rowBytes});
       Val g = b_.emit(
-          "Custom", {data, ids, scales},
+          "Custom", {data, ids, q.scales},
           "function_name = \"GatherBlockQuantized\", bits = " +
               std::to_string(layout.bits) +
               " : si64, block_size = " + std::to_string(layout.blockSize) +
@@ -863,6 +889,32 @@ private:
     return b_.cast(b_.reshape(r, shape4(node)), resultElt(node));
   }
 
+  // The mask as an f32 [1|S, 1|H, rows, cols] addend, scaled per head by the
+  // ALiBi slope when maxBias is set (ggml's soft_max / flash_attn_ext rule).
+  Val maskAddend(const ggml_tensor *mask, int64_t rows, int64_t H,
+                 float maxBias) {
+    Val m = valueOf(mask);
+    if (mask->ne[1] > rows)
+      m = b_.slice(m, {0}, {rows}, {2});
+    m = b_.cast(m, Elt::F32);
+    if (maxBias == 0.0f)
+      return m;
+    const int64_t nHeadLog2 = int64_t(1)
+                              << static_cast<int>(std::floor(std::log2(H)));
+    const float m0 = std::pow(2.0f, -maxBias / nHeadLog2);
+    const float m1 = std::pow(2.0f, -(maxBias / 2.0f) / nHeadLog2);
+    std::vector<float> slopes(H);
+    for (int64_t h = 0; h < H; ++h)
+      slopes[h] =
+          h < nHeadLog2
+              ? std::pow(m0, static_cast<float>(h + 1))
+              : std::pow(m1, static_cast<float>(2 * (h - nHeadLog2) + 1));
+    Shape shape = m.shape;
+    shape[1] = H;
+    return b_.emit("Mul", {m, b_.reshape(b_.constF32(slopes), {1, H, 1, 1})},
+                   "", shape, Elt::F32);
+  }
+
   Val lowerSoftMax(const ggml_tensor *node) {
     const float scale = opParamF32(node, 0);
     const ggml_tensor *mask = node->src[1];
@@ -870,15 +922,68 @@ private:
     if (scale != 1.0f)
       s = b_.emit("Mul", {s, b_.splat(scale, Elt::F32, {1})}, "", s.shape,
                   Elt::F32);
-    if (mask) {
-      Val m = valueOf(mask);
-      if (mask->ne[1] > node->ne[1])
-        m = b_.slice(m, {0}, {node->ne[1]}, {2});
-      m = b_.cast(m, Elt::F32);
-      s = b_.emit("Add", {s, m}, "", shape4(node), Elt::F32);
+    if (mask)
+      s = b_.emit(
+          "Add",
+          {s, maskAddend(mask, node->ne[1], node->ne[2], opParamF32(node, 1))},
+          "", shape4(node), Elt::F32);
+    return b_.cast(softmaxRows(s, node->src[2]), resultElt(node));
+  }
+
+  // Softmax over the last axis of s: [S, H, T, N]. sinks (H values) adds one
+  // extra logit per head that joins the normalization and is then dropped.
+  Val softmaxRows(const Val &s, const ggml_tensor *sinks) {
+    if (!sinks)
+      return b_.emit("Softmax", {s}, "axis = -1 : si64", s.shape, Elt::F32);
+    const int64_t S = s.shape[0], H = s.shape[1], T = s.shape[2],
+                  N = s.shape[3];
+    Val sink = b_.reshape(b_.cast(valueOf(sinks), Elt::F32), {1, H, 1, 1});
+    sink = b_.emit("Expand", {sink, b_.constI64({S, H, T, 1})}, "",
+                   {S, H, T, 1}, Elt::F32);
+    Val joined = b_.emit("Concat", {s, sink}, "axis = -1 : si64",
+                         {S, H, T, N + 1}, Elt::F32);
+    Val p = b_.emit("Softmax", {joined}, "axis = -1 : si64", joined.shape,
+                    Elt::F32);
+    return b_.slice(p, {0}, {N}, {3});
+  }
+
+  // FLASH_ATTN_EXT as softmax(scale * Q K^T + mask) V, with the grouped-query
+  // heads folded into M. q: [D, T, H, S], k: [D, n_kv, Hkv, S],
+  // v: [Dv, n_kv, Hkv, S], mask: [n_kv, >= T, 1 | H, 1 | S];
+  // result: [Dv, H, T, S].
+  Val lowerFlashAttn(const ggml_tensor *node) {
+    const ggml_tensor *q = node->src[0];
+    const ggml_tensor *k = node->src[1];
+    const ggml_tensor *v = node->src[2];
+    const ggml_tensor *mask = node->src[3];
+    const ggml_tensor *sinks = node->src[4];
+    const float scale = opParamF32(node, 0);
+    const float softcap = opParamF32(node, 2);
+    const int64_t D = q->ne[0], T = q->ne[1], H = q->ne[2], S = q->ne[3];
+    const int64_t nkv = k->ne[1], Hkv = k->ne[2], Dv = v->ne[0];
+    const int64_t r = H / Hkv;
+
+    Val Q = b_.reshape(b_.cast(valueOf(q), Elt::F32), {S, Hkv, r * T, D});
+    Val Kt = b_.transpose(b_.cast(valueOf(k), Elt::F32), {0, 1, 3, 2});
+    Val s = b_.emit("MatMul", {Q, Kt}, "", {S, Hkv, r * T, nkv}, Elt::F32);
+    s = b_.reshape(s, {S, H, T, nkv});
+    s = b_.emit("Mul", {s, b_.splat(scale, Elt::F32, {1})}, "", s.shape,
+                Elt::F32);
+    if (softcap != 0.0f) {
+      s = b_.emit("Mul", {s, b_.splat(1.0f / softcap, Elt::F32, {1})}, "",
+                  s.shape, Elt::F32);
+      s = b_.emit("Tanh", {s}, "", s.shape, Elt::F32);
+      s = b_.emit("Mul", {s, b_.splat(softcap, Elt::F32, {1})}, "", s.shape,
+                  Elt::F32);
     }
-    Val r = b_.emit("Softmax", {s}, "axis = -1 : si64", shape4(node), Elt::F32);
-    return b_.cast(r, resultElt(node));
+    if (mask)
+      s = b_.emit("Add", {s, maskAddend(mask, T, H, opParamF32(node, 1))}, "",
+                  s.shape, Elt::F32);
+    Val pr = b_.reshape(softmaxRows(s, sinks), {S, Hkv, r * T, nkv});
+    Val V = b_.cast(valueOf(v), Elt::F32);
+    Val o = b_.emit("MatMul", {pr, V}, "", {S, Hkv, r * T, Dv}, Elt::F32);
+    o = b_.reshape(o, {S, H, T, Dv});
+    return b_.cast(b_.transpose(o, {0, 2, 1, 3}), resultElt(node));
   }
 
   Val silu(const Val &x) {
@@ -929,7 +1034,7 @@ private:
   Builder b_;
   std::vector<Val> args_;
   std::vector<std::pair<Val, Val>> ropeArgs_;
-  std::unordered_map<const ggml_tensor *, std::pair<Val, Val>> quant_;
+  std::unordered_map<const ggml_tensor *, QuantOperands> quant_;
   std::unordered_map<const ggml_tensor *, Storage> storage_;
   std::map<std::pair<const ggml_tensor *, int>, Val> viewMemo_;
   std::unordered_map<const ggml_tensor *, int> index_;
@@ -945,16 +1050,39 @@ bool checkUnaryShape(const ggml_tensor *node, std::string *reason) {
 } // namespace
 
 bool quantLayout(int ggmlType, QuantLayout &layout) {
-  switch (static_cast<ggml_type>(ggmlType)) {
+  const auto type = static_cast<ggml_type>(ggmlType);
+  switch (type) {
   case GGML_TYPE_Q4_0:
-    layout = {4, 32, 16};
+    layout = {4, 32, 16, false};
     return true;
-  case GGML_TYPE_Q8_0:
-    layout = {8, 32, 32};
+  case GGML_TYPE_Q4_1:
+  case GGML_TYPE_Q4_K:
+    layout = {4, 32, 16, true};
     return true;
   default:
-    return false;
+    break;
   }
+  // Q8_0 and Q5_0 map exactly; every other type is requantized from ggml's
+  // own dequantization, which needs whole blocks inside a 32-element block.
+  if (!ggml_is_quantized(type))
+    return false;
+  const int64_t blck = ggml_blck_size(type);
+  if (blck % 16 != 0 && 16 % blck != 0)
+    return false;
+  const ggml_type_traits *traits = ggml_get_type_traits(type);
+  if (!traits || !traits->to_float)
+    return false;
+  if (type == GGML_TYPE_Q8_0 || type == GGML_TYPE_Q5_0) {
+    layout = {8, 32, 32, false};
+    return true;
+  }
+  // 8-bit requantization of the dequantized values adds about as much error
+  // as Q8_0 adds to f16 weights, even across the 16-element sub-blocks that
+  // K-quants scale independently. 32-element blocks keep the int8 WMMA
+  // prefill path, which requires block_size % 32 == 0; 16 falls back to GEMV.
+  layout = blck % 32 == 0 ? QuantLayout{8, 32, 32, false}
+                          : QuantLayout{8, 16, 16, false};
+  return true;
 }
 
 bool RopeTableSpec::operator==(const RopeTableSpec &o) const {
@@ -1089,6 +1217,9 @@ bool canExecuteNode(const ggml_tensor *node, std::string *reason) {
     const ggml_tensor *idx = node->src[1];
     if ((!quantSrc0 && !isFloat(a->type)) || idx->type != GGML_TYPE_I32)
       return no("GET_ROWS type");
+    QuantLayout layout;
+    if (quantSrc0 && quantLayout(a->type, layout) && layout.zeroPoints)
+      return no("GET_ROWS on a zero-point layout");
     if (a->ne[2] != 1 || a->ne[3] != 1)
       return no("GET_ROWS batched data");
     return true;
@@ -1109,9 +1240,8 @@ bool canExecuteNode(const ggml_tensor *node, std::string *reason) {
     return true;
   }
   case GGML_OP_SOFT_MAX: {
-    if (opParamF32(node, 1) != 0.0f)
-      return no("SOFT_MAX ALiBi");
-    if (node->src[2])
+    if (node->src[2] && (node->src[2]->type != GGML_TYPE_F32 ||
+                         ggml_nelements(node->src[2]) != node->ne[2]))
       return no("SOFT_MAX sinks");
     const ggml_tensor *mask = node->src[1];
     if (mask) {
@@ -1122,6 +1252,24 @@ bool canExecuteNode(const ggml_tensor *node, std::string *reason) {
       if (!isFloat(mask->type))
         return no("SOFT_MAX mask type");
     }
+    return true;
+  }
+  case GGML_OP_FLASH_ATTN_EXT: {
+    const ggml_tensor *q = node->src[0];
+    const ggml_tensor *k = node->src[1];
+    const ggml_tensor *v = node->src[2];
+    const ggml_tensor *mask = node->src[3];
+    if (node->src[5])
+      return no("FLASH_ATTN_EXT with kv rows");
+    if (!isFloat(q->type) || !isFloat(k->type) || !isFloat(v->type))
+      return no("FLASH_ATTN_EXT type");
+    if (k->ne[2] == 0 || q->ne[2] % k->ne[2] != 0 || k->ne[3] != q->ne[3] ||
+        v->ne[1] != k->ne[1] || v->ne[2] != k->ne[2] || v->ne[3] != k->ne[3])
+      return no("FLASH_ATTN_EXT shape");
+    if (mask && (mask->ne[0] != k->ne[1] || mask->ne[1] < q->ne[1] ||
+                 !sameOrOne(mask->ne[2], q->ne[2]) ||
+                 !sameOrOne(mask->ne[3], q->ne[3])))
+      return no("FLASH_ATTN_EXT mask shape");
     return true;
   }
   case GGML_OP_GLU:

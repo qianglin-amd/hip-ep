@@ -47,20 +47,33 @@ struct RopeTableSpec {
   bool operator==(const RopeTableSpec &o) const;
 };
 
-// Block-quantized weights live in the backend buffer repacked into the
-// MatMulNBits layout, which has the same byte size as the ggml blocks:
-//   [rows * blocks * blob] packed values, then [rows * blocks] fp16 scales.
-// Q4_0: 4-bit, low nibble first, implicit zero point 8.
-// Q8_0: 8-bit stored as q + 128, implicit zero point 128.
+// Block-quantized weights live in the backend buffer repacked into a
+// MatMulNBits layout with 32-element blocks, or 16 for requantized types whose
+// ggml block is not a multiple of 32 (QuantRepack.cpp):
+//   [rows * blocks * blob] packed values, [rows * blocks] fp16 scales, and
+//   for zeroPoints layouts [rows * blocks] fp16 zero points;
+//   value = (q - zero_point) * scale.
+// 4-bit symmetric (Q4_0): low nibble first, implicit zero point 8.
+// 4-bit with zero points (Q4_1, Q4_K): fp16 zero point per block.
+// 8-bit symmetric (Q8_0, Q5_0 exactly; any other ggml quantization through
+// dequantize and requantize): stored as q + 128, implicit zero point 128.
 struct QuantLayout {
   int bits = 0;
   int64_t blockSize = 32;
   int64_t blob = 0; // packed bytes per block
+  bool zeroPoints = false;
 };
 bool quantLayout(int ggmlType, QuantLayout &layout);
 
 struct SegmentInput {
-  enum class Kind { Tensor, RopeCos, RopeSin, QuantData, QuantScales };
+  enum class Kind {
+    Tensor,
+    RopeCos,
+    RopeSin,
+    QuantData,
+    QuantScales,
+    QuantZeroPoints
+  };
   Kind kind = Kind::Tensor;
   const ggml_tensor *tensor = nullptr; // storage root (Tensor, Quant*)
   int rope = -1;                       // index into Segment::ropeTables

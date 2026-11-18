@@ -304,7 +304,10 @@ void GemmFp16U4Impl(
     [[maybe_unused]] int      grp_k_end = 0;
     [[maybe_unused]] uint32_t s_pk      = 0;
     [[maybe_unused]] uint32_t bias_pk   = 0;
+    [[maybe_unused]] uint32_t zfrac_pk  = 0;
     [[maybe_unused]] uint32_t zp_u4     = 8;
+    // fp16 zero points may be fractional (e.g. GGUF Q4_K, Q4_1).
+    constexpr bool kFracZeros = USE_ZEROS && !ZEROS_U8;
 
     // fp16 1024.0. OR-ing a 4-bit value into the mantissa of 1024.0 yields
     // exactly 1024+q, which is the integer-to-fp16 conversion without any
@@ -340,7 +343,17 @@ void GemmFp16U4Impl(
                 }
             }
         }
-        const _Float16 bias = -((_Float16)1024 + zp);
+        // 1024 + zp is only exact for an integer zp (fp16 spacing is 1.0 at
+        // 1024), so a fractional zero point is split: the integer part goes in
+        // the bias and the fraction is subtracted separately.
+        _Float16 zint = zp;
+        if constexpr (kFracZeros) {
+            zint = static_cast<_Float16>(__builtin_floorf(static_cast<float>(zp)));
+            const _Float16 zfrac = zp - zint;
+            const uint16_t f_bits = __builtin_bit_cast(uint16_t, zfrac);
+            zfrac_pk = (uint32_t(f_bits) << 16) | f_bits;
+        }
+        const _Float16 bias = -((_Float16)1024 + zint);
         const uint16_t s_bits = __builtin_bit_cast(uint16_t, s16);
         const uint16_t b_bits = __builtin_bit_cast(uint16_t, bias);
         s_pk    = (uint32_t(s_bits) << 16) | s_bits;
@@ -450,6 +463,8 @@ void GemmFp16U4Impl(
                  * from static_cast<_Float16>(unsigned). */
                 const half2v bias2 = __builtin_bit_cast(half2v, bias_pk);
                 const half2v scale2 = __builtin_bit_cast(half2v, s_pk);
+                [[maybe_unused]] const half2v zfrac2 =
+                    __builtin_bit_cast(half2v, zfrac_pk);
 #pragma unroll
                 for (int w = 0; w < B_U32; w++) {
                     const uint32_t packed = pf_b4[w];
@@ -467,7 +482,11 @@ void GemmFp16U4Impl(
                     for (int i = 0; i < 4; i++) {
                         const half2v q =
                             __builtin_bit_cast(half2v, raw[i] | kMagicPk);
-                        out[i] = __builtin_bit_cast(uint32_t, (q + bias2) * scale2);
+                        if constexpr (kFracZeros)
+                            out[i] = __builtin_bit_cast(
+                                uint32_t, ((q + bias2) - zfrac2) * scale2);
+                        else
+                            out[i] = __builtin_bit_cast(uint32_t, (q + bias2) * scale2);
                     }
                     reinterpret_cast<u32x4*>(&smB[buf][b_col][b_k8])[w] = out;
                 }

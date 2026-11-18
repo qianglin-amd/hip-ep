@@ -14,6 +14,7 @@
 
 #include "GgmlImporter.h"
 #include "HipEpEngine.h"
+#include "QuantRepack.h"
 #include "hip_custom_kernels.h"
 
 #include <hip/hip_runtime.h>
@@ -181,80 +182,6 @@ struct Layout {
 };
 
 //===----------------------------------------------------------------------===//
-// Block-quantized weights: ggml blocks <-> MatMulNBits layout (QuantLayout)
-//===----------------------------------------------------------------------===//
-
-// ggml block layouts (ggml-common.h, not an installed header).
-struct BlockQ4_0 {
-  uint16_t d;
-  uint8_t qs[16]; // element j in the low nibble of qs[j], j + 16 in the high
-};
-struct BlockQ8_0 {
-  uint16_t d;
-  int8_t qs[32];
-};
-static_assert(sizeof(BlockQ4_0) == 18, "block_q4_0 layout");
-static_assert(sizeof(BlockQ8_0) == 34, "block_q8_0 layout");
-
-void repackToNBits(ggml_type type, const uint8_t *src, uint8_t *dst,
-                   int64_t blocks) {
-  QuantLayout layout;
-  quantLayout(type, layout);
-  uint8_t *packed = dst;
-  auto *scales = reinterpret_cast<uint16_t *>(dst + blocks * layout.blob);
-  for (int64_t b = 0; b < blocks; ++b) {
-    if (type == GGML_TYPE_Q4_0) {
-      const auto &blk = reinterpret_cast<const BlockQ4_0 *>(src)[b];
-      scales[b] = blk.d;
-      uint8_t q[32];
-      for (int j = 0; j < 16; ++j) {
-        q[j] = blk.qs[j] & 0x0F;
-        q[j + 16] = blk.qs[j] >> 4;
-      }
-      for (int i = 0; i < 16; ++i)
-        packed[b * 16 + i] =
-            static_cast<uint8_t>(q[2 * i] | (q[2 * i + 1] << 4));
-    } else {
-      const auto &blk = reinterpret_cast<const BlockQ8_0 *>(src)[b];
-      scales[b] = blk.d;
-      for (int i = 0; i < 32; ++i)
-        packed[b * 32 + i] = static_cast<uint8_t>(blk.qs[i]) ^ 0x80;
-    }
-  }
-}
-
-void unpackFromNBits(ggml_type type, const uint8_t *src, uint8_t *dst,
-                     int64_t blocks) {
-  QuantLayout layout;
-  quantLayout(type, layout);
-  const uint8_t *packed = src;
-  const auto *scales =
-      reinterpret_cast<const uint16_t *>(src + blocks * layout.blob);
-  for (int64_t b = 0; b < blocks; ++b) {
-    if (type == GGML_TYPE_Q4_0) {
-      auto &blk = reinterpret_cast<BlockQ4_0 *>(dst)[b];
-      blk.d = scales[b];
-      uint8_t q[32];
-      for (int i = 0; i < 16; ++i) {
-        q[2 * i] = packed[b * 16 + i] & 0x0F;
-        q[2 * i + 1] = packed[b * 16 + i] >> 4;
-      }
-      for (int j = 0; j < 16; ++j)
-        blk.qs[j] = static_cast<uint8_t>(q[j] | (q[j + 16] << 4));
-    } else {
-      auto &blk = reinterpret_cast<BlockQ8_0 *>(dst)[b];
-      blk.d = scales[b];
-      for (int i = 0; i < 32; ++i)
-        blk.qs[i] = static_cast<int8_t>(packed[b * 32 + i] ^ 0x80);
-    }
-  }
-}
-
-int64_t quantBlocks(const ggml_tensor *t) {
-  return ggml_nelements(t) / ggml_blck_size(t->type);
-}
-
-//===----------------------------------------------------------------------===//
 // Device, buffer type and buffer
 //===----------------------------------------------------------------------===//
 
@@ -290,42 +217,73 @@ void *bufferBase(ggml_backend_buffer_t buffer) {
   return static_cast<BufferContext *>(buffer->context)->base;
 }
 
-void bufferMemsetTensor(ggml_backend_buffer_t buffer, ggml_tensor *tensor,
-                        uint8_t value, size_t offset, size_t size) {
-  auto *ctx = static_cast<BufferContext *>(buffer->context);
-  hipSetDevice(ctx->device);
-  HIPEP_CHECK(
-      hipMemset(static_cast<char *>(tensor->data) + offset, value, size));
+// Block-quantized tensors are stored in the MatMulNBits layout (QuantRepack).
+size_t repackedSize(const ggml_tensor *t) {
+  if (t->view_src)
+    return 0;
+  return packedSize(t->type, ggml_nrows(t), t->ne[0]);
 }
 
-bool isRepacked(const ggml_tensor *t) {
-  QuantLayout layout;
-  return !t->view_src && quantLayout(t->type, layout);
+bool isRepacked(const ggml_tensor *t) { return repackedSize(t) != 0; }
+
+// The repacked tensor holding t's bytes: t itself or the root of a view of it.
+// Byte offsets into a view are ggml-layout offsets into that root.
+const ggml_tensor *repackedRoot(const ggml_tensor *t) {
+  const ggml_tensor *root = t->view_src ? t->view_src : t;
+  return isRepacked(root) ? root : nullptr;
+}
+
+size_t rootOffset(const ggml_tensor *t, const ggml_tensor *root) {
+  return static_cast<const char *>(t->data) -
+         static_cast<const char *>(root->data);
 }
 
 // Whole repacked tensor, converted back to ggml blocks.
 void bufferGetTensorRaw(const ggml_tensor *tensor, uint8_t *raw, int device) {
   hipSetDevice(device);
-  const size_t total = ggml_nbytes(tensor);
-  std::vector<uint8_t> packed(total);
+  std::vector<uint8_t> packed(repackedSize(tensor));
+  HIPEP_CHECK(hipMemcpy(packed.data(), tensor->data, packed.size(),
+                        hipMemcpyDeviceToHost));
+  unpackWeights(tensor->type, packed.data(), raw, ggml_nrows(tensor),
+                tensor->ne[0]);
+}
+
+// Applies `edit` to the ggml-layout bytes of a repacked root and repacks it.
+// The old contents are only fetched when the edit does not cover the root.
+template <typename Edit>
+void editRepacked(const ggml_tensor *root, size_t offset, size_t size,
+                  int device, Edit edit) {
+  const size_t total = ggml_nbytes(root);
+  std::vector<uint8_t> raw(total), packed(repackedSize(root));
+  if (offset != 0 || size != total)
+    bufferGetTensorRaw(root, raw.data(), device);
+  edit(raw.data() + offset);
+  packWeights(root->type, raw.data(), packed.data(), ggml_nrows(root),
+              root->ne[0]);
+  HIPEP_CHECK(hipMemcpy(root->data, packed.data(), packed.size(),
+                        hipMemcpyHostToDevice));
+}
+
+void bufferMemsetTensor(ggml_backend_buffer_t buffer, ggml_tensor *tensor,
+                        uint8_t value, size_t offset, size_t size) {
+  auto *ctx = static_cast<BufferContext *>(buffer->context);
+  hipSetDevice(ctx->device);
+  if (const ggml_tensor *root = repackedRoot(tensor)) {
+    editRepacked(root, rootOffset(tensor, root) + offset, size, ctx->device,
+                 [&](uint8_t *p) { std::memset(p, value, size); });
+    return;
+  }
   HIPEP_CHECK(
-      hipMemcpy(packed.data(), tensor->data, total, hipMemcpyDeviceToHost));
-  unpackFromNBits(tensor->type, packed.data(), raw, quantBlocks(tensor));
+      hipMemset(static_cast<char *>(tensor->data) + offset, value, size));
 }
 
 void bufferSetTensor(ggml_backend_buffer_t buffer, ggml_tensor *tensor,
                      const void *data, size_t offset, size_t size) {
   auto *ctx = static_cast<BufferContext *>(buffer->context);
   hipSetDevice(ctx->device);
-  if (isRepacked(tensor)) {
-    const size_t total = ggml_nbytes(tensor);
-    std::vector<uint8_t> raw(total), packed(total);
-    if (offset != 0 || size != total)
-      bufferGetTensorRaw(tensor, raw.data(), ctx->device);
-    std::memcpy(raw.data() + offset, data, size);
-    repackToNBits(tensor->type, raw.data(), packed.data(), quantBlocks(tensor));
-    HIPEP_CHECK(
-        hipMemcpy(tensor->data, packed.data(), total, hipMemcpyHostToDevice));
+  if (const ggml_tensor *root = repackedRoot(tensor)) {
+    editRepacked(root, rootOffset(tensor, root) + offset, size, ctx->device,
+                 [&](uint8_t *p) { std::memcpy(p, data, size); });
     return;
   }
   HIPEP_CHECK(hipMemcpy(static_cast<char *>(tensor->data) + offset, data, size,
@@ -336,10 +294,10 @@ void bufferGetTensor(ggml_backend_buffer_t buffer, const ggml_tensor *tensor,
                      void *data, size_t offset, size_t size) {
   auto *ctx = static_cast<BufferContext *>(buffer->context);
   hipSetDevice(ctx->device);
-  if (isRepacked(tensor)) {
-    std::vector<uint8_t> raw(ggml_nbytes(tensor));
-    bufferGetTensorRaw(tensor, raw.data(), ctx->device);
-    std::memcpy(data, raw.data() + offset, size);
+  if (const ggml_tensor *root = repackedRoot(tensor)) {
+    std::vector<uint8_t> raw(ggml_nbytes(root));
+    bufferGetTensorRaw(root, raw.data(), ctx->device);
+    std::memcpy(data, raw.data() + rootOffset(tensor, root) + offset, size);
     return;
   }
   HIPEP_CHECK(hipMemcpy(data, static_cast<const char *>(tensor->data) + offset,
@@ -350,12 +308,19 @@ bool bufferCpyTensor(ggml_backend_buffer_t buffer, const ggml_tensor *src,
                      ggml_tensor *dst) {
   if (!src->buffer || !isHipepBuft(src->buffer->buft))
     return false;
+  // A raw copy only moves a repacked layout between two whole tensors of the
+  // same type; ggml falls back to get + set otherwise.
+  const ggml_tensor *srcRoot = repackedRoot(src);
+  const ggml_tensor *dstRoot = repackedRoot(dst);
+  if ((srcRoot || dstRoot) &&
+      (srcRoot != src || dstRoot != dst || src->type != dst->type))
+    return false;
   auto *ctx = static_cast<BufferContext *>(buffer->context);
   hipSetDevice(ctx->device);
   // Device-to-device hipMemcpy does not block the host; wait so later work on
   // any stream sees the copy.
-  HIPEP_CHECK(hipMemcpy(dst->data, src->data, ggml_nbytes(src),
-                        hipMemcpyDeviceToDevice));
+  const size_t bytes = std::max(ggml_nbytes(src), repackedSize(src));
+  HIPEP_CHECK(hipMemcpy(dst->data, src->data, bytes, hipMemcpyDeviceToDevice));
   HIPEP_CHECK(hipDeviceSynchronize());
   return true;
 }
@@ -401,6 +366,11 @@ ggml_backend_buffer_t buftAlloc(ggml_backend_buffer_type_t buft, size_t size) {
 
 size_t buftAlignment(ggml_backend_buffer_type_t) { return 256; }
 
+// The packed layout of some quantized types is larger than their ggml blocks.
+size_t buftAllocSize(ggml_backend_buffer_type_t, const ggml_tensor *tensor) {
+  return std::max(ggml_nbytes(tensor), repackedSize(tensor));
+}
+
 bool buftIsHost(ggml_backend_buffer_type_t) { return false; }
 
 const ggml_backend_buffer_type_i kBuftInterface = {
@@ -409,7 +379,7 @@ const ggml_backend_buffer_type_i kBuftInterface = {
     /* .alloc_buffer_n   = */ nullptr,
     /* .get_alignment    = */ buftAlignment,
     /* .get_max_size     = */ nullptr,
-    /* .get_alloc_size   = */ nullptr,
+    /* .get_alloc_size   = */ buftAllocSize,
     /* .get_alloc_size_n = */ nullptr,
     /* .is_host          = */ buftIsHost,
 };
@@ -791,21 +761,26 @@ bool runSegment(BackendContext *ctx, ggml_cgraph *graph, const Step &step,
       t.elementSize = static_cast<int64_t>(ggml_type_size(root->type));
       inputRanges.push_back({root->data, ggml_nbytes(root)});
     } else if (b.kind == SegmentInput::Kind::QuantData ||
-               b.kind == SegmentInput::Kind::QuantScales) {
+               b.kind == SegmentInput::Kind::QuantScales ||
+               b.kind == SegmentInput::Kind::QuantZeroPoints) {
       const ggml_tensor *w = resolve(graph, b.ref);
       QuantLayout layout;
       quantLayout(w->type, layout);
       const int64_t rows = w->ne[1], blocks = w->ne[0] / layout.blockSize;
+      char *base = static_cast<char *>(w->data);
       if (b.kind == SegmentInput::Kind::QuantData) {
-        t.data = w->data;
+        t.data = base;
         t.shape = {rows, blocks, layout.blob};
         t.elementSize = 1;
       } else {
-        t.data = static_cast<char *>(w->data) + rows * blocks * layout.blob;
+        const int64_t scalesAt = rows * blocks * layout.blob;
+        t.data = b.kind == SegmentInput::Kind::QuantScales
+                     ? base + scalesAt
+                     : base + scalesAt + rows * blocks * 2;
         t.shape = {rows, blocks};
         t.elementSize = 2;
       }
-      inputRanges.push_back({w->data, ggml_nbytes(w)});
+      inputRanges.push_back({w->data, repackedSize(w)});
     } else {
       const RopeTable &r = ctx->ropes[b.rope];
       t.data = b.kind == SegmentInput::Kind::RopeCos ? r.cos : r.sin;
