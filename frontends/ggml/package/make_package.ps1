@@ -5,8 +5,10 @@
 
 <#
 .SYNOPSIS
-Builds a self-contained Windows package that runs llama.cpp on the HIP EP
-ggml backend (ggml-hipep) on a machine without a ROCm or Visual Studio install.
+Builds a self-contained Windows package that runs GGUF models through llama.cpp
+on the HIP EP ggml backend (ggml-hipep), and ONNX models through ONNX Runtime
+and ONNX Runtime GenAI on the HIP EP plugin (hipgpu), on a machine without a
+ROCm or Visual Studio install.
 
 .EXAMPLE
 .\make_package.ps1 -LlamaBin D:\llama.cpp\build-hipep-pkg\bin `
@@ -15,7 +17,8 @@ ggml backend (ggml-hipep) on a machine without a ROCm or Visual Studio install.
 param(
     # llama.cpp build (BUILD_SHARED_LIBS=ON) whose ggml-base the backend was built against.
     [Parameter(Mandatory)] [string] $LlamaBin,
-    # hip-ep build output holding ggml-hipep.dll and custom_kernels_<arch>.dll.
+    # hip-ep build output: ggml-hipep.dll, hipgpu.dll, onnxruntime.dll,
+    # hip-onnx-runner.exe and custom_kernels_<arch>.dll.
     [Parameter(Mandatory)] [string] $HipEpBin,
     # TheRock ROCm SDK bin directory (amdhip64_7.dll, hipblaslt.dll, hipblaslt\library).
     [Parameter(Mandatory)] [string] $RocmBin,
@@ -32,7 +35,7 @@ function Copy-Required([string] $Path, [string] $Dest) {
     Copy-Item $Path $Dest -Recurse -Force
 }
 
-if (-not $Name) { $Name = "hipep-llamacpp-win-x64-$Arch-$(Get-Date -Format yyyyMMdd)" }
+if (-not $Name) { $Name = "hipep-win-x64-$Arch-$(Get-Date -Format yyyyMMdd)" }
 $root = Join-Path $OutDir $Name
 $bin = Join-Path $root "bin"
 if (Test-Path $root) { Remove-Item $root -Recurse -Force }
@@ -45,10 +48,16 @@ $tools = "llama-cli", "llama-server", "llama-completion", "llama-bench",
 foreach ($t in $tools) { Copy-Required (Join-Path $LlamaBin "$t.exe") $bin }
 Get-ChildItem $LlamaBin -Filter *.dll | ForEach-Object { Copy-Item $_.FullName $bin }
 
-# The backend and its kernel library. The JIT loads custom_kernels_<arch>.dll
-# from the directory of ggml-hipep.dll.
-Copy-Required (Join-Path $HipEpBin "ggml-hipep.dll") $bin
-Copy-Required (Join-Path $HipEpBin "custom_kernels_$Arch.dll") $bin
+# The ggml backend, the ONNX Runtime plugin EP with the ONNX Runtime it was
+# built against and its runner, and the kernel library they share. The JIT
+# loads custom_kernels_<arch>.dll from the directory of the loading DLL.
+foreach ($f in "ggml-hipep.dll", "hipgpu.dll", "onnxruntime.dll",
+               "hip-onnx-runner.exe", "custom_kernels_$Arch.dll") {
+    Copy-Required (Join-Path $HipEpBin $f) $bin
+}
+
+# Python helpers for ONNX Runtime and ONNX Runtime GenAI.
+Copy-Required (Join-Path $PSScriptRoot "python") $root
 
 # ROCm runtime: the HIP runtime and its code-object manager, and hipBLASLt with
 # the Tensile kernel data for the target architecture, which hipBLASLt finds in
@@ -101,6 +110,14 @@ call "%~dp0hipep-env.cmd"
 "@
     Set-Content -Path (Join-Path $root "$t.cmd") -Value $cmd -Encoding Ascii
 }
+
+$onnxRun = @"
+@echo off
+setlocal
+call "%~dp0hipep-env.cmd"
+"%HIPEP_ROOT%bin\hip-onnx-runner.exe" %*
+"@
+Set-Content -Path (Join-Path $root "onnx-run.cmd") -Value $onnxRun -Encoding Ascii
 
 $check = @"
 @echo off

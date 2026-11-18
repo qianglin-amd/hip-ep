@@ -2,16 +2,23 @@
 Copyright (C) 2026 Advanced Micro Devices, Inc. All rights reserved.
 Licensed under the MIT License.
 -->
-# llama.cpp on HIP EP: Windows package
+# HIP EP: Windows package
 
-This package runs GGUF models with the stock llama.cpp tools (`llama-cli`,
-`llama-server`, ...) on an AMD GPU through the HIP EP ggml backend
-(`ggml-hipep.dll`). The backend compiles each ggml graph with the HIP EP
-MLIR compiler and runs it with hipBLASLt and the HIP EP custom kernels.
+This package runs models on an AMD GPU with HIP EP, which compiles each model
+graph with its MLIR compiler and runs it with hipBLASLt and the HIP EP custom
+kernels. It takes two kinds of models:
 
-Everything it needs is inside: the llama.cpp tools, the backend, the ROCm
-runtime libraries and the MSVC runtime. No ROCm SDK, Python or Visual Studio
-install is required.
+- **GGUF models** with the stock llama.cpp tools (`llama-cli`,
+  `llama-server`, ...) through the HIP EP ggml backend (`ggml-hipep.dll`).
+- **ONNX models** with ONNX Runtime through the HIP EP plugin execution
+  provider (`hipgpu.dll`): from the bundled `hip-onnx-runner`, from Python
+  `onnxruntime`, or as LLMs from Python `onnxruntime-genai`. See
+  [ONNX models](#onnx-models).
+
+Everything it needs is inside: the llama.cpp tools, ONNX Runtime and the
+runner, both HIP EP front ends, the ROCm runtime libraries and the MSVC
+runtime. No ROCm SDK or Visual Studio install is required; Python is only
+needed for the Python examples.
 
 ## Requirements
 
@@ -21,7 +28,8 @@ install is required.
 | GPU | The architecture in `VERSION.txt` (`gfx1151`: Radeon 8060S / 8050S, Ryzen AI Max) |
 | Driver | A recent AMD Software: Adrenalin Edition driver |
 | CPU | x86-64 with AVX2 |
-| Disk | About 0.5 GB for the package, plus the model and a compile cache |
+| Disk | About 0.4 GB for the package, plus the model and a compile cache |
+| Python (optional) | 3.10 or newer 64-bit, for the ONNX Python examples |
 
 The GPU kernels are compiled for one architecture. On a different GPU the
 backend fails to load its kernels; rebuild the package for that architecture
@@ -56,6 +64,9 @@ backend fails to load its kernels; rebuild the package for that architecture
 The first run of a model compiles its graphs. That takes from a few seconds
 to about a minute; the results are cached (see [Compile cache](#compile-cache)), so
 later runs start quickly.
+
+For an ONNX model, run `onnx-run.cmd -m C:\models\model.onnx`, or see
+[ONNX models](#onnx-models) for Python and LLMs.
 
 ## The launchers
 
@@ -134,7 +145,7 @@ llama-cli.exe -m model.gguf -dev HIPEP0 -ngl 99 -fa on
 the backend named by `GGML_BACKEND_PATH` when a device is selected on the
 command line. Without it, everything runs on the CPU.
 
-## Supported models and options
+## Supported GGUF models and options
 
 - Llama-family dense models (Llama 3.x, and models with the same graph).
   Other architectures run as long as their ops are supported; unsupported
@@ -147,9 +158,119 @@ command line. Without it, everything runs on the CPU.
 - f16 KV cache (the default). A quantized KV cache (`-ctk q8_0` / `-ctv q8_0`)
   runs attention on the CPU and is much slower.
 
+## ONNX models
+
+The HIP EP is an ONNX Runtime plugin execution provider. It compiles the
+model when the session is created (a few seconds for a CNN, longer for large
+models) and then runs it on the GPU. By default the examples below disable
+the CPU fallback, so session creation fails instead of silently running an
+unsupported model on the CPU; a successful run is proof that the whole model
+ran on the GPU.
+
+### Without Python: onnx-run.cmd
+
+`onnx-run.cmd` runs `bin\hip-onnx-runner.exe` with the bundled ONNX Runtime.
+It feeds random inputs, runs one inference and reports the timing:
+
+```bat
+onnx-run.cmd -m C:\models\resnet50.onnx
+```
+
+```text
+Registering EP: ...\bin\hipgpu.dll
+Found 1 EP device(s)
+Session created in 4117 ms
+Running inference...
+Inference: 47094 us
+OK - 1 output tensor(s)
+```
+
+Useful options (`onnx-run.cmd --help` lists all):
+
+| Option | Use |
+|---|---|
+| `-f name:value` | Value for a symbolic input dimension, e.g. `-f batch_size:1,sequence_length:128` |
+| `-i <dir>` | Read inputs from `input_<idx>_<name>_<type>.bin` files instead of random data |
+| `-d 2` | Write the outputs to `<model>_o_dump\` |
+| `-n` | Run on the CPU only, for comparison |
+| `--allow-cpu-fallback` | Let nodes the EP does not support run on the CPU |
+
+### Python: onnxruntime
+
+Install the Python packages (any recent 64-bit Python):
+
+```bat
+pip install -r python\requirements.txt
+```
+
+The `python\hipep.py` helper puts `bin\` on `PATH`, registers
+`bin\hipgpu.dll` with ONNX Runtime and returns session options for it:
+
+```python
+import sys
+sys.path.insert(0, r"C:\hipep\python")   # the package's python folder
+
+import hipep
+import onnxruntime as ort
+
+sess = ort.InferenceSession("model.onnx", sess_options=hipep.session_options())
+print(sess.get_providers())              # ['hipgpu', 'CPUExecutionProvider']
+outputs = sess.run(None, {"input": x})
+```
+
+`hipep.session_options(allow_cpu_fallback=True)` lets unsupported nodes run
+on the CPU, and `provider_options={...}` passes HIP EP provider options.
+
+Without the helper, the same thing in plain ONNX Runtime calls is:
+
+```python
+import os
+os.environ["PATH"] = r"C:\hipep\bin;" + os.environ["PATH"]
+import onnxruntime as ort
+
+ort.register_execution_provider_library("hipgpu", r"C:\hipep\bin\hipgpu.dll")
+devices = [d for d in ort.get_ep_devices() if d.ep_name == "hipgpu"]
+so = ort.SessionOptions()
+so.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+so.add_provider_for_devices(devices, {})
+sess = ort.InferenceSession("model.onnx", sess_options=so)
+```
+
+`python\run_onnx.py` runs any model with random inputs and can compare the
+result with the CPU:
+
+```bat
+python python\run_onnx.py C:\models\resnet50.onnx --compare-cpu
+python python\run_onnx.py model.onnx --dim batch_size=1 --dim sequence_length=128
+```
+
+### Python: onnxruntime-genai (LLMs)
+
+ONNX Runtime GenAI models are directories with a `genai_config.json`, a
+`model.onnx` and a tokenizer, for example the int4 Phi-3.5 or Llama 3.x
+exports. `hipep.genai_config` registers the HIP EP with GenAI under the name
+`AMDGPU` and selects it, whatever provider the config names:
+
+```bat
+python python\run_genai.py C:\models\phi3.5-mini-instruct-int4 -p "What is the capital of France?"
+python python\run_genai.py C:\models\phi3.5-mini-instruct-int4
+```
+
+The second form is an interactive chat; an empty line exits. In your own
+code:
+
+```python
+import hipep
+import onnxruntime_genai as og
+
+model = og.Model(hipep.genai_config(r"C:\models\phi3.5-mini-instruct-int4"))
+tokenizer = og.Tokenizer(model)
+```
+
 ## Compile cache
 
-Compiled graphs and machine code are cached in
+The ONNX path compiles each model when its session is created. The GGUF
+path caches compiled graphs and machine code in
 `%LOCALAPPDATA%\hip-ep\ggml-cache`. The cache is rebuilt automatically when
 the package changes. To clear it, delete that folder.
 
@@ -168,16 +289,23 @@ the package changes. To clear it, delete that folder.
 | Model runs but slowly, GPU idle | `-dev HIPEP0` is missing (direct use of the `.exe`), or `-ngl` is too low. |
 | Long pause on the first prompt | First-time compilation; later runs use the cache. |
 | Some ops still on the CPU | Expected for ops the backend does not support yet; run with `GGML_HIPEP_VERBOSE=1` to list them. |
+| ONNX: session creation fails because nodes would run on the CPU | The model has ops the HIP EP does not support. Use `--allow-cpu-fallback` (runner) or `allow_cpu_fallback=True` (Python) to run those nodes on the CPU. |
+| ONNX Python: `no hipgpu device found` or registration fails | Use `onnxruntime` 1.24 or newer (64-bit Python) and update the AMD driver. |
+| ONNX: `EP library not found` | Run `bin\hip-onnx-runner.exe` from the package (it looks next to itself) or set `MORPHIZEN_EP_LIB` to the full path of `hipgpu.dll`. |
 
 ## Package layout
 
 ```text
 <package>\
   README.md, VERSION.txt
-  check-device.cmd, hipep-env.cmd, llama-*.cmd     launchers
+  check-device.cmd, hipep-env.cmd, llama-*.cmd, onnx-run.cmd   launchers
+  python\
+    hipep.py, run_onnx.py, run_genai.py, requirements.txt      ONNX Runtime helpers
   bin\
     llama-*.exe, test-backend-ops.exe, llama*.dll, ggml*.dll, mtmd.dll   llama.cpp
     ggml-hipep.dll                                 HIP EP ggml backend (compiler + JIT)
+    hipgpu.dll                                     HIP EP ONNX Runtime plugin (compiler + JIT)
+    onnxruntime.dll, hip-onnx-runner.exe           ONNX Runtime and the runner
     custom_kernels_<arch>.dll                      HIP EP GPU kernels
     amdhip64_7.dll, amd_comgr*.dll, hipblaslt.dll  ROCm runtime
     hipblaslt\library\<arch>\                      hipBLASLt kernel data
@@ -187,8 +315,9 @@ the package changes. To clear it, delete that folder.
 ## Rebuilding the package
 
 On the build machine, after building hip-ep with `HIP_EP_BUILD_GGML_BACKEND=ON`
-and a shared llama.cpp from the same llama.cpp source (see
-`docs/design/ggml-frontend.md`):
+(the default build also produces `hipgpu.dll`, `onnxruntime.dll` and
+`hip-onnx-runner.exe`) and a shared llama.cpp from the same llama.cpp source
+(see `docs/design/ggml-frontend.md`):
 
 ```powershell
 frontends\ggml\package\make_package.ps1 `
