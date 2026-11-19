@@ -12,6 +12,7 @@ Without -p it starts an interactive chat; an empty line exits.
 
 import argparse
 import json
+import os
 import time
 
 import onnxruntime_genai as og
@@ -19,13 +20,14 @@ import onnxruntime_genai as og
 import hipep
 
 
-def generate(model, tokenizer, prompt, max_length):
+def generate(model, tokenizer, prompt, max_length, template=None):
     messages = json.dumps([{"role": "user", "content": prompt}])
     try:
         text = tokenizer.apply_chat_template(
-            messages=messages, add_generation_prompt=True
+            messages=messages, template_str=template, add_generation_prompt=True
         )
     except Exception:
+        # Models without a chat template take the raw prompt.
         text = prompt
     params = og.GeneratorParams(model)
     params.set_search_options(max_length=max_length, do_sample=False)
@@ -63,8 +65,16 @@ def main():
         f"model loaded on {hipep.GENAI_EP_NAME} in {time.perf_counter() - start:.1f} s"
     )
 
+    # Some exports keep the chat template in its own file rather than in
+    # tokenizer_config.json.
+    template = None
+    template_file = os.path.join(args.model_dir, "chat_template.jinja")
+    if os.path.isfile(template_file):
+        with open(template_file, encoding="utf-8") as f:
+            template = f.read()
+
     if args.prompt:
-        generate(model, tokenizer, args.prompt, args.max_length)
+        generate(model, tokenizer, args.prompt, args.max_length, template)
         return 0
     while True:
         try:
@@ -73,7 +83,7 @@ def main():
             break
         if not prompt:
             break
-        generate(model, tokenizer, prompt, args.max_length)
+        generate(model, tokenizer, prompt, args.max_length, template)
     return 0
 
 

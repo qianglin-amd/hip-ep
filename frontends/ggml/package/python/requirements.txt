@@ -1,4 +1,4 @@
+# Offline: pip install --no-index --find-links wheels onnxruntime-genai
 numpy
-onnxruntime>=1.24
-# Only for run_genai.py (ONNX Runtime GenAI LLM models):
-onnxruntime-genai>=0.13
+onnxruntime>=1.24.4
+onnxruntime-genai>=0.13.1

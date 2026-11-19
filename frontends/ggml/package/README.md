@@ -11,14 +11,18 @@ kernels. It takes two kinds of models:
 - **GGUF models** with the stock llama.cpp tools (`llama-cli`,
   `llama-server`, ...) through the HIP EP ggml backend (`ggml-hipep.dll`).
 - **ONNX models** with ONNX Runtime through the HIP EP plugin execution
-  provider (`hipgpu.dll`): from the bundled `hip-onnx-runner`, from Python
-  `onnxruntime`, or as LLMs from Python `onnxruntime-genai`. See
-  [ONNX models](#onnx-models).
+  provider (`hipgpu.dll`), from the bundled `hip-onnx-runner` or from Python
+  `onnxruntime`. See [ONNX models](#onnx-models).
+- **ONNX LLMs (genai_config.json packages)** with ONNX Runtime GenAI (OGA) on
+  the same plugin, from the bundled `oga-chat`, from C/C++ with the bundled
+  OGA SDK, or from Python `onnxruntime-genai`. See
+  [ONNX Runtime GenAI](#onnx-runtime-genai-oga).
 
-Everything it needs is inside: the llama.cpp tools, ONNX Runtime and the
-runner, both HIP EP front ends, the ROCm runtime libraries and the MSVC
-runtime. No ROCm SDK or Visual Studio install is required; Python is only
-needed for the Python examples.
+Everything it needs is inside: the llama.cpp tools, ONNX Runtime and OGA with
+their runners, both HIP EP front ends, the ROCm runtime libraries and the
+MSVC runtime, plus the Python wheels for an offline install. No ROCm SDK or
+Visual Studio install is required; Python is only needed for the Python
+examples.
 
 ## Requirements
 
@@ -28,8 +32,8 @@ needed for the Python examples.
 | GPU | The architecture in `VERSION.txt` (`gfx1151`: Radeon 8060S / 8050S, Ryzen AI Max) |
 | Driver | A recent AMD Software: Adrenalin Edition driver |
 | CPU | x86-64 with AVX2 |
-| Disk | About 0.4 GB for the package, plus the model and a compile cache |
-| Python (optional) | 3.10 or newer 64-bit, for the ONNX Python examples |
+| Disk | About 0.5 GB for the package, plus the model and a compile cache |
+| Python (optional) | 3.11 to 3.14, 64-bit, for the Python examples (bundled wheels) |
 
 The GPU kernels are compiled for one architecture. On a different GPU the
 backend fails to load its kernels; rebuild the package for that architecture
@@ -83,6 +87,8 @@ normal llama.cpp options work.
 | `llama-bench.cmd` | Prompt-processing and generation speed |
 | `llama-perplexity.cmd` | Perplexity on a text file |
 | `check-device.cmd` | Lists the devices llama.cpp can use |
+| `onnx-run.cmd` | Runs an ONNX model on the HIP EP (see [ONNX models](#onnx-models)) |
+| `oga-chat.cmd` | Chats with an ONNX Runtime GenAI model on the HIP EP (see [OGA](#onnx-runtime-genai-oga)) |
 
 Examples:
 
@@ -197,11 +203,15 @@ Useful options (`onnx-run.cmd --help` lists all):
 
 ### Python: onnxruntime
 
-Install the Python packages (any recent 64-bit Python):
+Install the Python packages from the wheels in `python\wheels` (Python 3.11
+to 3.14; no internet access needed):
 
 ```bat
-pip install -r python\requirements.txt
+pip install --no-index --find-links python\wheels onnxruntime-genai
 ```
+
+That installs `onnxruntime-genai`, `onnxruntime` and `numpy`. With internet
+access, `pip install -r python\requirements.txt` works too.
 
 The `python\hipep.py` helper puts `bin\` on `PATH`, registers
 `bin\hipgpu.dll` with ONNX Runtime and returns session options for it:
@@ -244,12 +254,77 @@ python python\run_onnx.py C:\models\resnet50.onnx --compare-cpu
 python python\run_onnx.py model.onnx --dim batch_size=1 --dim sequence_length=128
 ```
 
-### Python: onnxruntime-genai (LLMs)
+## ONNX Runtime GenAI (OGA)
 
 ONNX Runtime GenAI models are directories with a `genai_config.json`, a
-`model.onnx` and a tokenizer, for example the int4 Phi-3.5 or Llama 3.x
-exports. `hipep.genai_config` registers the HIP EP with GenAI under the name
-`AMDGPU` and selects it, whatever provider the config names:
+`model.onnx` (+ `model.onnx.data`) and a tokenizer, for example the int4
+Phi-3.5 or Llama 3.x exports. The package carries OGA (version in
+`VERSION.txt`) and runs these models on the HIP EP plugin, which it registers
+with OGA under the name `AMDGPU`. Whatever provider the model's
+`genai_config.json` names (`dml`, `cuda`, ...), the model runs on the HIP EP.
+
+### Without Python: oga-chat.cmd
+
+```bat
+rem One question
+oga-chat.cmd C:\models\phi3.5-mini-instruct-int4 -p "What is the capital of France?"
+
+rem Interactive: one prompt per line, an empty line exits
+oga-chat.cmd C:\models\phi3.5-mini-instruct-int4
+```
+
+```text
+[model loaded on AMDGPU in 5.3 s]
+ The capital of France is Paris.
+[prompt 15 tokens, first token 248 ms, 8 tokens, 40.5 tokens/s]
+```
+
+| Option | Use |
+|---|---|
+| `-p TEXT` | Answer one prompt and exit |
+| `-n N` | Generate at most N tokens (default 512) |
+| `--max-length N` | KV cache length, prompt plus reply (default: prompt + `-n`) |
+| `--system TEXT` | System message for the chat template |
+| `--no-template` | Feed the prompt as is (for base models without a chat format) |
+| `--cpu` | Run on the CPU, for comparison |
+| `-q` | Print only the generated text |
+
+The KV cache is reserved for the whole `--max-length` up front. Do not set it
+to a model's full context window (often 131072 tokens) unless the GPU has the
+memory for it.
+
+### C/C++: the OGA SDK
+
+`sdk\onnxruntime-genai` holds the OGA headers (`ort_genai.h` C++ wrapper,
+`ort_genai_c.h` C API) and the import library. Link
+`sdk\onnxruntime-genai\lib\onnxruntime-genai.lib` and run your program from
+the folder that holds the DLLs of `bin\`: put the `.exe` in `bin\`, or copy
+the contents of `bin\` next to it. Putting `bin\` on `PATH` is not enough:
+Windows 11 has its own, older `onnxruntime.dll` in `System32`, which the DLL
+search order finds before `PATH`. Register the HIP EP before creating the
+model:
+
+```cpp
+#include "ort_genai.h"
+
+OgaHandle handle;
+OgaRegisterExecutionProviderLibrary("AMDGPU", R"(C:\hipep\bin\hipgpu.dll)");
+auto config = OgaConfig::Create(R"(C:\models\phi3.5-mini-instruct-int4)");
+config->ClearProviders();
+config->AppendProvider("AMDGPU");
+auto model = OgaModel::Create(*config);
+auto tokenizer = OgaTokenizer::Create(*model);
+auto params = OgaGeneratorParams::Create(*model);
+params->SetSearchOption("max_length", 1024);
+// ... OgaGenerator::Create(*model, *params), AppendTokenSequences, GenerateNextToken
+```
+
+The header needs C++20 (`std::span`). The source of `oga-chat` in the hip-ep
+repository (`tools/oga-chat/oga-chat.cpp`) is a complete example.
+
+### Python: onnxruntime-genai
+
+Install the wheels as in [Python: onnxruntime](#python-onnxruntime), then:
 
 ```bat
 python python\run_genai.py C:\models\phi3.5-mini-instruct-int4 -p "What is the capital of France?"
@@ -257,14 +332,19 @@ python python\run_genai.py C:\models\phi3.5-mini-instruct-int4
 ```
 
 The second form is an interactive chat; an empty line exits. In your own
-code:
+code, `hipep.genai_config` registers the HIP EP with OGA and selects it:
 
 ```python
+import sys
+sys.path.insert(0, r"C:\hipep\python")
+
 import hipep
 import onnxruntime_genai as og
 
 model = og.Model(hipep.genai_config(r"C:\models\phi3.5-mini-instruct-int4"))
 tokenizer = og.Tokenizer(model)
+params = og.GeneratorParams(model)
+params.set_search_options(max_length=1024)
 ```
 
 ## Compile cache
@@ -292,20 +372,27 @@ the package changes. To clear it, delete that folder.
 | ONNX: session creation fails because nodes would run on the CPU | The model has ops the HIP EP does not support. Use `--allow-cpu-fallback` (runner) or `allow_cpu_fallback=True` (Python) to run those nodes on the CPU. |
 | ONNX Python: `no hipgpu device found` or registration fails | Use `onnxruntime` 1.24 or newer (64-bit Python) and update the AMD driver. |
 | ONNX: `EP library not found` | Run `bin\hip-onnx-runner.exe` from the package (it looks next to itself) or set `MORPHIZEN_EP_LIB` to the full path of `hipgpu.dll`. |
+| OGA: `hipMalloc failed ... out of memory`, then `unspecified launch failure` | The KV cache for `max_length` does not fit. Lower `--max-length` (oga-chat) or `max_length` (Python). |
+| Your own program: `The requested API version [..] is not available ... ORT Version is: 1.17` | It loaded Windows' `System32\onnxruntime.dll`. Run the program from the folder with the package's DLLs (see [C/C++](#cc-the-oga-sdk)). |
+| OGA: odd or empty replies from a base model | Base (non-instruct) models do not follow the chat format; use `--no-template` and a completion-style prompt. |
 
 ## Package layout
 
 ```text
 <package>\
   README.md, VERSION.txt
-  check-device.cmd, hipep-env.cmd, llama-*.cmd, onnx-run.cmd   launchers
+  check-device.cmd, hipep-env.cmd, llama-*.cmd, onnx-run.cmd, oga-chat.cmd   launchers
   python\
-    hipep.py, run_onnx.py, run_genai.py, requirements.txt      ONNX Runtime helpers
+    hipep.py, run_onnx.py, run_genai.py, requirements.txt      ONNX Runtime / OGA helpers
+    wheels\                                        onnxruntime-genai, onnxruntime, numpy wheels
+  sdk\onnxruntime-genai\
+    include\ort_genai.h, ort_genai_c.h, lib\onnxruntime-genai.lib   OGA C/C++ SDK
   bin\
     llama-*.exe, test-backend-ops.exe, llama*.dll, ggml*.dll, mtmd.dll   llama.cpp
     ggml-hipep.dll                                 HIP EP ggml backend (compiler + JIT)
     hipgpu.dll                                     HIP EP ONNX Runtime plugin (compiler + JIT)
     onnxruntime.dll, hip-onnx-runner.exe           ONNX Runtime and the runner
+    onnxruntime-genai.dll, oga-chat.exe            ONNX Runtime GenAI and its runner
     custom_kernels_<arch>.dll                      HIP EP GPU kernels
     amdhip64_7.dll, amd_comgr*.dll, hipblaslt.dll  ROCm runtime
     hipblaslt\library\<arch>\                      hipBLASLt kernel data
@@ -314,18 +401,33 @@ the package changes. To clear it, delete that folder.
 
 ## Rebuilding the package
 
-On the build machine, after building hip-ep with `HIP_EP_BUILD_GGML_BACKEND=ON`
-(the default build also produces `hipgpu.dll`, `onnxruntime.dll` and
-`hip-onnx-runner.exe`) and a shared llama.cpp from the same llama.cpp source
-(see `docs/design/ggml-frontend.md`):
+On the build machine:
 
-```powershell
-frontends\ggml\package\make_package.ps1 `
-  -LlamaBin <llama.cpp>\build\bin `
-  -HipEpBin <hip-ep build>\bin `
-  -RocmBin  <TheRock dist>\bin `
-  -Arch gfx1151 -Zip
-```
+1. Get ONNX Runtime GenAI: extract the `Microsoft.ML.OnnxRuntimeGenAI` NuGet
+   package (it is a zip) into a directory, and download the Python wheels
+   into its `wheels\` subdirectory:
+
+   ```powershell
+   pip download onnxruntime-genai==0.13.1 onnxruntime numpy --only-binary=:all: `
+     --platform win_amd64 --python-version 3.12 -d <oga>\wheels
+   ```
+
+   Repeat the `pip download` for each Python version to support.
+2. Build hip-ep with `-DHIP_EP_BUILD_GGML_BACKEND=ON -DHIP_EP_OGA_DIR=<oga>`
+   (the default build also produces `hipgpu.dll`, `onnxruntime.dll` and
+   `hip-onnx-runner.exe`; `HIP_EP_OGA_DIR` adds `oga-chat.exe`), and a shared
+   llama.cpp from the same llama.cpp source (see
+   `docs/design/ggml-frontend.md`).
+3. Assemble the package:
+
+   ```powershell
+   frontends\ggml\package\make_package.ps1 `
+     -LlamaBin <llama.cpp>\build\bin `
+     -HipEpBin <hip-ep build>\bin `
+     -RocmBin  <TheRock dist>\bin `
+     -OgaDir   <oga> `
+     -Arch gfx1151 -Zip
+   ```
 
 Build llama.cpp with `-DGGML_NATIVE=OFF -DGGML_AVX2=ON` so the CPU backend
 runs on other machines, and build hip-ep with `-DHIP_ARCHITECTURES=` the

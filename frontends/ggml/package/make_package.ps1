@@ -22,6 +22,11 @@ param(
     [Parameter(Mandatory)] [string] $HipEpBin,
     # TheRock ROCm SDK bin directory (amdhip64_7.dll, hipblaslt.dll, hipblaslt\library).
     [Parameter(Mandatory)] [string] $RocmBin,
+    # ONNX Runtime GenAI distribution the hip-ep build used for oga-chat
+    # (HIP_EP_OGA_DIR): the extracted Microsoft.ML.OnnxRuntimeGenAI NuGet package
+    # or a release zip, plus a wheels\ folder of onnxruntime-genai, onnxruntime
+    # and numpy wheels for offline Python installs.
+    [Parameter(Mandatory)] [string] $OgaDir,
     [string] $Arch = "gfx1151",
     [string] $OutDir = (Join-Path (Get-Location) "dist"),
     [string] $Name = "",
@@ -58,6 +63,29 @@ foreach ($f in "ggml-hipep.dll", "hipgpu.dll", "onnxruntime.dll",
 
 # Python helpers for ONNX Runtime and ONNX Runtime GenAI.
 Copy-Required (Join-Path $PSScriptRoot "python") $root
+
+# ONNX Runtime GenAI (OGA): the runtime and oga-chat, the C/C++ SDK, and the
+# Python wheels for an offline install.
+function Find-First([string] $Dir, [string[]] $Relative) {
+    foreach ($r in $Relative) {
+        $p = Join-Path $Dir $r
+        if (Test-Path $p) { return $p }
+    }
+    throw "none of $($Relative -join ', ') under $Dir"
+}
+Copy-Required (Join-Path $HipEpBin "oga-chat.exe") $bin
+Copy-Item (Find-First $OgaDir "runtimes\win-x64\native\onnxruntime-genai.dll", "lib\onnxruntime-genai.dll") $bin
+$sdk = Join-Path $root "sdk\onnxruntime-genai"
+New-Item -ItemType Directory -Force (Join-Path $sdk "include"), (Join-Path $sdk "lib") | Out-Null
+$ogaInclude = Find-First $OgaDir "build\native\include", "include"
+Get-ChildItem $ogaInclude -Filter "ort_genai*.h" | ForEach-Object { Copy-Item $_.FullName (Join-Path $sdk "include") }
+Copy-Item (Find-First $OgaDir "runtimes\win-x64\native\onnxruntime-genai.lib", "lib\onnxruntime-genai.lib") (Join-Path $sdk "lib")
+$wheels = Join-Path $OgaDir "wheels"
+if (-not (Get-ChildItem $wheels -Filter "onnxruntime_genai-*.whl" -ErrorAction SilentlyContinue)) {
+    throw "no onnxruntime_genai wheels in $wheels"
+}
+New-Item -ItemType Directory -Force (Join-Path $root "python\wheels") | Out-Null
+Get-ChildItem $wheels -Filter *.whl | ForEach-Object { Copy-Item $_.FullName (Join-Path $root "python\wheels") }
 
 # ROCm runtime: the HIP runtime and its code-object manager, and hipBLASLt with
 # the Tensile kernel data for the target architecture, which hipBLASLt finds in
@@ -119,6 +147,14 @@ call "%~dp0hipep-env.cmd"
 "@
 Set-Content -Path (Join-Path $root "onnx-run.cmd") -Value $onnxRun -Encoding Ascii
 
+$ogaChat = @"
+@echo off
+setlocal
+call "%~dp0hipep-env.cmd"
+"%HIPEP_ROOT%bin\oga-chat.exe" %*
+"@
+Set-Content -Path (Join-Path $root "oga-chat.cmd") -Value $ogaChat -Encoding Ascii
+
 $check = @"
 @echo off
 setlocal
@@ -133,11 +169,15 @@ Copy-Required (Join-Path $PSScriptRoot "README.md") $root
 $hipEpRev = (git -C $PSScriptRoot rev-parse --short HEAD) 2>$null
 $llamaSrc = (Get-Item $LlamaBin).Parent.Parent.FullName
 $llamaRev = (git -C $llamaSrc describe --tags --always) 2>$null
+$ortVersion = (Get-Item (Join-Path $bin "onnxruntime.dll")).VersionInfo.ProductVersion
+$ogaVersion = (Get-Item (Join-Path $bin "onnxruntime-genai.dll")).VersionInfo.ProductVersion
 @"
-hip-ep commit:    $hipEpRev
-llama.cpp:        $llamaRev
-GPU architecture: $Arch
-Built:            $(Get-Date -Format s)
+hip-ep commit:     $hipEpRev
+llama.cpp:         $llamaRev
+onnxruntime:       $ortVersion
+onnxruntime-genai: $ogaVersion
+GPU architecture:  $Arch
+Built:             $(Get-Date -Format s)
 "@ | Set-Content -Path (Join-Path $root "VERSION.txt") -Encoding Ascii
 
 $size = (Get-ChildItem $root -Recurse -File | Measure-Object Length -Sum).Sum

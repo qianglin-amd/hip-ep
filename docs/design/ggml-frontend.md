@@ -196,11 +196,13 @@ be on `PATH`, because llama.cpp loads the backend with a plain
 
 `frontends/ggml/package/make_package.ps1` assembles a self-contained Windows
 package from a llama.cpp build, the backend, the ONNX Runtime plugin EP
-(`hipgpu.dll`) with `onnxruntime.dll` and `hip-onnx-runner`, the TheRock
-runtime libraries (with the hipBLASLt Tensile data for one architecture) and
-the MSVC runtime. It adds launchers that set `GGML_BACKEND_PATH` and pass
-`-dev HIPEP0`, and Python helpers that register `hipgpu.dll` with ONNX
-Runtime and ONNX Runtime GenAI. The `README.md` next to the script is the
+(`hipgpu.dll`) with `onnxruntime.dll` and `hip-onnx-runner`, ONNX Runtime
+GenAI with `oga-chat` (built when `HIP_EP_OGA_DIR` names an OGA
+distribution), its C/C++ SDK and Python wheels, the TheRock runtime libraries
+(with the hipBLASLt Tensile data for one architecture) and the MSVC runtime.
+It adds launchers that set `GGML_BACKEND_PATH` and pass `-dev HIPEP0`, and
+Python helpers that register `hipgpu.dll` with ONNX Runtime and ONNX Runtime
+GenAI. The `README.md` next to the script is the
 package's user guide.
 
 ## Usage
